@@ -85,23 +85,21 @@ class MissionControlQueries:
         return row
 
     def get_active_loop_state(self) -> dict[str, Any] | None:
-        row = self.store.fetch_one(
-            """
-            SELECT
-                l.*,
-                r.name AS loop_name,
-                r.dataset,
-                r.model
-            FROM loop_state l
-            JOIN runs r ON r.id = l.loop_run_id
-            WHERE l.status IN ('running', 'paused', 'terminating')
-            ORDER BY l.updated_at DESC
-            LIMIT 1
-            """
-        )
+        row = self.store.fetch_active_loop_state()
         if row is None:
             return None
+        run = self.store.fetch_one(
+            "SELECT name AS loop_name, dataset, model, status AS run_status FROM runs WHERE id = ?",
+            (str(row["loop_run_id"]),),
+        )
+        if run is not None:
+            row["loop_name"] = run.get("loop_name")
+            row["dataset"] = run.get("dataset")
+            row["model"] = run.get("model")
+            row["run_status"] = run.get("run_status")
         row["pause_requested"] = bool(row.get("pause_requested"))
+        row["stop_requested"] = bool(row.get("stop_requested"))
+        row["terminate_requested"] = bool(row.get("terminate_requested"))
         return row
 
     def get_latest_loop_state(self) -> dict[str, Any] | None:

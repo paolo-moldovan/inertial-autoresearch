@@ -160,6 +160,13 @@ HTML = """<!doctype html>
   </div>
   <script>
     let selectedRunId = null;
+    let pollTimer = null;
+    let refreshInFlight = false;
+    let currentPollMs = 1500;
+    const renderState = {
+      summaryHash: "",
+      detailHash: "",
+    };
 
     async function getJson(path, options) {
       const response = await fetch(path, options);
@@ -179,8 +186,47 @@ HTML = """<!doctype html>
       return "<tr>" + cells.map((cell) => `<td>${cell}</td>`).join("") + "</tr>";
     }
 
+    function stableHash(value) {
+      return JSON.stringify(value ?? null);
+    }
+
+    function hasActiveSelection() {
+      const selection = window.getSelection();
+      return !!selection && !selection.isCollapsed && selection.toString().trim().length > 0;
+    }
+
+    function userIsInteracting() {
+      if (document.hidden || hasActiveSelection()) return true;
+      const active = document.activeElement;
+      if (!active) return false;
+      const tag = active.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA";
+    }
+
+    function scheduleRefresh(nextMs = currentPollMs) {
+      if (pollTimer) window.clearTimeout(pollTimer);
+      pollTimer = window.setTimeout(refreshAll, nextMs);
+    }
+
     async function refreshSummary() {
       const data = await getJson("/api/summary");
+      currentPollMs = data.loop_state && ["running", "paused", "terminating"].includes(data.loop_state.status)
+        ? 1500
+        : 5000;
+      const summaryHash = stableHash({
+        loop_state: data.loop_state,
+        best_result: data.best_result,
+        leaderboard: data.leaderboard,
+        queued_proposals: data.queued_proposals,
+        recent_loop_events: data.recent_loop_events,
+        recent_decisions: data.recent_decisions,
+        recent_llm_calls: data.recent_llm_calls,
+      });
+      if (summaryHash === renderState.summaryHash) {
+        return data;
+      }
+      renderState.summaryHash = summaryHash;
+
       const loop = data.loop_state;
       const best = data.best_result;
       const statusLine = document.getElementById("status-line");
@@ -191,8 +237,10 @@ HTML = """<!doctype html>
       if (!loop) {
         statusLine.textContent = "No current loop.";
       } else {
+        const loopLabel = loop.loop_name || shortId(loop.loop_run_id);
         statusLine.innerHTML = `
-          <span>Loop <strong>${shortId(loop.loop_run_id)}</strong> is <strong>${loop.status}</strong></span>
+          <span>Loop <strong>${loopLabel}</strong> is <strong>${loop.status}</strong></span>
+          <span class="tag">id ${shortId(loop.loop_run_id)}</span>
           <span>Iteration <strong>${loop.current_iteration}/${loop.max_iterations}</strong></span>
           <span>Best <strong>${best ? metric(best.metric_value) : "n/a"}</strong></span>
           <span>Flags pause=${loop.pause_requested} stop=${loop.stop_requested} terminate=${loop.terminate_requested}</span>
@@ -236,11 +284,17 @@ HTML = """<!doctype html>
           typeof row.latency_ms === "number" ? `${row.latency_ms.toFixed(1)} ms` : "",
         ])
       ).join("");
+      return data;
     }
 
     async function refreshRunDetail() {
       if (!selectedRunId) return;
       const detail = await getJson(`/api/run?run_id=${encodeURIComponent(selectedRunId)}`);
+      const detailHash = stableHash(detail);
+      if (detailHash === renderState.detailHash) {
+        return;
+      }
+      renderState.detailHash = detailHash;
       const container = document.getElementById("run-detail");
       if (!detail || !detail.run) {
         container.innerHTML = "<span class='muted'>Run detail not found.</span>";
@@ -287,15 +341,27 @@ HTML = """<!doctype html>
     }
 
     async function refreshAll() {
-      await refreshSummary();
-      await refreshRunDetail();
-      document.querySelectorAll("[data-run-id]").forEach((row) => {
-        row.onclick = async () => {
-          selectedRunId = row.getAttribute("data-run-id");
-          history.replaceState({}, "", `?run_id=${encodeURIComponent(selectedRunId)}`);
-          await refreshRunDetail();
-        };
-      });
+      if (refreshInFlight) return;
+      if (userIsInteracting()) {
+        scheduleRefresh(750);
+        return;
+      }
+      refreshInFlight = true;
+      try {
+        await refreshSummary();
+        await refreshRunDetail();
+        document.querySelectorAll("[data-run-id]").forEach((row) => {
+          row.onclick = async () => {
+            selectedRunId = row.getAttribute("data-run-id");
+            renderState.detailHash = "";
+            history.replaceState({}, "", `?run_id=${encodeURIComponent(selectedRunId)}`);
+            await refreshRunDetail();
+          };
+        });
+      } finally {
+        refreshInFlight = false;
+        scheduleRefresh();
+      }
     }
 
     async function control(path) {
@@ -320,7 +386,6 @@ HTML = """<!doctype html>
     const params = new URLSearchParams(window.location.search);
     selectedRunId = params.get("run_id");
     refreshAll();
-    setInterval(refreshAll, 1000);
   </script>
 </body>
 </html>
