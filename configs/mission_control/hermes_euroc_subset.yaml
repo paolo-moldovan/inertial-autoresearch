@@ -23,13 +23,13 @@ data:
     test_max_windows: 32
 
 training:
-  epochs: 50
+  epochs: 500
   batch_size: 16
   num_workers: 0
   time_budget_sec: 0
 
 autoresearch:
-  max_iterations: 10
+  max_iterations: 100
   orchestrator: hermes
   hermes:
     base_url: http://127.0.0.1:11434/v1
