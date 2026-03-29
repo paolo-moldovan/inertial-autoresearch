@@ -56,6 +56,7 @@ def test_checkpoint_and_figure_paths_are_derived() -> None:
 
     assert config.checkpoint_dir == Path("custom_artifacts/checkpoints/test-run")
     assert config.figures_dir == Path("custom_artifacts/figures/test-run")
+    assert config.runs_dir == Path("custom_artifacts/runs")
 
 
 def test_load_config_builds_nested_hermes_config() -> None:

@@ -5,6 +5,29 @@ autoresearch:
   metric_direction: minimize
   results_file: artifacts/autoresearch/results.tsv
   orchestrator: hermes    # none | hermes | researchclaw
+  baseline:
+    mode: global        # per_loop | global | manual
+    run_id: ""
+  strategy:
+    mode: adaptive
+    explore_probability: 0.15
+    stagnation_patience: 3
+    stagnation_explore_boost: 0.20
+    exploit_top_k: 3
+    novelty_bonus: 0.10
+    max_retries_per_signature: 2
+    hermes_bonus: 0.05
+    confidence_weight: 0.15
+    discard_penalty: 0.08
+    crash_penalty: 0.20
+  search_space:
+    freeze: []
+    allow: []
+    deny: []
+    allow_groups: []
+    deny_groups: []
+    architecture_mode: branch
+    baseline_mode: exploit
   hermes:
     python_bin: vendor/hermes-agent/.venv/bin/python
     cli_path: vendor/hermes-agent/cli.py

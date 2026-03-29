@@ -5,16 +5,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from autoresearch_loop.hermes import HermesQueryTrace
-    from autoresearch_loop.mutations import MutationProposal
+    from autoresearch_loop.mutations import MutationPolicyCandidate, MutationProposal
     from imu_denoise.config import ExperimentConfig
+    from imu_denoise.observability import LoopController, MissionControlQueries
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -22,6 +25,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from imu_denoise.training import TrainingInterrupted  # noqa: E402
 
 RESULTS_HEADER = [
     "timestamp",
@@ -54,20 +59,24 @@ class LoopResult:
     metrics_path: Path | None
 
 
+@dataclass(frozen=True)
+class BaselineReference:
+    """Resolved baseline policy for a loop run."""
+
+    include_baseline_run: bool
+    metric_value: float | None
+    run_id: str | None
+    description: str
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the argument parser for the local autoresearch loop."""
     parser = argparse.ArgumentParser(description="Run local config-first autoresearch iterations.")
     parser.add_argument(
         "--config",
         action="append",
-        default=[
-            "configs/base.yaml",
-            "configs/device.yaml",
-            "configs/models/lstm.yaml",
-            "configs/training/quick.yaml",
-            "configs/autoresearch.yaml",
-        ],
-        help="Config path(s) to merge. Defaults to a synthetic quick autoresearch stack.",
+        default=[],
+        help="Additional config path(s) to merge after the shared defaults.",
     )
     parser.add_argument(
         "--set",
@@ -81,6 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override autoresearch.max_iterations.",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=0,
+        help="Pause after this many completed runs when --pause is enabled.",
+    )
+    parser.add_argument(
+        "--pause",
+        action="store_true",
+        help="Enable batch pause/review mode.",
     )
     return parser
 
@@ -163,6 +183,19 @@ def _result_snapshot(result: LoopResult) -> dict[str, object]:
     }
 
 
+def _recent_policy_results(results: list[LoopResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "iteration": result.iteration,
+            "status": result.status,
+            "proposal_source": result.proposal_source,
+            "metric_value": result.metric_value,
+            "description": result.description,
+        }
+        for result in results
+    ]
+
+
 def _select_mutation_proposal(
     *,
     iteration: int,
@@ -171,22 +204,24 @@ def _select_mutation_proposal(
     results: list[LoopResult],
     fallback_proposal: MutationProposal,
     hermes_used_descriptions: set[str],
-) -> tuple[MutationProposal, str, HermesQueryTrace | None, list[MutationProposal] | None]:
-    from autoresearch_loop.mutations import default_mutation_pool
+    incumbent_summary: dict[str, object] | None,
+    mutation_lessons: list[dict[str, object]] | None,
+) -> tuple[list[MutationProposal], int | None, str, HermesQueryTrace | None]:
+    from autoresearch_loop.mutations import default_mutation_pool, filter_mutation_proposals
 
-    if iteration == 0 or base_config.autoresearch.orchestrator != "hermes":
-        return fallback_proposal, "static", None, None
-
-    from autoresearch_loop.hermes import (
-        HermesProposalError,
-        choose_mutation_proposal_with_trace,
-        hermes_backend_ready,
-    )
-
-    if not hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT):
-        return fallback_proposal, "static-fallback", None, None
+    if iteration == 0:
+        return [fallback_proposal], 0, "static", None
 
     candidate_pool = default_mutation_pool()[1:]
+    candidate_pool, blocked_candidates = filter_mutation_proposals(
+        candidate_pool,
+        base_config.autoresearch.search_space,
+    )
+    if not candidate_pool:
+        raise RuntimeError(
+            "No mutation candidates remain after applying the autoresearch search-space "
+            f"constraints. Blocked candidates: {blocked_candidates}"
+        )
     available_candidates = [
         proposal
         for proposal in candidate_pool
@@ -197,6 +232,28 @@ def _select_mutation_proposal(
         available_candidates = candidate_pool[:]
         rng.shuffle(available_candidates)
 
+    if base_config.autoresearch.orchestrator != "hermes":
+        fallback_index = 0
+        for index, candidate in enumerate(available_candidates):
+            if candidate.description == fallback_proposal.description:
+                fallback_index = index
+                break
+        return available_candidates, fallback_index, "static", None
+
+    from autoresearch_loop.hermes import (
+        HermesProposalError,
+        choose_mutation_proposal_with_trace,
+        hermes_backend_ready,
+    )
+
+    if not hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT):
+        fallback_index = 0
+        for index, candidate in enumerate(available_candidates):
+            if candidate.description == fallback_proposal.description:
+                fallback_index = index
+                break
+        return available_candidates, fallback_index, "static-fallback", None
+
     try:
         proposal, trace = choose_mutation_proposal_with_trace(
             config=base_config.autoresearch.hermes,
@@ -205,36 +262,54 @@ def _select_mutation_proposal(
             metric_direction=base_config.autoresearch.metric_direction,
             history=[_result_snapshot(result) for result in results],
             candidates=available_candidates,
+            incumbent=incumbent_summary,
+            search_space={
+                **asdict(base_config.autoresearch.search_space),
+                "blocked_candidates": blocked_candidates,
+            },
+            mutation_lessons=mutation_lessons,
             root=ROOT,
         )
     except HermesProposalError as exc:
-        return fallback_proposal, "static-fallback", exc.trace, available_candidates
+        fallback_index = 0
+        for index, candidate in enumerate(available_candidates):
+            if candidate.description == fallback_proposal.description:
+                fallback_index = index
+                break
+        return available_candidates, fallback_index, "static-fallback", exc.trace
 
-    hermes_used_descriptions.add(proposal.description)
-    return proposal, "hermes", trace, available_candidates
+    selected_index = 0
+    for index, candidate in enumerate(available_candidates):
+        if (
+            candidate.description == proposal.description
+            and candidate.overrides == proposal.overrides
+        ):
+            selected_index = index
+            break
+    return available_candidates, selected_index, "hermes", trace
 
 
 def _run_single_experiment(
     *,
-    config_paths: list[str],
+    config: ExperimentConfig,
     overrides: list[str],
     metric_key: str,
     parent_run_id: str | None = None,
     iteration: int | None = None,
+    run_id: str | None = None,
 ) -> tuple[Any, Any, str]:
     from imu_denoise.cli.common import build_model
-    from imu_denoise.config import load_config
     from imu_denoise.data.datamodule import create_dataloaders
     from imu_denoise.device import DeviceContext
     from imu_denoise.observability import ObservabilityWriter
     from imu_denoise.training import (
         Trainer,
+        TrainingInterrupted,
         build_loss,
         build_optimizer_and_scheduler,
         seed_everything,
     )
 
-    config = load_config(*config_paths, overrides=overrides)
     observability = ObservabilityWriter.from_experiment_config(config)
     run_id = observability.start_run(
         name=config.name,
@@ -249,6 +324,7 @@ def _run_single_experiment(
         objective_metric=metric_key,
         objective_direction="minimize",
         source="runtime",
+        run_id=run_id,
     )
     seed_everything(config.training.seed)
     device_ctx = DeviceContext.from_config(config.device)
@@ -274,6 +350,8 @@ def _run_single_experiment(
         summary = trainer.fit(train_loader, val_loader, test_loader)
         _metric_from_summary(summary, metric_key)
         return config, summary, run_id
+    except TrainingInterrupted:
+        raise
     except Exception as exc:
         observability.finish_run(
             run_id=run_id,
@@ -284,22 +362,240 @@ def _run_single_experiment(
         raise
 
 
+def _resolve_reference_config_payload(
+    *,
+    base_config: ExperimentConfig,
+    incumbent_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if incumbent_config is not None:
+        return cast(dict[str, Any], json.loads(json.dumps(incumbent_config)))
+    return asdict(base_config)
+
+
+def _resolve_iteration_config(
+    *,
+    base_config: ExperimentConfig,
+    base_overrides: list[str],
+    proposal_overrides: list[str],
+    incumbent_config: dict[str, Any] | None = None,
+    extra_overrides: list[str] | None = None,
+) -> ExperimentConfig:
+    from imu_denoise.config import load_config_from_dict
+
+    reference_payload = _resolve_reference_config_payload(
+        base_config=base_config,
+        incumbent_config=incumbent_config,
+    )
+    overrides = [*base_overrides, *proposal_overrides, *(extra_overrides or [])]
+    return load_config_from_dict(reference_payload, overrides=overrides)
+
+
+def _best_metric_from_results(results: list[LoopResult], direction: str) -> float | None:
+    valid = [result.metric_value for result in results if result.metric_value is not None]
+    if not valid:
+        return None
+    return max(valid) if direction == "maximize" else min(valid)
+
+
+def _resolve_baseline_reference(
+    base_config: ExperimentConfig,
+    queries: MissionControlQueries,
+) -> BaselineReference:
+    policy = base_config.autoresearch.baseline.mode
+
+    if policy == "per_loop":
+        return BaselineReference(
+            include_baseline_run=True,
+            metric_value=None,
+            run_id=None,
+            description="per-loop baseline",
+        )
+
+    if policy == "global":
+        baseline = queries.find_best_global_incumbent(
+            metric_key=base_config.autoresearch.metric_key,
+            dataset=base_config.data.dataset,
+            direction=base_config.autoresearch.metric_direction,
+            reference_config=base_config,
+        )
+        if baseline is None:
+            return BaselineReference(
+                include_baseline_run=True,
+                metric_value=None,
+                run_id=None,
+                description="global incumbent not found; falling back to per-loop baseline",
+            )
+        return BaselineReference(
+            include_baseline_run=False,
+            metric_value=float(baseline["metric_value"]),
+            run_id=str(baseline["run_id"]),
+            description=f"global incumbent {str(baseline['run_id'])[:8]}",
+        )
+
+    if policy == "manual":
+        configured_run_id = base_config.autoresearch.baseline.run_id.strip()
+        if not configured_run_id:
+            raise ValueError("autoresearch.baseline.run_id is required when mode=manual")
+        match = queries.resolve_id_fragment(configured_run_id)
+        if match is None or match["entity_type"] != "run":
+            run_id = configured_run_id
+        else:
+            run_id = str(match["id"])
+        metric_value = queries.get_run_metric(
+            run_id,
+            metric_key=base_config.autoresearch.metric_key,
+        )
+        if metric_value is None:
+            raise ValueError(
+                f"Could not resolve baseline metric for manual baseline run: {configured_run_id}"
+            )
+        return BaselineReference(
+            include_baseline_run=False,
+            metric_value=metric_value,
+            run_id=run_id,
+            description=f"manual baseline {run_id[:8]}",
+        )
+
+    raise ValueError(f"Unsupported autoresearch baseline mode: {policy}")
+
+
+def _wait_while_paused(
+    *,
+    loop_controller: LoopController,
+    loop_run_id: str,
+    total_iterations: int,
+    batch_size: int | None,
+    current_iteration: int,
+    best_metric: float | None,
+    best_run_id: str | None,
+) -> dict[str, Any]:
+    while True:
+        loop_state = loop_controller.get_loop_state(loop_run_id)
+        if loop_state is None:
+            raise RuntimeError("Loop state disappeared while waiting for resume.")
+        if bool(loop_state.get("stop_requested")) or bool(loop_state.get("terminate_requested")):
+            return loop_state
+        if loop_state["status"] != "paused":
+            return loop_state
+        loop_controller.heartbeat(
+            loop_run_id=loop_run_id,
+            current_iteration=current_iteration,
+            max_iterations=total_iterations,
+            batch_size=batch_size,
+            pause_after_iteration=loop_state.get("pause_after_iteration"),
+            pause_requested=bool(loop_state.get("pause_requested")),
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+            active_child_run_id=None,
+            status="paused",
+        )
+        time.sleep(0.25)
+
+
+def _finish_loop_with_status(
+    *,
+    observability: Any,
+    loop_controller: LoopController,
+    loop_run_id: str,
+    current_iteration: int,
+    max_iterations: int,
+    batch_size: int | None,
+    best_metric: float | None,
+    best_run_id: str | None,
+    status: str,
+    message: str,
+) -> None:
+    observability.finish_run(
+        run_id=loop_run_id,
+        status=status,
+        summary={"message": message},
+        source="runtime",
+    )
+    loop_controller.complete_loop(
+        loop_run_id=loop_run_id,
+        current_iteration=current_iteration,
+        max_iterations=max_iterations,
+        batch_size=batch_size,
+        best_metric=best_metric,
+        best_run_id=best_run_id,
+        status=status,
+    )
+
+
+def _resolve_results_file(
+    *,
+    base_config: ExperimentConfig,
+    loop_run_id: str,
+    loop_name: str,
+) -> Path:
+    from imu_denoise.config import AutoResearchConfig
+    from imu_denoise.utils.paths import build_run_paths
+
+    configured = Path(base_config.autoresearch.results_file)
+    default_path = Path(AutoResearchConfig().results_file)
+    if configured == default_path:
+        return build_run_paths(
+            base_config.output_dir,
+            run_name=loop_name,
+            run_id=loop_run_id,
+        ).loop_results_path
+    return configured
+
+
+def _safe_update_run_manifest(run_paths: Any, payload: dict[str, Any]) -> None:
+    try:
+        from imu_denoise.utils.paths import update_run_manifest
+
+        update_run_manifest(run_paths, payload)
+    except Exception:
+        return
+
+
 def run_autoresearch(
     *,
     config_paths: list[str],
     base_overrides: list[str] | None = None,
     max_iterations: int | None = None,
+    batch_size: int | None = None,
+    pause_enabled: bool = False,
 ) -> list[LoopResult]:
     """Run the baseline plus config mutations and record results to TSV."""
-    from autoresearch_loop.mutations import build_mutation_schedule
-    from imu_denoise.config import load_config
-    from imu_denoise.observability import ObservabilityWriter, import_hermes_state
+    from autoresearch_loop.mutations import (
+        MutationPolicyCandidate,
+        MutationProposal,
+        build_mutation_schedule,
+        choose_policy_candidate,
+    )
+    from imu_denoise.cli.common import resolve_config
+    from imu_denoise.observability import (
+        LoopAlreadyRunningError,
+        LoopController,
+        MissionControlQueries,
+        ObservabilityWriter,
+        import_hermes_state,
+    )
+    from imu_denoise.observability.control import LOOP_PAUSED
+    from imu_denoise.observability.lineage import (
+        build_change_items,
+        build_mutation_signatures,
+        data_regime_fingerprint,
+    )
+    from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
     base_overrides = list(base_overrides or [])
-    base_config = load_config(*config_paths, overrides=base_overrides)
+    base_config = resolve_config(config_paths, base_overrides)
     observability = ObservabilityWriter.from_experiment_config(base_config)
+    queries = MissionControlQueries(
+        db_path=Path(base_config.observability.db_path),
+        blob_dir=Path(base_config.observability.blob_dir),
+    )
+    loop_name = f"{base_config.name}-autoresearch"
+    loop_run_id = observability.make_run_id(name=loop_name, phase="autoresearch_loop")
+    loop_controller = LoopController.from_experiment_config(base_config, writer=observability)
     loop_run_id = observability.start_run(
-        name=f"{base_config.name}-autoresearch",
+        name=loop_name,
         phase="autoresearch_loop",
         dataset=base_config.data.dataset,
         model=base_config.model.name,
@@ -309,35 +605,286 @@ def run_autoresearch(
         objective_metric=base_config.autoresearch.metric_key,
         objective_direction=base_config.autoresearch.metric_direction,
         source="runtime",
+        run_id=loop_run_id,
+    )
+    write_run_manifest(
+        build_run_paths(base_config.output_dir, run_name=loop_name, run_id=loop_run_id),
+        {
+            "run_id": loop_run_id,
+            "name": loop_name,
+            "phase": "autoresearch_loop",
+            "regime_fingerprint": data_regime_fingerprint(base_config),
+        },
     )
     total_iterations = (
         max_iterations if max_iterations is not None else base_config.autoresearch.max_iterations
     )
-    results_file = Path(base_config.autoresearch.results_file)
+    results_file = _resolve_results_file(
+        base_config=base_config,
+        loop_run_id=loop_run_id,
+        loop_name=loop_name,
+    )
     _ensure_results_file(results_file)
+    requested_batch_size = batch_size if pause_enabled and batch_size and batch_size > 0 else None
 
     rng = Random(base_config.training.seed)
-    schedule = build_mutation_schedule(total_iterations, rng)
-    best_metric: float | None = None
+    baseline_reference = _resolve_baseline_reference(base_config, queries)
+    schedule = build_mutation_schedule(
+        total_iterations,
+        rng,
+        include_baseline=baseline_reference.include_baseline_run,
+    )
+    total_scheduled_runs = len(schedule)
     results: list[LoopResult] = []
-    hermes_used_descriptions: set[str] = set()
-
-    for iteration, fallback_proposal in enumerate(schedule):
-        proposal, proposal_source, hermes_trace, candidate_pool = _select_mutation_proposal(
-            iteration=iteration,
-            base_config=base_config,
-            rng=rng,
-            results=results,
-            fallback_proposal=fallback_proposal,
-            hermes_used_descriptions=hermes_used_descriptions,
+    best_metric = baseline_reference.metric_value
+    if best_metric is None:
+        best_metric = _best_metric_from_results(results, base_config.autoresearch.metric_direction)
+    best_run_id: str | None = baseline_reference.run_id
+    hermes_used_descriptions: set[str] = {
+        result.description for result in results if result.proposal_source == "hermes"
+    }
+    try:
+        loop_controller.initialize_loop(
+            loop_run_id=loop_run_id,
+            max_iterations=total_scheduled_runs,
+            batch_size=requested_batch_size,
+            pause_enabled=pause_enabled,
+            current_iteration=len(results),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
         )
+    except LoopAlreadyRunningError:
+        observability.finish_run(
+            run_id=loop_run_id,
+            status="failed",
+            summary={"message": "another loop is already active"},
+            source="runtime",
+        )
+        raise
+
+    observability.append_event(
+        run_id=loop_run_id,
+        event_type="baseline_reference",
+        level="INFO",
+        title="baseline policy resolved",
+        payload={
+            "mode": base_config.autoresearch.baseline.mode,
+            "include_baseline_run": baseline_reference.include_baseline_run,
+            "baseline_run_id": baseline_reference.run_id,
+            "baseline_metric_value": baseline_reference.metric_value,
+            "description": baseline_reference.description,
+        },
+        source="runtime",
+    )
+
+    for iteration, fallback_proposal in enumerate(schedule[len(results) :], start=len(results)):
+        loop_state = loop_controller.get_loop_state(loop_run_id)
+        if loop_state is None:
+            raise RuntimeError("Missing loop state for autoresearch loop.")
+        if loop_state["status"] == "paused":
+            loop_state = _wait_while_paused(
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                total_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                current_iteration=len(results),
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+            )
+
+        if bool(loop_state.get("terminate_requested")):
+            _finish_loop_with_status(
+                observability=observability,
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                status="terminated",
+                message=f"terminated after {len(results)} iterations",
+            )
+            return results
+        if bool(loop_state.get("stop_requested")):
+            _finish_loop_with_status(
+                observability=observability,
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                status="stopped",
+                message=f"stopped after {len(results)} iterations",
+            )
+            return results
+
+        should_pause = bool(loop_state.get("pause_requested"))
+        pause_reason = "manual"
+        pause_after_iteration = loop_state.get("pause_after_iteration")
+        if (
+            isinstance(pause_after_iteration, int)
+            and pause_after_iteration > 0
+            and len(results) >= pause_after_iteration
+        ):
+            should_pause = True
+            pause_reason = "batch"
+        if should_pause:
+            observability.append_event(
+                run_id=loop_run_id,
+                event_type=LOOP_PAUSED,
+                level="INFO",
+                title="loop paused",
+                payload={"reason": pause_reason, "current_iteration": len(results)},
+                source="runtime",
+            )
+            loop_controller.heartbeat(
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                pause_after_iteration=pause_after_iteration,
+                pause_requested=False,
+                stop_requested=bool(loop_state.get("stop_requested")),
+                terminate_requested=bool(loop_state.get("terminate_requested")),
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                active_child_run_id=None,
+                status="paused",
+            )
+            loop_state = _wait_while_paused(
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                total_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                current_iteration=len(results),
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+            )
+
+        queue_row = None
+        candidate_pool: list[MutationProposal] | None = None
+        policy_decision: Any | None = None
+        policy_candidate_payloads: list[dict[str, Any]] | None = None
+        if iteration > 0:
+            queue_row = loop_controller.claim_next_queued_proposal(loop_run_id=loop_run_id)
+        if queue_row is not None:
+            proposal = MutationProposal(
+                description=str(queue_row["description"]),
+                overrides=list(queue_row["overrides"]),
+            )
+            proposal_source = "human-queued"
+            hermes_trace = None
+            preferred_candidate_index = None
+        else:
+            incumbent_summary: dict[str, object] | None = None
+            if best_run_id is not None:
+                incumbent_reference = queries.get_run_reference(best_run_id)
+                if incumbent_reference is not None:
+                    incumbent_summary = {
+                        "run_id": str(incumbent_reference["run_id"]),
+                        "run_name": str(incumbent_reference["run_name"]),
+                        "model": str(incumbent_reference["model"]),
+                        "phase": str(incumbent_reference["phase"]),
+                        "metric_value": best_metric,
+                    }
+            mutation_lessons = queries.list_recent_mutation_lessons(
+                limit=6,
+                regime_fingerprint=data_regime_fingerprint(base_config),
+            )
+            (
+                candidate_pool,
+                preferred_candidate_index,
+                proposal_source,
+                hermes_trace,
+            ) = _select_mutation_proposal(
+                iteration=iteration,
+                base_config=base_config,
+                rng=rng,
+                results=results,
+                fallback_proposal=fallback_proposal,
+                hermes_used_descriptions=hermes_used_descriptions,
+                incumbent_summary=incumbent_summary,
+                mutation_lessons=mutation_lessons,
+            )
+            incumbent_config_for_policy = (
+                queries.get_run_config_payload(best_run_id) if best_run_id is not None else None
+            )
+            policy_candidates: list[MutationPolicyCandidate] = []
+            policy_candidate_payloads = []
+            current_regime_fingerprint = data_regime_fingerprint(base_config)
+            for candidate_index, candidate in enumerate(candidate_pool):
+                candidate_config = _resolve_iteration_config(
+                    base_config=base_config,
+                    base_overrides=base_overrides,
+                    proposal_overrides=list(candidate.overrides),
+                    incumbent_config=incumbent_config_for_policy,
+                )
+                candidate_change_items = build_change_items(
+                    current_config=candidate_config,
+                    reference_config=(
+                        incumbent_config_for_policy
+                        if incumbent_config_for_policy is not None
+                        else base_config
+                    ),
+                    overrides=list(candidate.overrides),
+                )
+                candidate_signatures = build_mutation_signatures(candidate_change_items)
+                candidate_regime_fingerprint = data_regime_fingerprint(candidate_config)
+                signature_stats = queries.get_mutation_stats_for_signatures(
+                    signatures=[str(item["signature"]) for item in candidate_signatures],
+                    regime_fingerprint=candidate_regime_fingerprint,
+                )
+                policy_candidates.append(
+                    MutationPolicyCandidate(
+                        proposal=candidate,
+                        signatures=[str(item["signature"]) for item in candidate_signatures],
+                        stats=[
+                            signature_stats[str(item["signature"])]
+                            for item in candidate_signatures
+                            if str(item["signature"]) in signature_stats
+                        ],
+                        hermes_preferred=(
+                            preferred_candidate_index is not None
+                            and candidate_index == preferred_candidate_index
+                        ),
+                        regime_compatible=(
+                            candidate_regime_fingerprint == current_regime_fingerprint
+                        ),
+                    )
+                )
+                policy_candidate_payloads.append(
+                    {
+                        "description": candidate.description,
+                        "overrides": list(candidate.overrides),
+                        "signatures": [str(item["signature"]) for item in candidate_signatures],
+                        "regime_fingerprint": candidate_regime_fingerprint,
+                        "regime_compatible": candidate_regime_fingerprint
+                        == current_regime_fingerprint,
+                        "hermes_preferred": (
+                            preferred_candidate_index is not None
+                            and candidate_index == preferred_candidate_index
+                        ),
+                    }
+                )
+            policy_decision = choose_policy_candidate(
+                candidates=policy_candidates,
+                strategy=base_config.autoresearch.strategy,
+                recent_results=_recent_policy_results(results),
+                rng=rng,
+            )
+            proposal = policy_decision.selected
+            if proposal_source == "hermes":
+                hermes_used_descriptions.add(proposal.description)
         observability.update_status(
             run_id=loop_run_id,
             phase="autoresearch_loop",
-            epoch=iteration,
+            epoch=len(results),
             best_metric=best_metric,
             last_metric=results[-1].metric_value if results else None,
-            message=f"iteration {iteration}",
+            message=f"iteration {len(results)}",
             source="runtime",
         )
         llm_call_id: str | None = None
@@ -380,22 +927,180 @@ def run_autoresearch(
                 "description": proposal.description,
                 "overrides": run_overrides,
                 "candidate_count": len(candidate_pool) if candidate_pool is not None else 0,
+                "policy_mode": None if policy_decision is None else policy_decision.mode,
             },
             source="runtime",
+        )
+        experiment_run_id = f"training-{iteration:03d}-{uuid4().hex}"
+        selected_incumbent_run_id = best_run_id
+        selected_incumbent_metric = best_metric
+        incumbent_config = (
+            queries.get_run_config_payload(selected_incumbent_run_id)
+            if selected_incumbent_run_id is not None
+            else None
+        )
+        resolved_config = _resolve_iteration_config(
+            base_config=base_config,
+            base_overrides=base_overrides,
+            proposal_overrides=list(proposal.overrides),
+            incumbent_config=incumbent_config,
+            extra_overrides=[
+                f"name=autoresearch_{iteration:03d}",
+                *(
+                    [f"training.time_budget_sec={base_config.autoresearch.time_budget_sec}"]
+                    if base_config.autoresearch.time_budget_sec > 0
+                    else []
+                ),
+            ],
+        )
+        reference_kind = "incumbent" if incumbent_config is not None else "base"
+        selection_rationale = (
+            f"queued proposal #{queue_row['id']}"
+            if queue_row is not None
+            else (
+                (
+                    f"{policy_decision.mode} policy selected {proposal.description}"
+                    + (
+                        " over Hermes preference"
+                        if (
+                            policy_decision is not None
+                            and preferred_candidate_index is not None
+                            and candidate_pool is not None
+                            and 0 <= preferred_candidate_index < len(candidate_pool)
+                            and candidate_pool[preferred_candidate_index].description
+                            != proposal.description
+                        )
+                        else ""
+                    )
+                )
+                if policy_decision is not None
+                else (
+                    hermes_trace.reason
+                    if hermes_trace is not None and hermes_trace.reason
+                    else f"{proposal_source} proposal selected"
+                )
+            )
+        )
+        candidate_count = (
+            len(candidate_pool)
+            if candidate_pool is not None
+            else (1 if queue_row is not None or proposal_source.startswith("static") else None)
+        )
+        selection_event = observability.record_selection_event(
+            run_id=experiment_run_id,
+            loop_run_id=loop_run_id,
+            iteration=iteration,
+            proposal_source=proposal_source,
+            description=proposal.description,
+            incumbent_run_id=selected_incumbent_run_id,
+            candidate_count=candidate_count,
+            rationale=selection_rationale,
+            policy_state={
+                "baseline_mode": base_config.autoresearch.baseline.mode,
+                "best_metric": best_metric,
+                "best_run_id": best_run_id,
+                "strategy": asdict(base_config.autoresearch.strategy),
+                "policy_mode": None if policy_decision is None else policy_decision.mode,
+                "policy_stagnating": (
+                    None if policy_decision is None else policy_decision.stagnating
+                ),
+                "policy_explore_probability": (
+                    None if policy_decision is None else policy_decision.explore_probability
+                ),
+                "selected_candidate_index": (
+                    None if policy_decision is None else policy_decision.selected_index
+                ),
+                "preferred_candidate_index": preferred_candidate_index,
+                "preferred_candidate_description": (
+                    None
+                    if preferred_candidate_index is None or candidate_pool is None
+                    else candidate_pool[preferred_candidate_index].description
+                ),
+                "policy_candidates": (
+                    None
+                    if policy_decision is None or policy_candidate_payloads is None
+                    else [
+                        {
+                            **policy_candidate_payloads[score.index],
+                            "total_score": score.total_score,
+                            "exploration_score": score.exploration_score,
+                            "novelty_score": score.novelty_score,
+                            "confidence": score.confidence,
+                            "avg_metric_delta": score.avg_metric_delta,
+                            "total_tries": score.total_tries,
+                            "keep_count": score.keep_count,
+                            "discard_count": score.discard_count,
+                            "crash_count": score.crash_count,
+                            "reasons": score.reasons,
+                        }
+                        for score in policy_decision.scored_candidates[:8]
+                    ]
+                ),
+                "candidate_descriptions": (
+                    [candidate.description for candidate in candidate_pool]
+                    if candidate_pool is not None
+                    else None
+                ),
+                "queued_proposal_id": None if queue_row is None else int(queue_row["id"]),
+            },
+            source="runtime",
+        )
+        change_set = observability.record_change_set(
+            run_id=experiment_run_id,
+            loop_run_id=loop_run_id,
+            parent_run_id=selected_incumbent_run_id,
+            incumbent_run_id=selected_incumbent_run_id,
+            reference_kind=reference_kind,
+            proposal_source=proposal_source,
+            description=proposal.description,
+            overrides=run_overrides,
+            current_config=resolved_config,
+            reference_config=incumbent_config if incumbent_config is not None else base_config,
+            source="runtime",
+        )
+        experiment_run_paths = build_run_paths(
+            base_config.output_dir,
+            run_name=resolved_config.name,
+            run_id=experiment_run_id,
+        )
+        _safe_update_run_manifest(
+            experiment_run_paths,
+            {
+                "regime_fingerprint": data_regime_fingerprint(resolved_config),
+                "resolved_config": observability.config_payload(resolved_config),
+                "selection_event": selection_event,
+                "change_set": change_set,
+            },
+        )
+        loop_controller.heartbeat(
+            loop_run_id=loop_run_id,
+            current_iteration=len(results),
+            max_iterations=total_scheduled_runs,
+            batch_size=requested_batch_size,
+            pause_after_iteration=loop_state.get("pause_after_iteration"),
+            pause_requested=bool(loop_state.get("pause_requested")),
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+            active_child_run_id=experiment_run_id,
+            status="running",
         )
 
         try:
             config, summary, experiment_run_id = _run_single_experiment(
-                config_paths=config_paths,
+                config=resolved_config,
                 overrides=run_overrides,
                 metric_key=base_config.autoresearch.metric_key,
                 parent_run_id=loop_run_id,
                 iteration=iteration,
+                run_id=experiment_run_id,
             )
             metric_value = _metric_from_summary(summary, base_config.autoresearch.metric_key)
-            if iteration == 0:
+            if iteration == 0 and baseline_reference.include_baseline_run:
                 status = "baseline"
                 best_metric = metric_value
+                best_run_id = experiment_run_id
             elif _is_better(
                 metric_value,
                 best_metric,
@@ -403,6 +1108,7 @@ def run_autoresearch(
             ):
                 status = "keep"
                 best_metric = metric_value
+                best_run_id = experiment_run_id
             else:
                 status = "discard"
 
@@ -442,6 +1148,112 @@ def run_autoresearch(
                 llm_call_id=llm_call_id,
                 source="runtime",
             )
+            observability.record_mutation_outcome(
+                run_id=experiment_run_id,
+                loop_run_id=loop_run_id,
+                regime_fingerprint=data_regime_fingerprint(resolved_config),
+                proposal_source=proposal_source,
+                description=proposal.description,
+                change_items=list(change_set["change_items"]),
+                status=status,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=metric_value,
+                incumbent_metric=selected_incumbent_metric,
+                direction=base_config.autoresearch.metric_direction,
+                source="runtime",
+            )
+            if queue_row is not None:
+                loop_controller.mark_queue_applied(
+                    proposal_id=int(queue_row["id"]),
+                    loop_run_id=loop_run_id,
+                    applied_run_id=experiment_run_id,
+                )
+            _safe_update_run_manifest(
+                experiment_run_paths,
+                {
+                    "result": {
+                        "status": status,
+                        "metric_key": base_config.autoresearch.metric_key,
+                        "metric_value": metric_value,
+                        "compared_against_run_id": selected_incumbent_run_id,
+                        "new_incumbent_run_id": best_run_id,
+                    }
+                },
+            )
+        except TrainingInterrupted as exc:
+            result = LoopResult(
+                iteration=iteration,
+                run_name=f"autoresearch_{iteration:03d}",
+                status=exc.status,
+                proposal_source=proposal_source,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                model_name="unknown",
+                description=f"{proposal.description}: {exc}",
+                overrides=run_overrides,
+                metrics_path=None,
+            )
+            observability.record_decision(
+                run_id=loop_run_id,
+                iteration=iteration,
+                proposal_source=proposal_source,
+                description=proposal.description,
+                status=exc.status,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                overrides=run_overrides,
+                candidates=(
+                    [
+                        {
+                            "description": candidate.description,
+                            "overrides": candidate.overrides,
+                        }
+                        for candidate in candidate_pool
+                    ]
+                    if candidate_pool is not None
+                    else None
+                ),
+                reason=str(exc),
+                llm_call_id=llm_call_id,
+                source="runtime",
+            )
+            _safe_update_run_manifest(
+                experiment_run_paths,
+                {
+                    "result": {
+                        "status": exc.status,
+                        "metric_key": base_config.autoresearch.metric_key,
+                        "metric_value": None,
+                        "message": str(exc),
+                    }
+                },
+            )
+            if queue_row is not None:
+                loop_controller.mark_queue_failed(
+                    proposal_id=int(queue_row["id"]),
+                    notes=str(exc),
+                )
+            _append_result(results_file, result)
+            observability.register_artifact(
+                run_id=loop_run_id,
+                path=results_file,
+                artifact_type="autoresearch_results",
+                label="results_tsv",
+                source="runtime",
+            )
+            _finish_loop_with_status(
+                observability=observability,
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                status=exc.status,
+                message=str(exc),
+            )
+            return results
         except Exception as exc:
             result = LoopResult(
                 iteration=iteration,
@@ -479,6 +1291,36 @@ def run_autoresearch(
                 llm_call_id=llm_call_id,
                 source="runtime",
             )
+            observability.record_mutation_outcome(
+                run_id=experiment_run_id,
+                loop_run_id=loop_run_id,
+                regime_fingerprint=data_regime_fingerprint(resolved_config),
+                proposal_source=proposal_source,
+                description=proposal.description,
+                change_items=list(change_set["change_items"]),
+                status="crash",
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                incumbent_metric=selected_incumbent_metric,
+                direction=base_config.autoresearch.metric_direction,
+                source="runtime",
+            )
+            _safe_update_run_manifest(
+                experiment_run_paths,
+                {
+                    "result": {
+                        "status": "crash",
+                        "metric_key": base_config.autoresearch.metric_key,
+                        "metric_value": None,
+                        "message": str(exc),
+                    }
+                },
+            )
+            if queue_row is not None:
+                loop_controller.mark_queue_failed(
+                    proposal_id=int(queue_row["id"]),
+                    notes=str(exc),
+                )
 
         _append_result(results_file, result)
         observability.register_artifact(
@@ -489,12 +1331,32 @@ def run_autoresearch(
             source="runtime",
         )
         results.append(result)
+        loop_controller.heartbeat(
+            loop_run_id=loop_run_id,
+            current_iteration=len(results),
+            max_iterations=total_scheduled_runs,
+            batch_size=requested_batch_size,
+            pause_after_iteration=loop_state.get("pause_after_iteration"),
+            pause_requested=False,
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+            active_child_run_id=None,
+            status="running",
+        )
 
-    observability.finish_run(
-        run_id=loop_run_id,
+    _finish_loop_with_status(
+        observability=observability,
+        loop_controller=loop_controller,
+        loop_run_id=loop_run_id,
+        current_iteration=len(results),
+        max_iterations=total_scheduled_runs,
+        batch_size=requested_batch_size,
+        best_metric=best_metric,
+        best_run_id=best_run_id,
         status="completed",
-        summary={"message": f"completed {len(results)} iterations"},
-        source="runtime",
+        message=f"completed {len(results)} iterations",
     )
     return results
 
@@ -502,10 +1364,13 @@ def run_autoresearch(
 def main() -> int:
     """CLI entrypoint for the local autoresearch loop."""
     args = build_parser().parse_args()
+    config_paths = list(args.config) or ["configs/training/quick.yaml"]
     results = run_autoresearch(
-        config_paths=args.config,
+        config_paths=config_paths,
         base_overrides=args.overrides,
         max_iterations=args.max_iterations,
+        batch_size=args.batch or None,
+        pause_enabled=args.pause,
     )
     print(f"Completed {len(results)} autoresearch runs.")
     if results:

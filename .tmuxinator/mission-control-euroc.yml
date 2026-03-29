@@ -1,0 +1,16 @@
+name: imu-mission-control-euroc
+root: <%= ENV.fetch("IMU_AUTORESEARCH_ROOT", "/Users/paolo/development/inertial-autoresearch") %>
+
+on_project_start: uv sync --extra monitor
+on_project_restart: uv sync --extra monitor
+pre_window: export PYTHONUNBUFFERED=1
+
+windows:
+  - mission-control-euroc:
+      layout: tiled
+      panes:
+        - tmux select-pane -T control; /bin/bash scripts/mission_control_supervisor.sh
+        - tmux select-pane -T backfill; uv run scripts/observability_backfill.py --config configs/mission_control/hermes_euroc_subset.yaml; exec $SHELL -l
+        - tmux select-pane -T monitor; uv run scripts/monitor.py --config configs/mission_control/hermes_euroc_subset.yaml; exec $SHELL -l
+        - tmux select-pane -T dashboard; uv run scripts/dashboard.py --config configs/mission_control/hermes_euroc_subset.yaml; exec $SHELL -l
+        - tmux select-pane -T autoresearch; uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_euroc_subset.yaml; exec $SHELL -l

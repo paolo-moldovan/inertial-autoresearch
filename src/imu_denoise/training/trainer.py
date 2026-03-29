@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
@@ -18,27 +20,40 @@ from imu_denoise.device.context import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
 from imu_denoise.models.base import BaseDenoiser
 from imu_denoise.observability import ObservabilityWriter
+from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training.callbacks import CheckpointManager, EarlyStopping
 from imu_denoise.training.losses import LossFn
 from imu_denoise.utils.io import save_metrics
 from imu_denoise.utils.logging import setup_logger
+from imu_denoise.utils.paths import build_run_paths, write_run_manifest
+
+
+class TrainingInterrupted(RuntimeError):
+    """Raised when an external control-plane signal interrupts training."""
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
 class TrainingArtifacts:
     """Paths produced by a training run."""
 
+    run_dir: Path
     checkpoint_dir: Path
     best_checkpoint: Path
     last_checkpoint: Path
     metrics_path: Path
     history_path: Path
+    runtime_log_path: Path
 
 
 @dataclass(frozen=True)
 class TrainingSummary:
     """Compact result of a completed training run."""
 
+    run_id: str
     best_epoch: int
     best_val_rmse: float
     final_train_loss: float
@@ -70,18 +85,28 @@ class Trainer:
         self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.scaler = device_ctx.create_scaler()
-        self.logger = setup_logger(config.name, log_dir=config.log_dir)
-        self.checkpoints = CheckpointManager(config.checkpoint_dir)
+        self.observability = observability or ObservabilityWriter.from_experiment_config(
+            config,
+            logger=None,
+        )
+        self.run_id = run_id or self.observability.make_run_id(name=config.name, phase="training")
+        self.run_paths = build_run_paths(
+            config.output_dir,
+            run_name=config.name,
+            run_id=self.run_id,
+        )
+        self.logger = setup_logger(
+            f"{config.name}.{self.run_paths.root.name}",
+            log_dir=str(self.run_paths.logs_dir),
+            log_filename="runtime",
+        )
+        self.observability.logger = self.logger
+        self.checkpoints = CheckpointManager(self.run_paths.checkpoints_dir)
         self.early_stopping = EarlyStopping(
             patience=config.training.early_stop_patience,
             mode="min",
         )
-        self.history_path = Path(config.log_dir) / f"{config.name}.history.jsonl"
-        self.observability = observability or ObservabilityWriter.from_experiment_config(
-            config,
-            logger=self.logger,
-        )
-        self.run_id = run_id
+        self.history_path = self.run_paths.history_path
         self.parent_run_id = parent_run_id
 
     def fit(
@@ -96,7 +121,7 @@ class Trainer:
         best_val_rmse = float("inf")
         last_train_loss = float("nan")
         last_val_loss = float("nan")
-        run_id = self.run_id or self.observability.start_run(
+        run_id = self.observability.start_run(
             name=self.config.name,
             phase="training",
             dataset=self.config.data.dataset,
@@ -107,9 +132,20 @@ class Trainer:
             objective_metric="val_rmse",
             objective_direction="minimize",
             source="runtime",
+            run_id=self.run_id,
         )
         log_handler = self.observability.create_log_handler(run_id)
         self.logger.addHandler(log_handler)
+        write_run_manifest(
+            self.run_paths,
+            {
+                "run_id": run_id,
+                "name": self.config.name,
+                "phase": "training",
+                "parent_run_id": self.parent_run_id,
+                "regime_fingerprint": data_regime_fingerprint(self.config),
+            },
+        )
         self.observability.update_status(
             run_id=run_id,
             phase="training",
@@ -192,6 +228,7 @@ class Trainer:
                     best_metric=best_val_rmse if best_val_rmse != float("inf") else None,
                     source="runtime",
                 )
+                self._heartbeat_parent_loop(best_metric=best_val_rmse)
 
                 if self.config.training.time_budget_sec > 0:
                     elapsed = time.perf_counter() - start_time
@@ -206,6 +243,8 @@ class Trainer:
                             source="runtime",
                         )
                         break
+
+                self._check_loop_termination()
 
                 if self.early_stopping.update(val_rmse):
                     self.logger.info("Stopping early after %d epochs without improvement.", epoch)
@@ -236,7 +275,7 @@ class Trainer:
                 "training_seconds": elapsed,
                 "test_metrics": test_metrics,
             }
-            metrics_path = Path(self.config.output_dir) / self.config.name / "metrics.json"
+            metrics_path = self.run_paths.metrics_path
             save_metrics(metrics_path, summary_metrics)
             self.observability.register_artifact(
                 run_id=run_id,
@@ -253,15 +292,23 @@ class Trainer:
                 label="history",
                 source="runtime",
             )
+            self._generate_summary_figures(
+                run_id=run_id,
+                val_loader=val_loader,
+                test_loader=test_loader,
+            )
 
             artifacts = TrainingArtifacts(
-                checkpoint_dir=self.config.checkpoint_dir,
+                run_dir=self.run_paths.root,
+                checkpoint_dir=self.run_paths.checkpoints_dir,
                 best_checkpoint=self.checkpoints.best_path,
                 last_checkpoint=self.checkpoints.last_path,
                 metrics_path=metrics_path,
                 history_path=self.history_path,
+                runtime_log_path=self.run_paths.runtime_log_path,
             )
             summary = TrainingSummary(
+                run_id=run_id,
                 best_epoch=best_epoch,
                 best_val_rmse=best_val_rmse,
                 final_train_loss=last_train_loss,
@@ -299,6 +346,7 @@ class Trainer:
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
             for batch in dataloader:
+                self._check_loop_termination()
                 noisy, clean = self._unpack_batch(batch)
                 noisy = noisy.to(self.device_ctx.device)
                 clean = clean.to(self.device_ctx.device)
@@ -335,10 +383,188 @@ class Trainer:
 
         return total_loss / max(total_batches, 1)
 
+    def _check_loop_termination(self) -> None:
+        if self.parent_run_id is None or self.observability.store is None:
+            return
+        from imu_denoise.observability.control import LoopController
+
+        controller = LoopController(store=self.observability.store, writer=self.observability)
+        loop_state = controller.get_loop_state(self.parent_run_id)
+        if loop_state is None:
+            return
+        if bool(loop_state.get("terminate_requested")):
+            raise TrainingInterrupted("terminated", "Training terminated by control-plane request.")
+
+    def _heartbeat_parent_loop(self, *, best_metric: float) -> None:
+        if self.parent_run_id is None or self.observability.store is None:
+            return
+        from imu_denoise.observability.control import LoopController
+
+        controller = LoopController(store=self.observability.store, writer=self.observability)
+        loop_state = controller.get_loop_state(self.parent_run_id)
+        if loop_state is None:
+            return
+        controller.heartbeat(
+            loop_run_id=self.parent_run_id,
+            current_iteration=int(loop_state["current_iteration"]),
+            max_iterations=int(loop_state["max_iterations"]),
+            batch_size=(
+                int(loop_state["batch_size"])
+                if isinstance(loop_state.get("batch_size"), int)
+                else None
+            ),
+            pause_after_iteration=(
+                int(loop_state["pause_after_iteration"])
+                if isinstance(loop_state.get("pause_after_iteration"), int)
+                else None
+            ),
+            pause_requested=bool(loop_state.get("pause_requested")),
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
+            best_metric=best_metric if best_metric != float("inf") else None,
+            best_run_id=(
+                str(loop_state["best_run_id"])
+                if loop_state.get("best_run_id") is not None
+                else None
+            ),
+            active_child_run_id=self.run_id,
+            status=str(loop_state.get("status") or "running"),
+        )
+
     def _sampling_rate_hz(self) -> float:
         if self.config.data.dataset == "blackbird":
             return 100.0
         return 200.0
+
+    def _generate_summary_figures(
+        self,
+        *,
+        run_id: str,
+        val_loader: DataLoader[Any],
+        test_loader: DataLoader[Any] | None,
+    ) -> None:
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib import pyplot as plt
+
+        from imu_denoise.evaluation.visualization import (
+            plot_denoising_comparison,
+            plot_error_distribution,
+            plot_psd,
+            plot_training_curves,
+        )
+
+        self.run_paths.figures_dir.mkdir(parents=True, exist_ok=True)
+
+        curves_path = self.run_paths.figures_dir / "training_curves.png"
+        curves_fig = plot_training_curves(self.history_path, save_path=curves_path)
+        plt.close(curves_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=curves_path,
+            artifact_type="figure",
+            label="training_curves",
+            source="runtime",
+        )
+
+        sample_batch = self._first_batch(test_loader) or self._first_batch(val_loader)
+        if sample_batch is None:
+            return
+
+        noisy_tensor, clean_tensor = self._unpack_batch(sample_batch)
+        timestamps_tensor = (
+            sample_batch.get("timestamps") if isinstance(sample_batch, dict) else None
+        )
+        noisy = noisy_tensor.to(self.device_ctx.device)
+        self.model.eval()
+        with torch.no_grad():
+            denoised = self.model(noisy).detach().cpu().float().numpy()
+
+        noisy_np = noisy.detach().cpu().float().numpy()
+        clean_np = clean_tensor.detach().cpu().float().numpy()
+        timestamps = self._timestamps_for_batch(
+            timestamps_tensor=timestamps_tensor,
+            sample_count=noisy_np.shape[1],
+        )
+        sample_index = 0
+
+        comparison_path = self.run_paths.figures_dir / "denoising_comparison.png"
+        comparison_fig = plot_denoising_comparison(
+            noisy=noisy_np[sample_index],
+            denoised=denoised[sample_index],
+            clean=clean_np[sample_index],
+            timestamps=timestamps[sample_index],
+            title=f"{self.config.name} denoising comparison",
+            save_path=comparison_path,
+        )
+        plt.close(comparison_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=comparison_path,
+            artifact_type="figure",
+            label="denoising_comparison",
+            source="runtime",
+        )
+
+        psd_path = self.run_paths.figures_dir / "psd.png"
+        psd_fig = plot_psd(
+            signals={
+                "noisy": noisy_np[sample_index],
+                "denoised": denoised[sample_index],
+                "clean": clean_np[sample_index],
+            },
+            fs=self._sampling_rate_hz(),
+            title=f"{self.config.name} PSD",
+            save_path=psd_path,
+        )
+        plt.close(psd_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=psd_path,
+            artifact_type="figure",
+            label="psd",
+            source="runtime",
+        )
+
+        errors_path = self.run_paths.figures_dir / "error_distribution.png"
+        errors_fig = plot_error_distribution(
+            errors=(denoised[sample_index] - clean_np[sample_index]),
+            title=f"{self.config.name} error distribution",
+            save_path=errors_path,
+        )
+        plt.close(errors_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=errors_path,
+            artifact_type="figure",
+            label="error_distribution",
+            source="runtime",
+        )
+
+    @staticmethod
+    def _first_batch(dataloader: DataLoader[Any] | None) -> dict[str, Any] | tuple[Any, ...] | None:
+        if dataloader is None:
+            return None
+        iterator = iter(dataloader)
+        try:
+            return cast(dict[str, Any] | tuple[Any, ...], next(iterator))
+        except StopIteration:
+            return None
+
+    def _timestamps_for_batch(
+        self,
+        *,
+        timestamps_tensor: torch.Tensor | None,
+        sample_count: int,
+    ) -> np.ndarray:
+        if timestamps_tensor is not None:
+            return timestamps_tensor.detach().cpu().float().numpy()
+        dt = 1.0 / self._sampling_rate_hz()
+        return np.tile(np.arange(sample_count, dtype=np.float32) * dt, (1, 1))
 
     def _step_scheduler(self, val_loss: float) -> None:
         if self.scheduler is None:

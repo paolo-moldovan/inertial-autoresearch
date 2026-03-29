@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from random import Random
+from typing import Any
+
+from imu_denoise.config.schema import AutoResearchSearchSpaceConfig, AutoResearchStrategyConfig
 
 
 @dataclass(frozen=True)
@@ -12,6 +15,88 @@ class MutationProposal:
 
     description: str
     overrides: list[str]
+    groups: tuple[str, ...] = ()
+    architecture_change: bool = False
+
+
+@dataclass(frozen=True)
+class MutationPolicyCandidate:
+    """Candidate plus mutation-memory evidence used by the local policy."""
+
+    proposal: MutationProposal
+    signatures: list[str]
+    stats: list[dict[str, Any]]
+    hermes_preferred: bool = False
+    regime_compatible: bool = True
+
+
+@dataclass(frozen=True)
+class MutationPolicyScore:
+    """Scored view of a mutation candidate."""
+
+    index: int
+    proposal: MutationProposal
+    total_score: float
+    exploration_score: float
+    novelty_score: float
+    hermes_preferred: bool
+    signature_count: int
+    total_tries: int
+    avg_metric_delta: float
+    confidence: float
+    keep_count: int
+    discard_count: int
+    crash_count: int
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
+class MutationPolicyDecision:
+    """Outcome of the local explore/exploit selector."""
+
+    selected_index: int
+    selected: MutationProposal
+    mode: str
+    stagnating: bool
+    explore_probability: float
+    scored_candidates: list[MutationPolicyScore]
+
+
+def choose_policy_candidate(
+    *,
+    candidates: list[MutationPolicyCandidate],
+    strategy: AutoResearchStrategyConfig,
+    recent_results: list[dict[str, Any]],
+    rng: Random,
+) -> MutationPolicyDecision:
+    """Choose a candidate using mutation memory plus an explore/exploit policy."""
+    if not candidates:
+        raise ValueError("No mutation candidates were provided to the policy selector.")
+
+    scored = [
+        _score_candidate(index=index, candidate=candidate, strategy=strategy)
+        for index, candidate in enumerate(candidates)
+    ]
+    scored.sort(key=lambda item: (-item.total_score, item.index))
+
+    stagnating = _is_stagnating(recent_results, patience=strategy.stagnation_patience)
+    explore_probability = _explore_probability(strategy=strategy, stagnating=stagnating)
+    mode = _select_mode(strategy=strategy, explore_probability=explore_probability, rng=rng)
+    if mode == "explore":
+        ranked = sorted(scored, key=lambda item: (-item.exploration_score, item.index))
+        top_k = max(1, min(strategy.exploit_top_k, len(ranked)))
+        selected = ranked[rng.randrange(top_k)]
+    else:
+        selected = scored[0]
+
+    return MutationPolicyDecision(
+        selected_index=selected.index,
+        selected=selected.proposal,
+        mode=mode,
+        stagnating=stagnating,
+        explore_probability=explore_probability,
+        scored_candidates=scored,
+    )
 
 
 def default_mutation_pool() -> list[MutationProposal]:
@@ -24,22 +109,27 @@ def default_mutation_pool() -> list[MutationProposal]:
         MutationProposal(
             description="lower learning rate",
             overrides=["training.lr=0.0003"],
+            groups=("training_core", "optimizer"),
         ),
         MutationProposal(
             description="higher learning rate",
             overrides=["training.lr=0.003"],
+            groups=("training_core", "optimizer"),
         ),
         MutationProposal(
             description="switch to huber loss",
             overrides=["training.loss=huber"],
+            groups=("loss",),
         ),
         MutationProposal(
             description="larger batch size",
             overrides=["training.batch_size=32"],
+            groups=("training_core",),
         ),
         MutationProposal(
             description="smaller batch size",
             overrides=["training.batch_size=8"],
+            groups=("training_core",),
         ),
         MutationProposal(
             description="conv1d baseline",
@@ -48,6 +138,8 @@ def default_mutation_pool() -> list[MutationProposal]:
                 "model.hidden_dim=64",
                 "model.num_layers=4",
             ],
+            groups=("architecture",),
+            architecture_change=True,
         ),
         MutationProposal(
             description="small transformer",
@@ -57,6 +149,8 @@ def default_mutation_pool() -> list[MutationProposal]:
                 "model.num_layers=2",
                 "model.num_heads=4",
             ],
+            groups=("architecture",),
+            architecture_change=True,
         ),
         MutationProposal(
             description="deeper lstm",
@@ -65,22 +159,242 @@ def default_mutation_pool() -> list[MutationProposal]:
                 "model.hidden_dim=128",
                 "model.num_layers=3",
             ],
+            groups=("architecture",),
+            architecture_change=True,
         ),
         MutationProposal(
             description="enable augmentation",
             overrides=["data.augment=true"],
+            groups=("augmentation", "data"),
         ),
     ]
 
 
-def build_mutation_schedule(max_iterations: int, rng: Random) -> list[MutationProposal]:
-    """Build a baseline-first mutation schedule of the requested length."""
+def build_mutation_schedule(
+    max_iterations: int,
+    rng: Random,
+    *,
+    include_baseline: bool = True,
+) -> list[MutationProposal]:
+    """Build a mutation schedule with an optional baseline-first seed proposal."""
     pool = default_mutation_pool()
     baseline = pool[0]
     candidates = pool[1:]
     rng.shuffle(candidates)
 
-    selected = [baseline]
-    while len(selected) < max_iterations + 1:
+    selected = [baseline] if include_baseline else []
+    target_length = max_iterations + 1 if include_baseline else max_iterations
+    while len(selected) < target_length:
         selected.extend(candidates)
-    return selected[: max_iterations + 1]
+    return selected[:target_length]
+
+
+def proposal_paths(proposal: MutationProposal) -> list[str]:
+    """Return the dotted config paths touched by a proposal."""
+    paths: list[str] = []
+    for override in proposal.overrides:
+        if "=" not in override:
+            continue
+        path, _value = override.split("=", 1)
+        paths.append(path.strip())
+    return paths
+
+
+def filter_mutation_proposals(
+    proposals: list[MutationProposal],
+    search_space: AutoResearchSearchSpaceConfig,
+) -> tuple[list[MutationProposal], dict[str, list[str]]]:
+    """Filter proposals against the configured search-space constraints."""
+    allowed: list[MutationProposal] = []
+    blocked: dict[str, list[str]] = {}
+    for proposal in proposals:
+        is_allowed, reasons = _proposal_allowed(proposal, search_space)
+        if is_allowed:
+            allowed.append(proposal)
+        else:
+            blocked[proposal.description] = reasons
+    return allowed, blocked
+
+
+def _proposal_allowed(
+    proposal: MutationProposal,
+    search_space: AutoResearchSearchSpaceConfig,
+) -> tuple[bool, list[str]]:
+    groups = set(proposal.groups)
+    paths = proposal_paths(proposal)
+    reasons: list[str] = []
+
+    if search_space.architecture_mode == "fixed" and proposal.architecture_change:
+        reasons.append("architecture_fixed")
+    if search_space.architecture_mode == "tune" and proposal.architecture_change:
+        reasons.append("architecture_tune_only")
+
+    deny_groups = {item for item in search_space.deny_groups if item}
+    blocked_groups = sorted(groups & deny_groups)
+    if blocked_groups:
+        reasons.append(f"deny_groups={','.join(blocked_groups)}")
+
+    for path in paths:
+        if any(_path_matches_prefix(path, prefix) for prefix in search_space.freeze):
+            reasons.append(f"frozen:{path}")
+        if any(_path_matches_prefix(path, prefix) for prefix in search_space.deny):
+            reasons.append(f"deny:{path}")
+
+    allow_paths = [item for item in search_space.allow if item]
+    allow_groups = {item for item in search_space.allow_groups if item}
+    if allow_paths or allow_groups:
+        allowed_by_group = bool(groups & allow_groups)
+        allowed_by_path = all(
+            any(_path_matches_prefix(path, prefix) for prefix in allow_paths)
+            for path in paths
+        ) if paths else False
+        if not allowed_by_group and not allowed_by_path:
+            reasons.append("outside_allowed_search_space")
+
+    return not reasons, reasons
+
+
+def _path_matches_prefix(path: str, prefix: str) -> bool:
+    normalized_prefix = prefix.strip()
+    return path == normalized_prefix or path.startswith(normalized_prefix + ".")
+
+
+def _score_candidate(
+    *,
+    index: int,
+    candidate: MutationPolicyCandidate,
+    strategy: AutoResearchStrategyConfig,
+) -> MutationPolicyScore:
+    known_stats = candidate.stats
+    signature_count = len(candidate.signatures)
+    total_tries = sum(int(item.get("tries", 0)) for item in known_stats)
+    keep_count = sum(int(item.get("keep_count", 0)) for item in known_stats)
+    discard_count = sum(int(item.get("discard_count", 0)) for item in known_stats)
+    crash_count = sum(int(item.get("crash_count", 0)) for item in known_stats)
+    avg_metric_delta = (
+        sum(
+            float(item["avg_metric_delta"])
+            for item in known_stats
+            if isinstance(item.get("avg_metric_delta"), (int, float))
+        )
+        / max(
+            1,
+            sum(
+                1
+                for item in known_stats
+                if isinstance(item.get("avg_metric_delta"), (int, float))
+            ),
+        )
+    )
+    confidence = (
+        sum(float(item.get("confidence", 0.0)) for item in known_stats) / max(1, len(known_stats))
+    )
+    known_signatures = {str(item.get("signature")) for item in known_stats}
+    novelty_count = sum(
+        1 for signature in candidate.signatures if signature not in known_signatures
+    )
+    novelty_score = strategy.novelty_bonus if novelty_count > 0 else 0.0
+    if not candidate.regime_compatible:
+        return MutationPolicyScore(
+            index=index,
+            proposal=candidate.proposal,
+            total_score=-1_000_000.0,
+            exploration_score=-1_000_000.0,
+            novelty_score=0.0,
+            hermes_preferred=candidate.hermes_preferred,
+            signature_count=signature_count,
+            total_tries=total_tries,
+            avg_metric_delta=avg_metric_delta,
+            confidence=confidence,
+            keep_count=keep_count,
+            discard_count=discard_count,
+            crash_count=crash_count,
+            reasons=["regime_incompatible"],
+        )
+    retry_penalty = 0.0
+    if strategy.max_retries_per_signature > 0:
+        over_limit = sum(
+            max(0, int(item.get("tries", 0)) - strategy.max_retries_per_signature)
+            for item in known_stats
+        )
+        retry_penalty = 0.05 * over_limit
+    total_score = avg_metric_delta
+    total_score += strategy.confidence_weight * (confidence - 0.5)
+    total_score += novelty_score
+    total_score -= strategy.discard_penalty * discard_count
+    total_score -= strategy.crash_penalty * crash_count
+    total_score -= retry_penalty
+    reasons: list[str] = []
+    if avg_metric_delta != 0.0:
+        reasons.append(f"avg_delta={avg_metric_delta:.4f}")
+    if confidence > 0:
+        reasons.append(f"confidence={confidence:.2f}")
+    if novelty_count > 0:
+        reasons.append(f"novelty+{novelty_score:.2f}")
+    if discard_count > 0:
+        reasons.append(f"discard_penalty={discard_count}")
+    if crash_count > 0:
+        reasons.append(f"crash_penalty={crash_count}")
+    if retry_penalty > 0:
+        reasons.append(f"retry_penalty={retry_penalty:.2f}")
+    if candidate.hermes_preferred:
+        total_score += strategy.hermes_bonus
+        reasons.append(f"hermes_bonus={strategy.hermes_bonus:.2f}")
+
+    exploration_score = novelty_score + max(0.0, strategy.novelty_bonus - 0.03 * total_tries)
+    if candidate.hermes_preferred:
+        exploration_score += 0.5 * strategy.hermes_bonus
+    return MutationPolicyScore(
+        index=index,
+        proposal=candidate.proposal,
+        total_score=total_score,
+        exploration_score=exploration_score,
+        novelty_score=novelty_score,
+        hermes_preferred=candidate.hermes_preferred,
+        signature_count=signature_count,
+        total_tries=total_tries,
+        avg_metric_delta=avg_metric_delta,
+        confidence=confidence,
+        keep_count=keep_count,
+        discard_count=discard_count,
+        crash_count=crash_count,
+        reasons=reasons,
+    )
+
+
+def _is_stagnating(recent_results: list[dict[str, Any]], *, patience: int) -> bool:
+    if patience <= 0:
+        return False
+    completed = [
+        result
+        for result in recent_results
+        if result.get("status") in {"keep", "discard", "baseline"}
+    ]
+    window = completed[-patience:]
+    if len(window) < patience:
+        return False
+    return not any(result.get("status") == "keep" for result in window)
+
+
+def _explore_probability(
+    *,
+    strategy: AutoResearchStrategyConfig,
+    stagnating: bool,
+) -> float:
+    probability = strategy.explore_probability
+    if stagnating:
+        probability += strategy.stagnation_explore_boost
+    return max(0.0, min(1.0, probability))
+
+
+def _select_mode(
+    *,
+    strategy: AutoResearchStrategyConfig,
+    explore_probability: float,
+    rng: Random,
+) -> str:
+    if strategy.mode == "explore":
+        return "explore"
+    if strategy.mode == "exploit":
+        return "exploit"
+    return "explore" if rng.random() < explore_probability else "exploit"

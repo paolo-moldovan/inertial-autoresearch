@@ -41,7 +41,7 @@ class DecisionRecord:
     """A single autoresearch decision outcome."""
 
     run_id: str
-    iteration: int
+    iteration: int | None
     proposal_source: str
     description: str
     status: str
@@ -94,4 +94,3 @@ class StatusSnapshotRecord:
     last_metric: float | None
     heartbeat_at: float
     message: str | None
-

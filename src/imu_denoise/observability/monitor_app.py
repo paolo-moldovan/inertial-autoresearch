@@ -2,143 +2,202 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
-from imu_denoise.observability.queries import MissionControlQueries
+from imu_denoise.config.schema import ObservabilityConfig
+from imu_denoise.observability import LoopController, MissionControlQueries, ObservabilityStore
+from imu_denoise.observability.writer import ObservabilityWriter
 
 
 def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
-    """Start the Textual read-only monitor."""
+    """Start the Textual operator console."""
     try:
         from textual.app import App, ComposeResult
-        from textual.containers import Horizontal, Vertical
-        from textual.widgets import (
-            DataTable,
-            Footer,
-            Header,
-            Static,
-        )
+        from textual.containers import Vertical
+        from textual.widgets import DataTable, Footer, Header, Static
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "Textual is not installed. Install `imu-denoise[monitor]` to use imu-monitor."
         ) from exc
 
     queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
+    store = ObservabilityStore(db_path=db_path, blob_dir=blob_dir)
+    writer = ObservabilityWriter(
+        config=ObservabilityConfig(
+            enabled=True,
+            db_path=str(db_path),
+            blob_dir=str(blob_dir),
+        ),
+        store=store,
+    )
+    controller = LoopController(store=store, writer=writer)
+
+    class FocusableStatic(Static):
+        can_focus = True
 
     class MissionControlApp(App[None]):
-        """Minimal live console for run, decision, and trace status."""
+        """Minimal live console for status, live run, and recent decisions."""
 
-        BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh")]
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+            ("d", "detail", "Detail"),
+            ("p", "pause", "Pause"),
+            ("r", "resume", "Resume"),
+            ("s", "stop", "Stop"),
+            ("t", "terminate", "Terminate"),
+            ("tab", "cycle_sections", "Cycle"),
+        ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._detail_open = False
+            self._focus_order = ["#status", "#live_run", "#recent_decisions", "#detail"]
+            self._focus_index = 0
+            self._decision_rows: list[dict[str, Any]] = []
 
         def compose(self) -> ComposeResult:
             yield Header()
             with Vertical():
-                with Horizontal():
-                    yield DataTable(id="active_runs")
-                    yield DataTable(id="decisions")
-                with Horizontal():
-                    yield DataTable(id="llm_calls")
-                    yield Static(id="detail")
-                yield DataTable(id="artifacts")
+                yield FocusableStatic(id="status")
+                yield FocusableStatic(id="live_run")
+                yield DataTable(id="recent_decisions")
+                yield FocusableStatic(id="detail")
             yield Footer()
 
         def on_mount(self) -> None:
-            self.query_one("#active_runs", DataTable).add_columns(
-                "run",
-                "phase",
-                "status",
-                "epoch",
-                "best",
-                "last",
-                "heartbeat",
-            )
-            self.query_one("#decisions", DataTable).add_columns(
-                "run",
-                "iter",
-                "source",
-                "decision",
-                "status",
-                "metric",
-            )
-            self.query_one("#llm_calls", DataTable).add_columns(
-                "run",
-                "model",
-                "status",
-                "latency_ms",
-                "reason",
-            )
-            self.query_one("#artifacts", DataTable).add_columns(
-                "run",
-                "type",
-                "label",
-                "path",
-            )
+            decisions = self.query_one("#recent_decisions", DataTable)
+            decisions.add_columns("iter", "source", "run", "decision", "status", "metric")
             self.set_interval(max(1.0 / max(refresh_hz, 1), 0.25), self.refresh_data)
             self.refresh_data()
 
-        def action_refresh(self) -> None:
+        def action_detail(self) -> None:
+            self._detail_open = not self._detail_open
             self.refresh_data()
 
-        def refresh_data(self) -> None:
-            active_runs = queries.list_active_runs()
-            decisions = queries.list_recent_decisions(limit=12)
-            llm_calls = queries.list_recent_llm_calls(limit=12)
-            artifacts = queries.list_artifacts()[:12]
+        def action_pause(self) -> None:
+            controller.request_pause()
+            self.refresh_data()
 
-            active_table = self.query_one("#active_runs", DataTable)
-            active_table.clear()
-            for row in active_runs:
-                active_table.add_row(
-                    row["name"],
-                    row["phase"],
-                    row["status"],
-                    str(row.get("epoch") or ""),
-                    _fmt_metric(row.get("best_metric")),
-                    _fmt_metric(row.get("last_metric")),
-                    _fmt_float(row.get("heartbeat_at")),
+        def action_resume(self) -> None:
+            controller.resume_loop()
+            self.refresh_data()
+
+        def action_stop(self) -> None:
+            controller.request_stop()
+            self.refresh_data()
+
+        def action_terminate(self) -> None:
+            controller.request_terminate()
+            self.refresh_data()
+
+        def action_cycle_sections(self) -> None:
+            self._focus_index = (self._focus_index + 1) % len(self._focus_order)
+            self.query_one(self._focus_order[self._focus_index]).focus()
+
+        def refresh_data(self) -> None:
+            summary = queries.get_mission_control_summary(limit=10)
+            loop_state = summary["loop_state"]
+            best_result = summary["best_result"]
+
+            status_widget = self.query_one("#status", Static)
+            if loop_state is None:
+                status_widget.update("STATUS\nNo active loop.")
+            else:
+                best_text = (
+                    f"{float(best_result['metric_value']):.6f} ({best_result['run_name']})"
+                    if isinstance(best_result, dict)
+                    and isinstance(best_result.get("metric_value"), (int, float))
+                    else "n/a"
+                )
+                status_widget.update(
+                    "STATUS\n"
+                    f"Loop: {loop_state['status']}  |  "
+                    "Iteration "
+                    f"{loop_state['current_iteration']}/{loop_state['max_iterations']}  |  "
+                    f"Best: {best_text}  |  "
+                    "Flags "
+                    f"pause={loop_state.get('pause_requested')} "
+                    f"stop={loop_state.get('stop_requested')} "
+                    f"term={loop_state.get('terminate_requested')}"
                 )
 
-            decision_table = self.query_one("#decisions", DataTable)
-            decision_table.clear()
-            for row in decisions:
-                decision_table.add_row(
+            live_widget = self.query_one("#live_run", Static)
+            active_runs = queries.list_active_runs()
+            if active_runs:
+                current = active_runs[0]
+                progress_ratio = 0.0
+                max_iterations = float(loop_state["max_iterations"]) if loop_state else 0.0
+                if max_iterations > 0 and loop_state is not None:
+                    progress_ratio = min(
+                        float(loop_state["current_iteration"]) / max_iterations,
+                        1.0,
+                    )
+                live_widget.update(
+                    "LIVE RUN\n"
+                    f"{current['name']}  |  epoch {current.get('epoch') or '-'}  |  "
+                    f"val_rmse {_fmt_metric(current.get('last_metric'))}\n"
+                    f"{_progress_bar(progress_ratio)}"
+                )
+            else:
+                live_widget.update("LIVE RUN\nNo active experiment run.")
+
+            decisions_widget = self.query_one("#recent_decisions", DataTable)
+            decisions_widget.clear()
+            self._decision_rows = list(summary.get("recent_decisions") or [])
+            for row in self._decision_rows:
+                decisions_widget.add_row(
+                    str(row.get("iteration") or ""),
+                    str(row["proposal_source"]),
                     str(row.get("run_name") or row.get("run_id") or ""),
-                    str(row["iteration"]),
-                    row["proposal_source"],
-                    row["description"],
-                    row["status"],
+                    str(row["description"]),
+                    str(row["status"]),
                     _fmt_metric(row.get("metric_value")),
                 )
 
-            llm_table = self.query_one("#llm_calls", DataTable)
-            llm_table.clear()
-            for row in llm_calls:
-                llm_table.add_row(
-                    str(row.get("run_name") or row.get("run_id") or ""),
-                    str(row.get("model") or ""),
-                    row["status"],
-                    _fmt_metric(row.get("latency_ms")),
-                    str(row.get("reason") or ""),
-                )
+            detail_widget = self.query_one("#detail", Static)
+            if not self._detail_open:
+                detail_widget.update("DETAIL\nPress `d` to toggle detail.")
+                return
 
-            artifact_table = self.query_one("#artifacts", DataTable)
-            artifact_table.clear()
-            for row in artifacts:
-                artifact_table.add_row(
-                    str(row.get("run_id") or ""),
-                    row["artifact_type"],
-                    str(row.get("label") or ""),
-                    row["path"],
-                )
-
-            detail = {
-                "overview": queries.overview(),
-                "latest_decision": decisions[0] if decisions else None,
-                "latest_llm_call": llm_calls[0] if llm_calls else None,
-            }
-            self.query_one("#detail", Static).update(json.dumps(detail, indent=2, default=str))
+            if best_result is None:
+                detail_widget.update("DETAIL\nNo leaderboard entry available.")
+                return
+            selected_run_id = str(best_result["run_id"])
+            cursor_row = getattr(decisions_widget, "cursor_row", 0)
+            if (
+                isinstance(cursor_row, int)
+                and 0 <= cursor_row < len(self._decision_rows)
+                and self._decision_rows[cursor_row].get("run_id")
+            ):
+                selected_run_id = str(self._decision_rows[cursor_row]["run_id"])
+            detail = queries.get_run_detail(selected_run_id)
+            if detail is None:
+                detail_widget.update("DETAIL\nBest run detail not found.")
+                return
+            identity = detail["identity"] or {}
+            lineage = detail.get("lineage") or {}
+            policy_context = detail.get("policy_context") or {}
+            parent = lineage.get("parent") or {}
+            incumbent = lineage.get("incumbent") or {}
+            related_lessons = detail.get("related_lessons") or []
+            change_diff = detail.get("change_diff") or []
+            detail_widget.update(
+                "DETAIL\n"
+                f"Run: {identity.get('run_name')}\n"
+                f"Run ID: {identity.get('run_id_short')}\n"
+                f"Experiment ID: {identity.get('experiment_id_short') or 'n/a'}\n"
+                f"Regime: {identity.get('regime_fingerprint_short') or 'n/a'}\n"
+                "Parent: "
+                f"{parent.get('run_name') or 'n/a'} "
+                f"({parent.get('run_id_short') or 'n/a'})\n"
+                "Incumbent: "
+                f"{incumbent.get('run_name') or 'n/a'} ({incumbent.get('run_id_short') or 'n/a'})\n"
+                f"Policy: {policy_context.get('policy_mode') or 'n/a'}\n"
+                f"Why: {policy_context.get('rationale') or 'n/a'}\n"
+                f"Diffs: {len(change_diff)}  |  Curves: {len(detail['curves'])}\n"
+                f"Lessons: {len(related_lessons)}  |  LLM Calls: {len(detail['llm_calls'])}"
+            )
 
     MissionControlApp().run()
 
@@ -149,7 +208,6 @@ def _fmt_metric(value: Any) -> str:
     return ""
 
 
-def _fmt_float(value: Any) -> str:
-    if isinstance(value, (int, float)):
-        return f"{float(value):.0f}"
-    return ""
+def _progress_bar(ratio: float, width: int = 24) -> str:
+    filled = int(width * max(0.0, min(ratio, 1.0)))
+    return "█" * filled + "░" * (width - filled)

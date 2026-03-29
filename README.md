@@ -24,63 +24,118 @@ uv sync --extra dev --extra monitor --extra monitor-adapters
 
 ## Core Commands
 
-Train a model:
+Preferred unified CLI:
 
 ```bash
-uv run scripts/train.py --config configs/models/lstm.yaml
+uv run imu run --config configs/models/lstm.yaml
 ```
 
 Quick synthetic smoke run:
 
 ```bash
-uv run scripts/train.py --config configs/models/lstm.yaml --config configs/training/quick.yaml
+uv run imu run --config configs/training/quick.yaml
 ```
 
 Evaluate a checkpoint:
 
 ```bash
-uv run scripts/evaluate.py \
-  --config configs/models/lstm.yaml \
-  --config configs/training/quick.yaml \
-  --checkpoint artifacts/checkpoints/default/best.pt
+uv run imu eval \
+  --config configs/training/quick.yaml
 ```
+
+If you omit `--checkpoint`, `imu eval` now looks up the latest matching completed training run in Mission Control and uses its `best` checkpoint automatically.
 
 Run a classical baseline:
 
 ```bash
-uv run scripts/run_baseline.py --config configs/training/quick.yaml --baseline kalman
+uv run imu baseline --config configs/training/quick.yaml --baseline kalman
 ```
 
 Preprocess data:
 
 ```bash
-uv run scripts/preprocess_data.py
+uv run imu-preprocess
 ```
+
+Legacy compatibility entrypoints still work:
+- `imu-train`
+- `imu-eval`
+- `imu-baseline`
+- `imu-monitor`
+- `imu-dashboard`
 
 ## AutoResearch
 
 Local Hermes + Ollama smoke run:
 
 ```bash
-uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml
+uv run imu loop --config configs/mission_control/hermes_smoke.yaml
 ```
 
-The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is `autoresearch_loop/loop.py`.
+Batch/review mode:
+
+```bash
+uv run imu loop --config configs/mission_control/hermes_smoke.yaml --batch 5 --pause
+```
+
+Queue a human proposal for the active loop:
+
+```bash
+uv run imu queue "try transformer with huber loss" \
+  --set model.name=transformer \
+  --set training.loss=huber
+```
+
+Resume a paused loop and inspect status:
+
+```bash
+uv run imu loop --resume
+uv run imu status
+```
+
+Request a graceful stop after the current iteration, or force-terminate the active run:
+
+```bash
+uv run imu stop
+uv run imu stop --terminate
+```
+
+Queue a rerun of a previous run for the active loop:
+
+```bash
+uv run imu rerun --run-id <run-id-or-prefix>
+```
+
+Control how loop baselines are chosen:
+
+```yaml
+autoresearch:
+  baseline:
+    mode: per_loop   # per_loop | global | manual
+    run_id: ""       # required when mode=manual
+```
+
+- `per_loop`: run a fresh baseline at iteration `0`
+- `global`: reuse the latest completed baseline run for the same dataset and model if one exists
+- `manual`: pin the baseline to a specific prior run id or id prefix
+
+The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is [autoresearch_loop/loop.py](/Users/paolo/development/inertial-autoresearch/autoresearch_loop/loop.py).
 
 ## Mission Control
 
 One command to run the dashboard:
 
 ```bash
-uv run --extra monitor imu-dashboard
+uv run --extra monitor imu dashboard
 ```
 
-That starts the Streamlit dashboard on `http://localhost:8501` by default.
+That starts the local Mission Control web dashboard on `http://127.0.0.1:8501` by default.
+It is no longer Streamlit-backed, so the page updates in place from JSON polling instead of rerunning and losing UI state.
 
 One command to run the live Textual monitor:
 
 ```bash
-uv run --extra monitor imu-monitor
+uv run --extra monitor imu monitor
 ```
 
 Backfill existing artifacts and Hermes state into Mission Control:
@@ -95,11 +150,27 @@ Start the full tmuxinator Mission Control session:
 uv run scripts/start_mission_control.py
 ```
 
-That session starts:
+That opens one tmux window in a tiled grid with panes for:
+- control
 - backfill
 - monitor
 - dashboard
 - autoresearch
+
+The `control` pane is the session supervisor. In that pane you can:
+- type `1`, `2`, `3`, `4` to jump between panes
+- type `list` to show pane mappings
+- type `exit` or press `Ctrl-C` to kill the entire Mission Control session immediately
+
+So you can watch everything at once instead of switching between tmux windows.
+
+Start the EuRoC Mission Control profile:
+
+```bash
+uv run scripts/start_mission_control.py --profile euroc
+```
+
+That uses [configs/mission_control/hermes_euroc_subset.yaml](/Users/paolo/development/inertial-autoresearch/configs/mission_control/hermes_euroc_subset.yaml) and is intended for a real-data subset run on the currently processed EuRoC Machine Hall sequences.
 
 ## Mission Control Phase 2
 
@@ -151,5 +222,8 @@ uv run --extra dev mypy src
 
 - Device auto-detection is `CUDA > MPS > CPU`.
 - Override device manually with `--set device.preferred=cpu`.
+- Run outputs now use a per-run layout under `artifacts/runs/<run-name>--<token>/`.
+- Typical run contents are `checkpoints/`, `logs/runtime.jsonl`, `logs/history.jsonl`, `figures/`, `metrics.json`, and `run.json`.
+- The observability DB remains shared under `artifacts/observability/`; experiment grouping lives there, while filesystem layout is run-centric to avoid overwriting repeated runs.
 - Default Mission Control database: `artifacts/observability/mission_control.db`
 - Default Mission Control blob store: `artifacts/observability/blobs`

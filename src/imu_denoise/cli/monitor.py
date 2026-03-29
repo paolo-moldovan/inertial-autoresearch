@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 from imu_denoise.cli.common import add_common_config_arguments, resolve_config
 from imu_denoise.observability.monitor_app import run_monitor
@@ -28,14 +29,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def run_command(args: Any) -> int:
     config = resolve_config(args.config, args.overrides)
     db_path = Path(args.db_path or config.observability.db_path)
     blob_dir = Path(args.blob_dir or config.observability.blob_dir)
     refresh_hz = args.refresh_hz or config.observability.tui_refresh_hz
     run_monitor(db_path=db_path, blob_dir=blob_dir, refresh_hz=refresh_hz)
     return 0
+
+
+def main() -> int:
+    return run_command(build_parser().parse_args())
 
 
 if __name__ == "__main__":

@@ -16,6 +16,26 @@ class DeviceConfig:
 
 
 @dataclass(frozen=True)
+class DataSubsetConfig:
+    """Reproducible split-local data subsetting for quick experiments."""
+
+    enabled: bool = False
+    seed: int = 42
+    train_sequence_fraction: float = 1.0
+    val_sequence_fraction: float = 1.0
+    test_sequence_fraction: float = 1.0
+    train_max_sequences: int | None = None
+    val_max_sequences: int | None = None
+    test_max_sequences: int | None = None
+    train_window_fraction: float = 1.0
+    val_window_fraction: float = 1.0
+    test_window_fraction: float = 1.0
+    train_max_windows: int | None = None
+    val_max_windows: int | None = None
+    test_max_windows: int | None = None
+
+
+@dataclass(frozen=True)
 class DataConfig:
     """Dataset and preprocessing settings."""
 
@@ -29,6 +49,7 @@ class DataConfig:
     train_sequences: list[str] = field(default_factory=list)
     val_sequences: list[str] = field(default_factory=list)
     test_sequences: list[str] = field(default_factory=list)
+    subset: DataSubsetConfig = field(default_factory=DataSubsetConfig)
     data_dir: str = "data"
 
 
@@ -87,6 +108,44 @@ class HermesConfig:
 
 
 @dataclass(frozen=True)
+class AutoResearchBaselineConfig:
+    """Baseline selection policy for autoresearch loops."""
+
+    mode: str = "per_loop"  # "per_loop" | "global" | "manual"
+    run_id: str = ""
+
+
+@dataclass(frozen=True)
+class AutoResearchStrategyConfig:
+    """Adaptive explore/exploit policy for autoresearch candidate selection."""
+
+    mode: str = "adaptive"  # "adaptive" | "exploit" | "explore"
+    explore_probability: float = 0.15
+    stagnation_patience: int = 3
+    stagnation_explore_boost: float = 0.20
+    exploit_top_k: int = 3
+    novelty_bonus: float = 0.10
+    max_retries_per_signature: int = 2
+    hermes_bonus: float = 0.05
+    confidence_weight: float = 0.15
+    discard_penalty: float = 0.08
+    crash_penalty: float = 0.20
+
+
+@dataclass(frozen=True)
+class AutoResearchSearchSpaceConfig:
+    """Constraints that shape which experiment mutations Hermes may propose."""
+
+    freeze: list[str] = field(default_factory=list)
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+    allow_groups: list[str] = field(default_factory=list)
+    deny_groups: list[str] = field(default_factory=list)
+    architecture_mode: str = "branch"  # "fixed" | "tune" | "evolve" | "branch"
+    baseline_mode: str = "exploit"  # "exploit" | "mutate_baseline" | "branch_from_baseline"
+
+
+@dataclass(frozen=True)
 class AutoResearchConfig:
     """Auto-research loop settings."""
 
@@ -96,6 +155,11 @@ class AutoResearchConfig:
     metric_direction: str = "minimize"  # "minimize" | "maximize"
     results_file: str = "artifacts/autoresearch/results.tsv"
     orchestrator: str = "none"  # "none" | "hermes" | "researchclaw"
+    baseline: AutoResearchBaselineConfig = field(default_factory=AutoResearchBaselineConfig)
+    strategy: AutoResearchStrategyConfig = field(default_factory=AutoResearchStrategyConfig)
+    search_space: AutoResearchSearchSpaceConfig = field(
+        default_factory=AutoResearchSearchSpaceConfig
+    )
     hermes: HermesConfig = field(default_factory=HermesConfig)
 
 
@@ -135,6 +199,10 @@ class ExperimentConfig:
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     output_dir: str = "artifacts"
     log_dir: str = "artifacts/logs"
+
+    @property
+    def runs_dir(self) -> Path:
+        return Path(self.output_dir) / "runs"
 
     @property
     def checkpoint_dir(self) -> Path:

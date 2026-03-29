@@ -84,8 +84,12 @@ def _dict_to_dataclass(cls: type, data: dict[str, Any]) -> Any:
 def _resolve_type(cls: type, field_name: str) -> type | None:
     """Resolve dataclass field types from annotations."""
     from imu_denoise.config.schema import (
+        AutoResearchBaselineConfig,
         AutoResearchConfig,
+        AutoResearchSearchSpaceConfig,
+        AutoResearchStrategyConfig,
         DataConfig,
+        DataSubsetConfig,
         DeviceConfig,
         HermesConfig,
         ModelConfig,
@@ -106,7 +110,16 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
 
     if cls is AutoResearchConfig:
         nested_type_map: dict[str, type] = {
+            "baseline": AutoResearchBaselineConfig,
+            "strategy": AutoResearchStrategyConfig,
+            "search_space": AutoResearchSearchSpaceConfig,
             "hermes": HermesConfig,
+        }
+        return nested_type_map.get(field_name)
+
+    if cls is DataConfig:
+        nested_type_map = {
+            "subset": DataSubsetConfig,
         }
         return nested_type_map.get(field_name)
 
@@ -118,6 +131,44 @@ def load_yaml(path: Path) -> dict[str, Any]:
     with open(path) as f:
         data = yaml.safe_load(f)
     return data if data is not None else {}
+
+
+def _selected_model_name(data: dict[str, Any], overrides: list[str] | None = None) -> str | None:
+    resolved = _apply_cli_overrides(data, overrides or []) if overrides else copy.deepcopy(data)
+    model = resolved.get("model")
+    if not isinstance(model, dict):
+        return None
+    name = model.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _merge_auto_model_config(
+    merged: dict[str, Any],
+    *,
+    selected_model: str | None,
+) -> dict[str, Any]:
+    if selected_model is None:
+        return merged
+    model_config_path = Path("configs/models") / f"{selected_model}.yaml"
+    if not model_config_path.exists():
+        return merged
+    return _deep_merge(merged, load_yaml(model_config_path))
+
+
+def load_config_from_dict(
+    data: dict[str, Any],
+    *,
+    overrides: list[str] | None = None,
+) -> ExperimentConfig:
+    """Resolve an experiment config from an already-merged mapping."""
+    merged = copy.deepcopy(data)
+    merged = _merge_auto_model_config(
+        merged,
+        selected_model=_selected_model_name(merged, overrides),
+    )
+    if overrides:
+        merged = _apply_cli_overrides(merged, overrides)
+    return cast(ExperimentConfig, _dict_to_dataclass(ExperimentConfig, merged))
 
 
 def load_config(
@@ -140,7 +191,4 @@ def load_config(
             data = load_yaml(path)
             merged = _deep_merge(merged, data)
 
-    if overrides:
-        merged = _apply_cli_overrides(merged, overrides)
-
-    return cast(ExperimentConfig, _dict_to_dataclass(ExperimentConfig, merged))
+    return load_config_from_dict(merged, overrides=overrides)

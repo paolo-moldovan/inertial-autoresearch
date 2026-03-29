@@ -1,0 +1,41 @@
+name: mission-control-euroc-subset
+
+data:
+  dataset: euroc
+  window_size: 200
+  stride: 100
+  normalize: true
+  augment: false
+  train_sequences:
+    - MH_01_easy
+  val_sequences:
+    - MH_04_difficult
+  test_sequences:
+    - MH_05_difficult
+  subset:
+    enabled: true
+    seed: 42
+    train_max_sequences: 1
+    val_max_sequences: 1
+    test_max_sequences: 1
+    train_max_windows: 128
+    val_max_windows: 32
+    test_max_windows: 32
+
+training:
+  epochs: 50
+  batch_size: 16
+  num_workers: 0
+  time_budget_sec: 0
+
+autoresearch:
+  max_iterations: 10
+  orchestrator: hermes
+  hermes:
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3.5:latest
+
+observability:
+  db_path: artifacts/observability/mission_control.db
+  blob_dir: artifacts/observability/blobs
+  streamlit_port: 8501

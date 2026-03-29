@@ -1,0 +1,1 @@
+{"candidate_index": 3, "reason": "best conv1d (0.167) + explore new arch for diversity; transformer lighter than LSTM, risk/reward balance"}

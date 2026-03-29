@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from collections.abc import Callable
 
 from imu_denoise.models.base import BaseDenoiser
 
 _MODEL_REGISTRY: dict[str, type[BaseDenoiser]] = {}
+_DISCOVERED_MODULES: set[str] = set()
 
 
 def register_model(name: str) -> Callable[[type[BaseDenoiser]], type[BaseDenoiser]]:
@@ -46,6 +49,7 @@ def get_model(name: str, **kwargs: object) -> BaseDenoiser:
     Raises:
         KeyError: If no model is registered under the given name.
     """
+    autodiscover_models()
     if name not in _MODEL_REGISTRY:
         available = ", ".join(sorted(_MODEL_REGISTRY.keys()))
         raise KeyError(f"Unknown model '{name}'. Available models: {available}")
@@ -54,4 +58,25 @@ def get_model(name: str, **kwargs: object) -> BaseDenoiser:
 
 def list_models() -> list[str]:
     """Return sorted list of all registered model names."""
+    autodiscover_models()
     return sorted(_MODEL_REGISTRY.keys())
+
+
+def autodiscover_models() -> list[str]:
+    """Import model modules from the package directory on demand."""
+    import imu_denoise.models as models_package
+
+    discovered: list[str] = []
+    for module_info in pkgutil.iter_modules(models_package.__path__):
+        module_name = module_info.name
+        if module_info.ispkg:
+            continue
+        if module_name.startswith("_") or module_name in {"base", "registry"}:
+            continue
+        full_name = f"{models_package.__name__}.{module_name}"
+        if full_name in _DISCOVERED_MODULES:
+            continue
+        importlib.import_module(full_name)
+        _DISCOVERED_MODULES.add(full_name)
+        discovered.append(module_name)
+    return discovered
