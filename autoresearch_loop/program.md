@@ -13,7 +13,7 @@ This loop is config-first and local by default.
 1. Run a baseline experiment.
 2. Apply one config mutation at a time.
 3. Train and evaluate on the current pipeline.
-4. Log results to `autoresearch_loop/results.tsv`.
+4. Log results to `artifacts/autoresearch/results.tsv`.
 5. Mark each trial as `baseline`, `keep`, `discard`, or `crash`.
 
 ## Safety

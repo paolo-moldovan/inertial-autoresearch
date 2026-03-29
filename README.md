@@ -72,9 +72,9 @@ loop falls back to the deterministic built-in mutation schedule.
 
 ## CI And Docker
 
-- CI workflow: [ci.yml](/Users/paolo/development/inertial-autoresearch/.github/workflows/ci.yml)
-- Docker image: [Dockerfile](/Users/paolo/development/inertial-autoresearch/docker/Dockerfile)
-- Compose stack: [docker-compose.yml](/Users/paolo/development/inertial-autoresearch/docker/docker-compose.yml)
+- CI workflow: [ci.yml](./.github/workflows/ci.yml)
+- Docker image: [Dockerfile](./docker/Dockerfile)
+- Compose stack: [docker-compose.yml](./docker/docker-compose.yml)
 
 ## Design Principles
 

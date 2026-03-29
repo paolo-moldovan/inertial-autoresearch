@@ -211,6 +211,7 @@ data/
 artifacts/
 vendor/
 .hermes/
+autoresearch_loop/results.tsv
 *.zip
 *.bag
 *.gguf

@@ -79,8 +79,8 @@ def spectral_divergence(
     pred_fft = np.fft.rfft(pred, axis=0)
     target_fft = np.fft.rfft(target, axis=0)
 
-    pred_psd = np.abs(pred_fft) ** 2 / n
-    target_psd = np.abs(target_fft) ** 2 / n
+    pred_psd = np.abs(pred_fft) ** 2 / (fs * n)
+    target_psd = np.abs(target_fft) ** 2 / (fs * n)
 
     # Log spectral distance: mean of |log(P_pred / P_target)|
     log_ratio = np.abs(np.log10(pred_psd + eps) - np.log10(target_psd + eps))

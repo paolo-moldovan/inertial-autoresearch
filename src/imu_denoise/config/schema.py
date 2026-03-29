@@ -94,7 +94,7 @@ class AutoResearchConfig:
     time_budget_sec: int = 600
     metric_key: str = "val_rmse"
     metric_direction: str = "minimize"  # "minimize" | "maximize"
-    results_file: str = "autoresearch_loop/results.tsv"
+    results_file: str = "artifacts/autoresearch/results.tsv"
     orchestrator: str = "none"  # "none" | "hermes" | "researchclaw"
     hermes: HermesConfig = field(default_factory=HermesConfig)
 

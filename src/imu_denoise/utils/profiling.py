@@ -63,7 +63,9 @@ def log_system_info(logger: logging.Logger) -> None:
 
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(0)
-        vram_mb = torch.cuda.get_device_properties(0).total_mem / (1024 * 1024)
+        properties = torch.cuda.get_device_properties(0)
+        total_memory = getattr(properties, "total_memory", 0)
+        vram_mb = total_memory / (1024 * 1024)
         logger.info("CUDA device: %s (%.0f MB VRAM)", device_name, vram_mb)
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         logger.info("Device: Apple MPS")

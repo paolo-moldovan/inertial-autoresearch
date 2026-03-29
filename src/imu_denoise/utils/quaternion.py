@@ -25,7 +25,8 @@ def quat_multiply(q1: NDArray[np.floating], q2: NDArray[np.floating]) -> NDArray
         q2: Quaternion(s) of shape ``(4,)`` or ``(N, 4)``.
 
     Returns:
-        Product quaternion(s), same shape as the broadcast of q1 and q2.
+        Product quaternion(s). Supports matching batch sizes, or a single
+        quaternion multiplied against a batched input.
     """
     q1, single1 = _ensure_batch(q1)
     q2, single2 = _ensure_batch(q2)

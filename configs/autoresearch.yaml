@@ -3,7 +3,7 @@ autoresearch:
   time_budget_sec: 600
   metric_key: val_rmse
   metric_direction: minimize
-  results_file: autoresearch_loop/results.tsv
+  results_file: artifacts/autoresearch/results.tsv
   orchestrator: hermes    # none | hermes | researchclaw
   hermes:
     python_bin: vendor/hermes-agent/.venv/bin/python
