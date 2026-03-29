@@ -5,6 +5,8 @@ traceable, iterative, and scientifically disciplined.
 
 ## Phase 1: Structured Experiment Lineage
 
+Status: completed
+
 Goals:
 - Record how each run was selected.
 - Record what changed from the relevant prior run.
@@ -30,6 +32,8 @@ Acceptance:
 - Any run can answer “why was it selected?”
 
 ## Phase 2: Mutation Memory
+
+Status: completed
 
 Goals:
 - Learn from which mutation families help or hurt.

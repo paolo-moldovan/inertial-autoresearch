@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +19,7 @@ from imu_denoise.observability.control import (
     QUEUE_ENQUEUED,
 )
 from imu_denoise.observability.events import TRAINING_EPOCH
+from imu_denoise.observability.lineage import data_regime_fingerprint, normalize_config_payload
 from imu_denoise.observability.store import ObservabilityStore
 
 
@@ -32,36 +31,6 @@ def _loads(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
     return value
-
-
-def _data_regime_payload(config_payload: Mapping[str, Any]) -> dict[str, Any]:
-    data = config_payload.get("data")
-    if not isinstance(data, Mapping):
-        return {}
-    return {
-        "dataset": data.get("dataset"),
-        "sequences": data.get("sequences"),
-        "train_sequences": data.get("train_sequences"),
-        "val_sequences": data.get("val_sequences"),
-        "test_sequences": data.get("test_sequences"),
-        "window_size": data.get("window_size"),
-        "stride": data.get("stride"),
-        "normalize": data.get("normalize"),
-        "dataset_kwargs": data.get("dataset_kwargs"),
-        "subset": data.get("subset"),
-    }
-
-
-def _data_regime_fingerprint_from_payload(config_payload: Mapping[str, Any]) -> str:
-    return sha256(
-        json.dumps(
-            _data_regime_payload(config_payload),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
 
 
 class MissionControlQueries:
@@ -366,15 +335,11 @@ class MissionControlQueries:
         )
         reference_payload: Mapping[str, Any] | None = None
         if reference_config is not None:
-            candidate_payload: Any
-            if is_dataclass(reference_config) and not isinstance(reference_config, type):
-                candidate_payload = asdict(reference_config)
-            else:
-                candidate_payload = reference_config
+            candidate_payload = normalize_config_payload(reference_config)
             if isinstance(candidate_payload, Mapping):
                 reference_payload = candidate_payload
         reference_fingerprint = (
-            _data_regime_fingerprint_from_payload(reference_payload)
+            data_regime_fingerprint(reference_payload)
             if reference_payload is not None
             else None
         )
@@ -384,7 +349,7 @@ class MissionControlQueries:
                 return row
             if not isinstance(config_payload, Mapping):
                 continue
-            if _data_regime_fingerprint_from_payload(config_payload) == reference_fingerprint:
+            if data_regime_fingerprint(config_payload) == reference_fingerprint:
                 return row
         return None
 
@@ -598,6 +563,7 @@ class MissionControlQueries:
             "decisions": self.list_decisions_for_run(run_id),
             "llm_calls": self.list_llm_calls_for_run(run_id),
             "tool_calls": self.list_tool_calls(run_id=run_id, limit=200),
+            "mutation_attempts": self.list_mutation_attempts(run_id=run_id, limit=100),
             "curves": self.get_run_curves(run_id),
             "links": self.get_traceability_links(run_id),
             "logs": self.list_logs(run_id, limit=100),
@@ -643,6 +609,12 @@ class MissionControlQueries:
         if not isinstance(payload, dict):
             return None
         return payload
+
+    def get_run_regime_fingerprint(self, run_id: str) -> str | None:
+        payload = self.get_run_config_payload(run_id)
+        if payload is None:
+            return None
+        return data_regime_fingerprint(payload)
 
     def get_change_set(self, run_id: str) -> dict[str, Any] | None:
         row = self.store.fetch_one(
@@ -732,6 +704,7 @@ class MissionControlQueries:
         recent_decisions = self.list_recent_decisions(limit=20)
         recent_llm_calls = self.list_recent_llm_calls(limit=20)
         recent_loop_events = self.list_recent_loop_events(limit=20)
+        mutation_regime_fingerprint: str | None = None
         if loop_state is not None:
             progress = self.list_loop_iteration_metrics(str(loop_state["loop_run_id"]))
             queued = self.list_queued_proposals(str(loop_state["loop_run_id"]))
@@ -747,6 +720,18 @@ class MissionControlQueries:
                 limit=20,
                 loop_run_id=str(loop_state["loop_run_id"]),
             )
+            if str(loop_state.get("status")) in {"running", "paused", "terminating"}:
+                mutation_regime_fingerprint = self.get_run_regime_fingerprint(
+                    str(loop_state["loop_run_id"])
+                )
+        mutation_leaderboard = self.list_mutation_leaderboard(
+            limit=10,
+            regime_fingerprint=mutation_regime_fingerprint,
+        )
+        recent_mutation_lessons = self.list_recent_mutation_lessons(
+            limit=10,
+            regime_fingerprint=mutation_regime_fingerprint,
+        )
         return {
             "loop_state": loop_state,
             "best_result": best_result,
@@ -756,6 +741,8 @@ class MissionControlQueries:
             "recent_loop_events": recent_loop_events,
             "recent_decisions": recent_decisions,
             "recent_llm_calls": recent_llm_calls,
+            "mutation_leaderboard": mutation_leaderboard,
+            "recent_mutation_lessons": recent_mutation_lessons,
         }
 
     def list_artifacts(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -768,6 +755,113 @@ class MissionControlQueries:
             )
         for row in rows:
             row["metadata"] = _loads(row.pop("metadata_json"))
+        return rows
+
+    def list_mutation_leaderboard(
+        self,
+        *,
+        limit: int = 10,
+        regime_fingerprint: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_clause = ""
+        params: list[Any] = []
+        if regime_fingerprint is not None:
+            where_clause = "WHERE s.regime_fingerprint = ?"
+            params.append(regime_fingerprint)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                s.signature,
+                sig.display_name,
+                s.regime_fingerprint,
+                s.category,
+                s.path,
+                s.tries,
+                s.keep_count,
+                s.discard_count,
+                s.crash_count,
+                s.avg_metric_delta,
+                s.last_metric_delta,
+                s.last_status,
+                s.last_run_id,
+                r.name AS last_run_name,
+                s.confidence,
+                s.updated_at
+            FROM mutation_stats s
+            JOIN mutation_signatures sig ON sig.signature = s.signature
+            LEFT JOIN runs r ON r.id = s.last_run_id
+            {where_clause}
+            ORDER BY s.confidence DESC, s.keep_count DESC,
+                     COALESCE(s.avg_metric_delta, -1e9) DESC, s.updated_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        )
+        return rows
+
+    def list_recent_mutation_lessons(
+        self,
+        *,
+        limit: int = 20,
+        regime_fingerprint: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_clause = ""
+        params: list[Any] = []
+        if regime_fingerprint is not None:
+            where_clause = "WHERE l.regime_fingerprint = ?"
+            params.append(regime_fingerprint)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                l.*,
+                sig.display_name,
+                r.name AS run_name
+            FROM mutation_lessons l
+            JOIN mutation_signatures sig ON sig.signature = l.signature
+            LEFT JOIN runs r ON r.id = l.run_id
+            {where_clause}
+            ORDER BY l.created_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        )
+        return rows
+
+    def list_mutation_attempts(
+        self,
+        *,
+        run_id: str | None = None,
+        regime_fingerprint: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            conditions.append("a.run_id = ?")
+            params.append(run_id)
+        if regime_fingerprint is not None:
+            conditions.append("a.regime_fingerprint = ?")
+            params.append(regime_fingerprint)
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                a.*,
+                sig.display_name,
+                sig.category,
+                sig.path,
+                r.name AS run_name
+            FROM mutation_attempts a
+            JOIN mutation_signatures sig ON sig.signature = a.signature
+            LEFT JOIN runs r ON r.id = a.run_id
+            {where_clause}
+            ORDER BY a.created_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        )
         return rows
 
     def list_events(

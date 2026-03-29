@@ -185,6 +185,20 @@ HTML = """<!doctype html>
         </table>
       </aside>
       <aside>
+        <h2>Mutation Memory</h2>
+        <table>
+          <thead><tr><th>Mutation</th><th>Stats</th><th>Confidence</th></tr></thead>
+          <tbody id="mutation-body"></tbody>
+        </table>
+      </aside>
+      <aside>
+        <h2>Recent Lessons</h2>
+        <table>
+          <thead><tr><th>Severity</th><th>Mutation</th><th>Lesson</th></tr></thead>
+          <tbody id="lessons-body"></tbody>
+        </table>
+      </aside>
+      <aside>
         <h2>Recent LLM Traces</h2>
         <table>
           <thead><tr><th>ID</th><th>Model</th><th>Status</th><th>Latency</th></tr></thead>
@@ -256,6 +270,8 @@ HTML = """<!doctype html>
         recent_loop_events: data.recent_loop_events,
         recent_decisions: data.recent_decisions,
         recent_llm_calls: data.recent_llm_calls,
+        mutation_leaderboard: data.mutation_leaderboard,
+        recent_mutation_lessons: data.recent_mutation_lessons,
       });
       if (summaryHash === renderState.summaryHash) {
         return data;
@@ -311,6 +327,22 @@ HTML = """<!doctype html>
         ])
       ).join("");
 
+      document.getElementById("mutation-body").innerHTML = (data.mutation_leaderboard || []).map((row) =>
+        rowHtml([
+          `${row.display_name}<div class="tag">${row.category || ""}</div>`,
+          `tries ${row.tries} | keep ${row.keep_count} | discard ${row.discard_count} | crash ${row.crash_count}`,
+          typeof row.confidence === "number" ? row.confidence.toFixed(2) : "",
+        ])
+      ).join("") || rowHtml(["<span class='muted'>no mutation stats</span>", "", ""]);
+
+      document.getElementById("lessons-body").innerHTML = (data.recent_mutation_lessons || []).map((row) =>
+        rowHtml([
+          row.severity,
+          `${row.display_name}<div class="tag">${shortId(row.run_id)}</div>`,
+          row.summary,
+        ])
+      ).join("") || rowHtml(["", "", "<span class='muted'>no lessons yet</span>"]);
+
       document.getElementById("llm-body").innerHTML = (data.recent_llm_calls || []).map((row) =>
         rowHtml([
           shortId(row.id),
@@ -339,6 +371,7 @@ HTML = """<!doctype html>
       const artifacts = detail.artifacts || [];
       const curves = detail.curves || [];
       const llmCalls = detail.llm_calls || [];
+      const mutationAttempts = detail.mutation_attempts || [];
       const latestDecision = decisions[0];
       const figureArtifacts = artifacts.filter((item) => item.artifact_type === "figure");
       const otherArtifacts = artifacts.filter((item) => item.artifact_type !== "figure");
@@ -381,6 +414,10 @@ HTML = """<!doctype html>
               <div>
                 <h3>Decision</h3>
                 <pre>${latestDecision ? JSON.stringify(latestDecision, null, 2) : "No decision record."}</pre>
+              </div>
+              <div>
+                <h3>Mutation Memory</h3>
+                <pre>${mutationAttempts.length ? JSON.stringify(mutationAttempts.slice(0, 5), null, 2) : "No mutation attempts recorded."}</pre>
               </div>
             </div>
             <div class="stack">

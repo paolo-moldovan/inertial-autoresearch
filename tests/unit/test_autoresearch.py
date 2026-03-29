@@ -86,6 +86,10 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     assert detail["selection_event"]["loop_run_id"] is not None
     assert detail["change_set"] is not None
     assert detail["change_set"]["reference_kind"] in {"base", "incumbent"}
+    assert detail["mutation_attempts"]
+    summary = queries.get_mission_control_summary(limit=10)
+    assert summary["mutation_leaderboard"]
+    assert summary["recent_mutation_lessons"]
 
 
 def test_autoresearch_loop_uses_hermes_proposals_when_enabled(

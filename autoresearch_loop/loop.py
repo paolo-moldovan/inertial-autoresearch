@@ -492,6 +492,7 @@ def run_autoresearch(
         import_hermes_state,
     )
     from imu_denoise.observability.control import LOOP_PAUSED
+    from imu_denoise.observability.lineage import data_regime_fingerprint
     from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
     base_overrides = list(base_overrides or [])
@@ -748,6 +749,7 @@ def run_autoresearch(
         experiment_run_id = f"training-{iteration:03d}-{uuid4().hex}"
         resolved_config = load_config_from_dict(asdict(base_config), overrides=run_overrides)
         selected_incumbent_run_id = best_run_id
+        selected_incumbent_metric = best_metric
         incumbent_config = (
             queries.get_run_config_payload(selected_incumbent_run_id)
             if selected_incumbent_run_id is not None
@@ -892,6 +894,20 @@ def run_autoresearch(
                 llm_call_id=llm_call_id,
                 source="runtime",
             )
+            observability.record_mutation_outcome(
+                run_id=experiment_run_id,
+                loop_run_id=loop_run_id,
+                regime_fingerprint=data_regime_fingerprint(resolved_config),
+                proposal_source=proposal_source,
+                description=proposal.description,
+                change_items=list(change_set["change_items"]),
+                status=status,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=metric_value,
+                incumbent_metric=selected_incumbent_metric,
+                direction=base_config.autoresearch.metric_direction,
+                source="runtime",
+            )
             if queue_row is not None:
                 loop_controller.mark_queue_applied(
                     proposal_id=int(queue_row["id"]),
@@ -1019,6 +1035,20 @@ def run_autoresearch(
                 ),
                 reason=str(exc),
                 llm_call_id=llm_call_id,
+                source="runtime",
+            )
+            observability.record_mutation_outcome(
+                run_id=experiment_run_id,
+                loop_run_id=loop_run_id,
+                regime_fingerprint=data_regime_fingerprint(resolved_config),
+                proposal_source=proposal_source,
+                description=proposal.description,
+                change_items=list(change_set["change_items"]),
+                status="crash",
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                incumbent_metric=selected_incumbent_metric,
+                direction=base_config.autoresearch.metric_direction,
                 source="runtime",
             )
             _safe_update_run_manifest(

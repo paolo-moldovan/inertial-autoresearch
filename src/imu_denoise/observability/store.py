@@ -113,6 +113,81 @@ CREATE TABLE IF NOT EXISTS selection_events (
 CREATE INDEX IF NOT EXISTS idx_selection_events_loop
 ON selection_events(loop_run_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS mutation_signatures (
+    signature TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    path TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    created_at REAL NOT NULL,
+    source TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mutation_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    loop_run_id TEXT,
+    signature TEXT NOT NULL,
+    regime_fingerprint TEXT NOT NULL,
+    proposal_source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    metric_key TEXT NOT NULL,
+    metric_value REAL,
+    incumbent_metric REAL,
+    metric_delta REAL,
+    created_at REAL NOT NULL,
+    source TEXT NOT NULL,
+    UNIQUE(run_id, signature),
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (loop_run_id) REFERENCES runs(id),
+    FOREIGN KEY (signature) REFERENCES mutation_signatures(signature)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mutation_attempts_lookup
+ON mutation_attempts(signature, regime_fingerprint, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS mutation_stats (
+    signature TEXT NOT NULL,
+    regime_fingerprint TEXT NOT NULL,
+    category TEXT NOT NULL,
+    path TEXT,
+    tries INTEGER NOT NULL,
+    keep_count INTEGER NOT NULL,
+    discard_count INTEGER NOT NULL,
+    crash_count INTEGER NOT NULL,
+    avg_metric_delta REAL,
+    last_metric_delta REAL,
+    last_status TEXT,
+    last_run_id TEXT,
+    confidence REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (signature, regime_fingerprint),
+    FOREIGN KEY (signature) REFERENCES mutation_signatures(signature),
+    FOREIGN KEY (last_run_id) REFERENCES runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS mutation_lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT UNIQUE NOT NULL,
+    run_id TEXT NOT NULL,
+    loop_run_id TEXT,
+    signature TEXT NOT NULL,
+    regime_fingerprint TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    lesson_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    metric_delta REAL,
+    created_at REAL NOT NULL,
+    source TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (loop_run_id) REFERENCES runs(id),
+    FOREIGN KEY (signature) REFERENCES mutation_signatures(signature)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mutation_lessons_lookup
+ON mutation_lessons(regime_fingerprint, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS llm_calls (
     id TEXT PRIMARY KEY,
     run_id TEXT,
@@ -740,6 +815,199 @@ class ObservabilityStore:
                     candidate_count,
                     rationale,
                     None if policy_state is None else _json_dumps(policy_state),
+                    created_at,
+                    source,
+                ),
+            )
+
+    def upsert_mutation_signature(
+        self,
+        *,
+        signature: str,
+        display_name: str,
+        category: str,
+        path: str | None,
+        before: Any,
+        after: Any,
+        created_at: float,
+        source: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mutation_signatures (
+                    signature, display_name, category, path, before_json, after_json,
+                    created_at, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signature) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    category=excluded.category,
+                    path=excluded.path,
+                    before_json=excluded.before_json,
+                    after_json=excluded.after_json,
+                    source=excluded.source
+                """,
+                (
+                    signature,
+                    display_name,
+                    category,
+                    path,
+                    _json_dumps(before),
+                    _json_dumps(after),
+                    created_at,
+                    source,
+                ),
+            )
+
+    def insert_mutation_attempt(
+        self,
+        *,
+        run_id: str,
+        loop_run_id: str | None,
+        signature: str,
+        regime_fingerprint: str,
+        proposal_source: str,
+        status: str,
+        metric_key: str,
+        metric_value: float | None,
+        incumbent_metric: float | None,
+        metric_delta: float | None,
+        created_at: float,
+        source: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO mutation_attempts (
+                    id, run_id, loop_run_id, signature, regime_fingerprint, proposal_source,
+                    status, metric_key, metric_value, incumbent_metric, metric_delta,
+                    created_at, source
+                )
+                VALUES (
+                    (SELECT id FROM mutation_attempts WHERE run_id = ? AND signature = ?),
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    run_id,
+                    signature,
+                    run_id,
+                    loop_run_id,
+                    signature,
+                    regime_fingerprint,
+                    proposal_source,
+                    status,
+                    metric_key,
+                    metric_value,
+                    incumbent_metric,
+                    metric_delta,
+                    created_at,
+                    source,
+                ),
+            )
+
+    def upsert_mutation_stat(
+        self,
+        *,
+        signature: str,
+        regime_fingerprint: str,
+        category: str,
+        path: str | None,
+        tries: int,
+        keep_count: int,
+        discard_count: int,
+        crash_count: int,
+        avg_metric_delta: float | None,
+        last_metric_delta: float | None,
+        last_status: str | None,
+        last_run_id: str | None,
+        confidence: float,
+        updated_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mutation_stats (
+                    signature, regime_fingerprint, category, path, tries, keep_count,
+                    discard_count, crash_count, avg_metric_delta, last_metric_delta,
+                    last_status, last_run_id, confidence, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signature, regime_fingerprint) DO UPDATE SET
+                    category=excluded.category,
+                    path=excluded.path,
+                    tries=excluded.tries,
+                    keep_count=excluded.keep_count,
+                    discard_count=excluded.discard_count,
+                    crash_count=excluded.crash_count,
+                    avg_metric_delta=excluded.avg_metric_delta,
+                    last_metric_delta=excluded.last_metric_delta,
+                    last_status=excluded.last_status,
+                    last_run_id=excluded.last_run_id,
+                    confidence=excluded.confidence,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    signature,
+                    regime_fingerprint,
+                    category,
+                    path,
+                    tries,
+                    keep_count,
+                    discard_count,
+                    crash_count,
+                    avg_metric_delta,
+                    last_metric_delta,
+                    last_status,
+                    last_run_id,
+                    confidence,
+                    updated_at,
+                ),
+            )
+
+    def insert_mutation_lesson(
+        self,
+        *,
+        fingerprint: str | None,
+        run_id: str,
+        loop_run_id: str | None,
+        signature: str,
+        regime_fingerprint: str,
+        severity: str,
+        lesson_type: str,
+        summary: str,
+        metric_delta: float | None,
+        created_at: float,
+        source: str,
+    ) -> None:
+        record_fingerprint = fingerprint or _fingerprint(
+            run_id,
+            signature,
+            regime_fingerprint,
+            lesson_type,
+            summary,
+            source,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO mutation_lessons (
+                    fingerprint, run_id, loop_run_id, signature, regime_fingerprint,
+                    severity, lesson_type, summary, metric_delta, created_at, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_fingerprint,
+                    run_id,
+                    loop_run_id,
+                    signature,
+                    regime_fingerprint,
+                    severity,
+                    lesson_type,
+                    summary,
+                    metric_delta,
                     created_at,
                     source,
                 ),
