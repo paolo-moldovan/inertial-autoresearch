@@ -13,7 +13,7 @@ from autoresearch_loop.loop import build_parser, run_autoresearch
 from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
 from imu_denoise.cli.common import resolve_config
 from imu_denoise.config import DataConfig, ExperimentConfig, ObservabilityConfig
-from imu_denoise.observability import MissionControlQueries
+from imu_denoise.observability import LoopController, MissionControlQueries
 from imu_denoise.observability.writer import ObservabilityWriter
 
 
@@ -363,6 +363,107 @@ def test_global_incumbent_requires_matching_data_regime(tmp_path: Path) -> None:
     assert incumbent is not None
     assert incumbent["run_id"] == matching_run
     assert float(incumbent["metric_value"]) == 0.30
+    matching_regime = queries.get_run_regime_fingerprint(matching_run)
+    assert matching_regime is not None
+    identity = queries.get_run_identity(matching_run)
+    assert identity is not None
+    assert identity["regime_fingerprint"] == matching_regime
+    leaderboard = queries.list_leaderboard(limit=10, regime_fingerprint=matching_regime)
+    leaderboard_run_ids = {str(row["run_id"]) for row in leaderboard}
+    assert matching_run in leaderboard_run_ids
+    assert better_but_mismatched not in leaderboard_run_ids
+
+
+def test_mission_control_summary_filters_leaderboard_to_active_regime(tmp_path: Path) -> None:
+    """Active-loop views should only compare runs from the compatible regime."""
+    reference_config = ExperimentConfig(
+        observability=ObservabilityConfig(
+            enabled=True,
+            db_path=str(tmp_path / "observability" / "mission_control.db"),
+            blob_dir=str(tmp_path / "observability" / "blobs"),
+        ),
+    )
+    writer = ObservabilityWriter.from_experiment_config(reference_config)
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+    controller = LoopController.from_experiment_config(reference_config, writer=writer)
+
+    matching_run = writer.start_run(
+        name="matching-run",
+        phase="training",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=reference_config,
+    )
+    writer.finish_run(run_id=matching_run, status="completed", summary={"best_val_rmse": 0.3})
+    writer.record_decision(
+        run_id=matching_run,
+        iteration=0,
+        proposal_source="static",
+        description="baseline",
+        status="baseline",
+        metric_key="val_rmse",
+        metric_value=0.3,
+        overrides=[],
+    )
+
+    mismatched_config = ExperimentConfig(
+        data=DataConfig(
+            dataset="synthetic",
+            window_size=32,
+            stride=16,
+            normalize=True,
+            augment=False,
+        ),
+        observability=reference_config.observability,
+    )
+    mismatched_run = writer.start_run(
+        name="mismatched-run",
+        phase="training",
+        dataset="synthetic",
+        model="conv1d",
+        device="cpu",
+        config=mismatched_config,
+    )
+    writer.finish_run(run_id=mismatched_run, status="completed", summary={"best_val_rmse": 0.1})
+    writer.record_decision(
+        run_id=mismatched_run,
+        iteration=1,
+        proposal_source="hermes",
+        description="mismatched better",
+        status="keep",
+        metric_key="val_rmse",
+        metric_value=0.1,
+        overrides=["data.window_size=32"],
+    )
+
+    loop_run_id = writer.start_run(
+        name="active-loop",
+        phase="autoresearch_loop",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=reference_config,
+    )
+    controller.initialize_loop(
+        loop_run_id=loop_run_id,
+        max_iterations=4,
+        batch_size=None,
+        pause_enabled=False,
+        current_iteration=1,
+        best_metric=0.3,
+        best_run_id=matching_run,
+    )
+
+    summary = queries.get_mission_control_summary(limit=10)
+
+    assert summary["regime_fingerprint"] == queries.get_run_regime_fingerprint(loop_run_id)
+    leaderboard_run_ids = {str(row["run_id"]) for row in summary["leaderboard"]}
+    assert matching_run in leaderboard_run_ids
+    assert mismatched_run not in leaderboard_run_ids
 
 
 def test_autoresearch_global_baseline_reuses_previous_best_incumbent(tmp_path: Path) -> None:

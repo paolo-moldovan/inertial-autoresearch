@@ -28,6 +28,7 @@ from imu_denoise.observability.events import (
 from imu_denoise.observability.lineage import (
     build_change_items,
     build_mutation_signatures,
+    data_regime_fingerprint,
     normalize_config_payload,
     summarize_change_items,
 )
@@ -162,6 +163,7 @@ class ObservabilityWriter:
             experiment_id=experiment_id,
             name=config.name,
             config_json=config_payload,
+            regime_fingerprint=data_regime_fingerprint(config_payload),
             overrides=overrides_payload,
             objective_metric=objective_metric,
             objective_direction=objective_direction,

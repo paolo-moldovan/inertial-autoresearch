@@ -524,6 +524,7 @@ def run_autoresearch(
             "run_id": loop_run_id,
             "name": loop_name,
             "phase": "autoresearch_loop",
+            "regime_fingerprint": data_regime_fingerprint(base_config),
         },
     )
     total_iterations = (
@@ -813,6 +814,7 @@ def run_autoresearch(
         _safe_update_run_manifest(
             experiment_run_paths,
             {
+                "regime_fingerprint": data_regime_fingerprint(resolved_config),
                 "resolved_config": observability.config_payload(resolved_config),
                 "selection_event": selection_event,
                 "change_set": change_set,

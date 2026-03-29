@@ -212,10 +212,16 @@ class MissionControlQueries:
         *,
         limit: int = 10,
         metric_key: str = "val_rmse",
+        regime_fingerprint: str | None = None,
     ) -> list[dict[str, Any]]:
         metric_keys = [metric_key]
         if metric_key == "val_rmse":
             metric_keys.append("rmse")
+        where_clause = ""
+        params: list[Any] = [metric_keys[0], metric_keys[-1]]
+        if regime_fingerprint is not None:
+            where_clause = "AND e.regime_fingerprint = ?"
+            params.append(regime_fingerprint)
         rows = self.store.fetch_all(
             """
             WITH ranked_decisions AS (
@@ -235,6 +241,7 @@ class MissionControlQueries:
                 r.phase,
                 r.status AS run_status,
                 r.experiment_id,
+                e.regime_fingerprint,
                 rd.proposal_source,
                 rd.status AS decision_status,
                 rd.metric_key,
@@ -243,15 +250,19 @@ class MissionControlQueries:
                 rd.description,
                 r.started_at
             FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
             LEFT JOIN ranked_decisions rd ON rd.run_id = r.id AND rd.row_num = 1
             LEFT JOIN status_snapshots s ON s.run_id = r.id
             WHERE r.phase IN ('training', 'baseline')
               AND r.status = 'completed'
               AND COALESCE(rd.metric_value, s.best_metric) IS NOT NULL
+            """
+            + where_clause
+            + """
             ORDER BY COALESCE(rd.metric_value, s.best_metric) ASC, r.started_at DESC
             LIMIT ?
             """,
-            (metric_keys[0], metric_keys[-1], limit),
+            (*params, limit),
         )
         for index, row in enumerate(rows, start=1):
             row["rank"] = index
@@ -315,6 +326,7 @@ class MissionControlQueries:
                 r.dataset,
                 r.model,
                 e.config_json,
+                e.regime_fingerprint,
                 rd.proposal_source,
                 rd.status AS decision_status,
                 rd.metric_key,
@@ -343,6 +355,24 @@ class MissionControlQueries:
             if reference_payload is not None
             else None
         )
+        if reference_fingerprint is not None:
+            filtered = [
+                row
+                for row in rows
+                if (
+                    row.get("regime_fingerprint") == reference_fingerprint
+                    or (
+                        row.get("regime_fingerprint") in {None, ""}
+                        and isinstance(_loads(row.get("config_json")), Mapping)
+                        and data_regime_fingerprint(_loads(row.get("config_json")))
+                        == reference_fingerprint
+                    )
+                )
+            ]
+            if filtered:
+                selected = filtered[0]
+                selected.pop("config_json", None)
+                return selected
         for row in rows:
             config_payload = _loads(row.pop("config_json", None))
             if reference_fingerprint is None:
@@ -398,6 +428,7 @@ class MissionControlQueries:
             SELECT
                 e.id,
                 e.name,
+                e.regime_fingerprint,
                 e.objective_metric,
                 e.objective_direction,
                 e.overrides_json,
@@ -579,6 +610,7 @@ class MissionControlQueries:
                 r.status AS run_status,
                 r.iteration,
                 r.experiment_id,
+                e.regime_fingerprint,
                 e.name AS experiment_name
             FROM runs r
             LEFT JOIN experiments e ON e.id = r.experiment_id
@@ -591,6 +623,10 @@ class MissionControlQueries:
         row["run_id_short"] = str(row["run_id"])[:8]
         experiment_id = row.get("experiment_id")
         row["experiment_id_short"] = str(experiment_id)[:8] if experiment_id else None
+        regime_fingerprint = row.get("regime_fingerprint")
+        row["regime_fingerprint_short"] = (
+            str(regime_fingerprint)[:8] if regime_fingerprint else None
+        )
         return row
 
     def get_run_config_payload(self, run_id: str) -> dict[str, Any] | None:
@@ -647,6 +683,7 @@ class MissionControlQueries:
         return {
             "run_id": run_id,
             "experiment_id": None if identity is None else identity.get("experiment_id"),
+            "regime_fingerprint": None if identity is None else identity.get("regime_fingerprint"),
             "decision_ids": [row["id"] for row in decisions],
             "llm_call_ids": [row["id"] for row in llm_calls],
             "change_set_id": None if change_set is None else change_set.get("id"),
@@ -697,14 +734,25 @@ class MissionControlQueries:
 
     def get_mission_control_summary(self, *, limit: int = 10) -> dict[str, Any]:
         loop_state = self.get_current_loop_state()
-        leaderboard = self.list_leaderboard(limit=limit)
+        comparison_regime_fingerprint: str | None = None
+        if (
+            loop_state is not None
+            and str(loop_state.get("status")) in {"running", "paused", "terminating"}
+        ):
+            comparison_regime_fingerprint = self.get_run_regime_fingerprint(
+                str(loop_state["loop_run_id"])
+            )
+        leaderboard = self.list_leaderboard(
+            limit=limit,
+            regime_fingerprint=comparison_regime_fingerprint,
+        )
         best_result = leaderboard[0] if leaderboard else None
         progress = []
         queued: list[dict[str, Any]] = []
         recent_decisions = self.list_recent_decisions(limit=20)
         recent_llm_calls = self.list_recent_llm_calls(limit=20)
         recent_loop_events = self.list_recent_loop_events(limit=20)
-        mutation_regime_fingerprint: str | None = None
+        mutation_regime_fingerprint = comparison_regime_fingerprint
         if loop_state is not None:
             progress = self.list_loop_iteration_metrics(str(loop_state["loop_run_id"]))
             queued = self.list_queued_proposals(str(loop_state["loop_run_id"]))
@@ -720,10 +768,6 @@ class MissionControlQueries:
                 limit=20,
                 loop_run_id=str(loop_state["loop_run_id"]),
             )
-            if str(loop_state.get("status")) in {"running", "paused", "terminating"}:
-                mutation_regime_fingerprint = self.get_run_regime_fingerprint(
-                    str(loop_state["loop_run_id"])
-                )
         mutation_leaderboard = self.list_mutation_leaderboard(
             limit=10,
             regime_fingerprint=mutation_regime_fingerprint,
@@ -741,6 +785,7 @@ class MissionControlQueries:
             "recent_loop_events": recent_loop_events,
             "recent_decisions": recent_decisions,
             "recent_llm_calls": recent_llm_calls,
+            "regime_fingerprint": comparison_regime_fingerprint,
             "mutation_leaderboard": mutation_leaderboard,
             "recent_mutation_lessons": recent_mutation_lessons,
         }

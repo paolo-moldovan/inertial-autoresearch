@@ -14,6 +14,7 @@ from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
 from imu_denoise.observability import MissionControlQueries, ObservabilityWriter
+from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training.reproducibility import seed_everything
 from imu_denoise.utils.io import load_checkpoint, save_metrics
 from imu_denoise.utils.paths import build_run_paths, write_run_manifest
@@ -91,6 +92,7 @@ def run_command(args: Any) -> int:
             "run_id": run_id,
             "name": run_name,
             "phase": "evaluation",
+            "regime_fingerprint": data_regime_fingerprint(config),
         },
     )
     checkpoint_path = _resolve_checkpoint_path(config, args.checkpoint)

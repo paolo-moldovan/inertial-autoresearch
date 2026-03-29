@@ -270,6 +270,7 @@ HTML = """<!doctype html>
         recent_loop_events: data.recent_loop_events,
         recent_decisions: data.recent_decisions,
         recent_llm_calls: data.recent_llm_calls,
+        regime_fingerprint: data.regime_fingerprint,
         mutation_leaderboard: data.mutation_leaderboard,
         recent_mutation_lessons: data.recent_mutation_lessons,
       });
@@ -294,6 +295,7 @@ HTML = """<!doctype html>
           <span class="tag">id ${shortId(loop.loop_run_id)}</span>
           <span>Iteration <strong>${loop.current_iteration}/${loop.max_iterations}</strong></span>
           <span>Best <strong>${best ? metric(best.metric_value) : "n/a"}</strong></span>
+          <span class="tag">regime ${shortId(data.regime_fingerprint)}</span>
           <span>Flags pause=${loop.pause_requested} stop=${loop.stop_requested} terminate=${loop.terminate_requested}</span>
         `;
       }

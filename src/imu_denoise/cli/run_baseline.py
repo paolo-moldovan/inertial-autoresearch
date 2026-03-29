@@ -14,6 +14,7 @@ from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.evaluation.metrics import compute_all_metrics
 from imu_denoise.observability import ObservabilityWriter
+from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training.reproducibility import seed_everything
 from imu_denoise.utils.io import save_metrics
 from imu_denoise.utils.paths import build_run_paths, update_run_manifest, write_run_manifest
@@ -76,6 +77,7 @@ def run_command(args: Any) -> int:
             "name": run_name,
             "phase": "baseline",
             "baseline": args.baseline,
+            "regime_fingerprint": data_regime_fingerprint(config),
         },
     )
 
@@ -193,6 +195,7 @@ def run_command(args: Any) -> int:
     update_run_manifest(
         run_paths,
         {
+            "regime_fingerprint": data_regime_fingerprint(config),
             "resolved_config": observability.config_payload(config),
             "selection_event": selection_event,
             "change_set": change_set,

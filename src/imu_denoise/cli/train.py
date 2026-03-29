@@ -11,6 +11,7 @@ from imu_denoise.cli.common import add_common_config_arguments, build_model, res
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.observability import ObservabilityWriter
+from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training import (
     Trainer,
     build_loss,
@@ -123,6 +124,7 @@ def run_command(args: Any) -> int:
     update_run_manifest(
         run_paths,
         {
+            "regime_fingerprint": data_regime_fingerprint(config),
             "resolved_config": observability.config_payload(config),
             "selection_event": selection_event,
             "change_set": change_set,

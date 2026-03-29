@@ -58,6 +58,8 @@ Acceptance:
 
 ## Phase 3: Apples-to-Apples Regime Matching
 
+Status: completed
+
 Goals:
 - Ensure incumbent reuse, memory reuse, and comparisons only happen across
   compatible evaluation regimes.

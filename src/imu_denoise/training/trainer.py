@@ -20,6 +20,7 @@ from imu_denoise.device.context import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
 from imu_denoise.models.base import BaseDenoiser
 from imu_denoise.observability import ObservabilityWriter
+from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training.callbacks import CheckpointManager, EarlyStopping
 from imu_denoise.training.losses import LossFn
 from imu_denoise.utils.io import save_metrics
@@ -142,6 +143,7 @@ class Trainer:
                 "name": self.config.name,
                 "phase": "training",
                 "parent_run_id": self.parent_run_id,
+                "regime_fingerprint": data_regime_fingerprint(self.config),
             },
         )
         self.observability.update_status(

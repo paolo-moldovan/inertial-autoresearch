@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     config_json TEXT NOT NULL,
+    regime_fingerprint TEXT,
     overrides_json TEXT,
     objective_metric TEXT,
     objective_direction TEXT,
@@ -25,6 +26,9 @@ CREATE TABLE IF NOT EXISTS experiments (
     created_at REAL NOT NULL,
     source TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_experiments_regime
+ON experiments(regime_fingerprint, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -413,9 +417,27 @@ class ObservabilityStore:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
             self._migrate(conn)
-            conn.execute("PRAGMA user_version = 3")
+            conn.execute("PRAGMA user_version = 4")
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
+        experiment_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(experiments)").fetchall()
+        }
+        if "regime_fingerprint" not in experiment_columns:
+            conn.execute(
+                """
+                ALTER TABLE experiments
+                ADD COLUMN regime_fingerprint TEXT
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_experiments_regime
+                ON experiments(regime_fingerprint, created_at DESC)
+                """
+            )
+        self._backfill_experiment_regime_fingerprints(conn)
+
         decision_info = conn.execute("PRAGMA table_info(decisions)").fetchall()
         needs_decision_migration = False
         for row in decision_info:
@@ -482,6 +504,30 @@ class ObservabilityStore:
                 """
             )
 
+    def _backfill_experiment_regime_fingerprints(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, config_json
+            FROM experiments
+            WHERE regime_fingerprint IS NULL OR regime_fingerprint = ''
+            """
+        ).fetchall()
+        if not rows:
+            return
+        from imu_denoise.observability.lineage import data_regime_fingerprint
+
+        for row in rows:
+            config_json = row["config_json"]
+            if not isinstance(config_json, str):
+                continue
+            payload = json.loads(config_json)
+            if not isinstance(payload, dict):
+                continue
+            conn.execute(
+                "UPDATE experiments SET regime_fingerprint = ? WHERE id = ?",
+                (data_regime_fingerprint(payload), str(row["id"])),
+            )
+
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
@@ -499,6 +545,7 @@ class ObservabilityStore:
         experiment_id: str,
         name: str,
         config_json: dict[str, Any],
+        regime_fingerprint: str,
         overrides: list[str],
         objective_metric: str | None,
         objective_direction: str | None,
@@ -509,13 +556,14 @@ class ObservabilityStore:
             conn.execute(
                 """
                 INSERT INTO experiments (
-                    id, name, config_json, overrides_json, objective_metric,
+                    id, name, config_json, regime_fingerprint, overrides_json, objective_metric,
                     objective_direction, summary_json, created_at, source
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name,
                     config_json=excluded.config_json,
+                    regime_fingerprint=excluded.regime_fingerprint,
                     overrides_json=excluded.overrides_json,
                     objective_metric=excluded.objective_metric,
                     objective_direction=excluded.objective_direction,
@@ -526,6 +574,7 @@ class ObservabilityStore:
                     experiment_id,
                     name,
                     _json_dumps(config_json),
+                    regime_fingerprint,
                     _json_dumps(overrides),
                     objective_metric,
                     objective_direction,
