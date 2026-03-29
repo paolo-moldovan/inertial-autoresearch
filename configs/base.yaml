@@ -17,5 +17,15 @@ training:
   seed: 42
   num_workers: 4
 
+observability:
+  enabled: true
+  db_path: artifacts/observability/mission_control.db
+  blob_dir: artifacts/observability/blobs
+  capture_raw_llm: true
+  import_hermes_state: true
+  redact_secrets: true
+  tui_refresh_hz: 2
+  streamlit_port: 8501
+
 output_dir: artifacts
 log_dir: artifacts/logs

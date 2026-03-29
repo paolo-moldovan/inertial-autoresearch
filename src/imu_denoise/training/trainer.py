@@ -17,6 +17,7 @@ from imu_denoise.config.schema import ExperimentConfig
 from imu_denoise.device.context import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
 from imu_denoise.models.base import BaseDenoiser
+from imu_denoise.observability import ObservabilityWriter
 from imu_denoise.training.callbacks import CheckpointManager, EarlyStopping
 from imu_denoise.training.losses import LossFn
 from imu_denoise.utils.io import save_metrics
@@ -58,6 +59,9 @@ class Trainer:
         optimizer: Optimizer,
         scheduler: LRScheduler | ReduceLROnPlateau | None,
         loss_fn: LossFn,
+        observability: ObservabilityWriter | None = None,
+        run_id: str | None = None,
+        parent_run_id: str | None = None,
     ) -> None:
         self.model = device_ctx.to_device(model)
         self.config = config
@@ -73,6 +77,12 @@ class Trainer:
             mode="min",
         )
         self.history_path = Path(config.log_dir) / f"{config.name}.history.jsonl"
+        self.observability = observability or ObservabilityWriter.from_experiment_config(
+            config,
+            logger=self.logger,
+        )
+        self.run_id = run_id
+        self.parent_run_id = parent_run_id
 
     def fit(
         self,
@@ -86,100 +96,196 @@ class Trainer:
         best_val_rmse = float("inf")
         last_train_loss = float("nan")
         last_val_loss = float("nan")
+        run_id = self.run_id or self.observability.start_run(
+            name=self.config.name,
+            phase="training",
+            dataset=self.config.data.dataset,
+            model=self.config.model.name,
+            device=self.device_ctx.device.type,
+            parent_run_id=self.parent_run_id,
+            config=self.config,
+            objective_metric="val_rmse",
+            objective_direction="minimize",
+            source="runtime",
+        )
+        log_handler = self.observability.create_log_handler(run_id)
+        self.logger.addHandler(log_handler)
+        self.observability.update_status(
+            run_id=run_id,
+            phase="training",
+            message=f"device={self.device_ctx.device.type} dtype={self.device_ctx.dtype}",
+            source="runtime",
+        )
 
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         if self.history_path.exists():
             self.history_path.unlink()
 
-        for epoch in range(1, self.config.training.epochs + 1):
-            train_loss = self._run_epoch(train_loader, training=True)
-            val_loss = self._run_epoch(val_loader, training=False)
-            metrics = Evaluator(self.model, self.device_ctx).evaluate(
-                val_loader,
-                fs=self._sampling_rate_hz(),
-            )
-            val_rmse = metrics["rmse"]
-            lr = self.optimizer.param_groups[0]["lr"]
+        try:
+            for epoch in range(1, self.config.training.epochs + 1):
+                train_loss = self._run_epoch(train_loader, training=True)
+                val_loss = self._run_epoch(val_loader, training=False)
+                metrics = Evaluator(self.model, self.device_ctx).evaluate(
+                    val_loader,
+                    fs=self._sampling_rate_hz(),
+                )
+                val_rmse = metrics["rmse"]
+                lr = self.optimizer.param_groups[0]["lr"]
 
-            self._write_history(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_rmse": val_rmse,
-                    "lr": lr,
-                }
-            )
-            self.logger.info(
-                "Epoch %d/%d train_loss=%.6f val_loss=%.6f val_rmse=%.6f lr=%.6g",
-                epoch,
-                self.config.training.epochs,
-                train_loss,
-                val_loss,
-                val_rmse,
-                lr,
-            )
+                self._write_history(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "val_rmse": val_rmse,
+                        "lr": lr,
+                    }
+                )
+                self.logger.info(
+                    "Epoch %d/%d train_loss=%.6f val_loss=%.6f val_rmse=%.6f lr=%.6g",
+                    epoch,
+                    self.config.training.epochs,
+                    train_loss,
+                    val_loss,
+                    val_rmse,
+                    lr,
+                )
 
-            self._step_scheduler(val_loss)
-            is_best = self.checkpoints.save(
-                epoch=epoch,
-                metric_value=val_rmse,
-                model=self.model,
-                optimizer=self.optimizer,
-                extra={"val_metrics": metrics},
-            )
-            if is_best:
-                best_epoch = epoch
-                best_val_rmse = val_rmse
+                self._step_scheduler(val_loss)
+                is_best = self.checkpoints.save(
+                    epoch=epoch,
+                    metric_value=val_rmse,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    extra={"val_metrics": metrics},
+                )
+                if is_best:
+                    best_epoch = epoch
+                    best_val_rmse = val_rmse
+                    self.observability.register_artifact(
+                        run_id=run_id,
+                        path=self.checkpoints.best_path,
+                        artifact_type="checkpoint",
+                        label="best",
+                        metadata={"epoch": epoch, "val_rmse": val_rmse},
+                        source="runtime",
+                    )
 
-            last_train_loss = train_loss
-            last_val_loss = val_loss
+                self.observability.register_artifact(
+                    run_id=run_id,
+                    path=self.checkpoints.last_path,
+                    artifact_type="checkpoint",
+                    label="last",
+                    metadata={"epoch": epoch, "val_rmse": val_rmse},
+                    source="runtime",
+                )
 
-            if self.config.training.time_budget_sec > 0:
-                elapsed = time.perf_counter() - start_time
-                if elapsed >= self.config.training.time_budget_sec:
-                    self.logger.warning("Stopping early because the time budget was reached.")
+                last_train_loss = train_loss
+                last_val_loss = val_loss
+                self.observability.record_epoch(
+                    run_id=run_id,
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    val_rmse=val_rmse,
+                    lr=lr,
+                    best_metric=best_val_rmse if best_val_rmse != float("inf") else None,
+                    source="runtime",
+                )
+
+                if self.config.training.time_budget_sec > 0:
+                    elapsed = time.perf_counter() - start_time
+                    if elapsed >= self.config.training.time_budget_sec:
+                        self.logger.warning("Stopping early because the time budget was reached.")
+                        self.observability.append_event(
+                            run_id=run_id,
+                            event_type="time_budget_reached",
+                            level="WARNING",
+                            title="training time budget reached",
+                            payload={"elapsed_seconds": elapsed},
+                            source="runtime",
+                        )
+                        break
+
+                if self.early_stopping.update(val_rmse):
+                    self.logger.info("Stopping early after %d epochs without improvement.", epoch)
+                    self.observability.append_event(
+                        run_id=run_id,
+                        event_type="early_stop",
+                        level="INFO",
+                        title="early stopping triggered",
+                        payload={"epoch": epoch, "val_rmse": val_rmse},
+                        source="runtime",
+                    )
                     break
 
-            if self.early_stopping.update(val_rmse):
-                self.logger.info("Stopping early after %d epochs without improvement.", epoch)
-                break
-
-        elapsed = time.perf_counter() - start_time
-        test_metrics = (
-            Evaluator(self.model, self.device_ctx).evaluate(
-                test_loader,
-                fs=self._sampling_rate_hz(),
+            elapsed = time.perf_counter() - start_time
+            test_metrics = (
+                Evaluator(self.model, self.device_ctx).evaluate(
+                    test_loader,
+                    fs=self._sampling_rate_hz(),
+                )
+                if test_loader is not None
+                else {}
             )
-            if test_loader is not None
-            else {}
-        )
-        summary_metrics = {
-            "best_epoch": best_epoch,
-            "best_val_rmse": best_val_rmse,
-            "final_train_loss": last_train_loss,
-            "final_val_loss": last_val_loss,
-            "training_seconds": elapsed,
-            "test_metrics": test_metrics,
-        }
-        metrics_path = Path(self.config.output_dir) / self.config.name / "metrics.json"
-        save_metrics(metrics_path, summary_metrics)
+            summary_metrics = {
+                "best_epoch": best_epoch,
+                "best_val_rmse": best_val_rmse,
+                "final_train_loss": last_train_loss,
+                "final_val_loss": last_val_loss,
+                "training_seconds": elapsed,
+                "test_metrics": test_metrics,
+            }
+            metrics_path = Path(self.config.output_dir) / self.config.name / "metrics.json"
+            save_metrics(metrics_path, summary_metrics)
+            self.observability.register_artifact(
+                run_id=run_id,
+                path=metrics_path,
+                artifact_type="training_metrics",
+                label="training_metrics",
+                metadata=summary_metrics,
+                source="runtime",
+            )
+            self.observability.register_artifact(
+                run_id=run_id,
+                path=self.history_path,
+                artifact_type="history",
+                label="history",
+                source="runtime",
+            )
 
-        artifacts = TrainingArtifacts(
-            checkpoint_dir=self.config.checkpoint_dir,
-            best_checkpoint=self.checkpoints.best_path,
-            last_checkpoint=self.checkpoints.last_path,
-            metrics_path=metrics_path,
-            history_path=self.history_path,
-        )
-        return TrainingSummary(
-            best_epoch=best_epoch,
-            best_val_rmse=best_val_rmse,
-            final_train_loss=last_train_loss,
-            final_val_loss=last_val_loss,
-            training_seconds=elapsed,
-            artifacts=artifacts,
-        )
+            artifacts = TrainingArtifacts(
+                checkpoint_dir=self.config.checkpoint_dir,
+                best_checkpoint=self.checkpoints.best_path,
+                last_checkpoint=self.checkpoints.last_path,
+                metrics_path=metrics_path,
+                history_path=self.history_path,
+            )
+            summary = TrainingSummary(
+                best_epoch=best_epoch,
+                best_val_rmse=best_val_rmse,
+                final_train_loss=last_train_loss,
+                final_val_loss=last_val_loss,
+                training_seconds=elapsed,
+                artifacts=artifacts,
+            )
+            self.observability.finish_run(
+                run_id=run_id,
+                status="completed",
+                summary=summary_metrics,
+                source="runtime",
+            )
+            return summary
+        except Exception as exc:
+            self.observability.finish_run(
+                run_id=run_id,
+                status="failed",
+                summary={"message": str(exc)},
+                source="runtime",
+            )
+            raise
+        finally:
+            self.logger.removeHandler(log_handler)
 
     def _run_epoch(self, dataloader: DataLoader[Any], *, training: bool) -> float:
         if training:

@@ -100,6 +100,20 @@ class AutoResearchConfig:
 
 
 @dataclass(frozen=True)
+class ObservabilityConfig:
+    """Mission-control observability settings."""
+
+    enabled: bool = True
+    db_path: str = "artifacts/observability/mission_control.db"
+    blob_dir: str = "artifacts/observability/blobs"
+    capture_raw_llm: bool = True
+    import_hermes_state: bool = True
+    redact_secrets: bool = True
+    tui_refresh_hz: int = 2
+    streamlit_port: int = 8501
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     """Top-level experiment configuration combining all sub-configs."""
 
@@ -109,6 +123,7 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     autoresearch: AutoResearchConfig = field(default_factory=AutoResearchConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     output_dir: str = "artifacts"
     log_dir: str = "artifacts/logs"
 

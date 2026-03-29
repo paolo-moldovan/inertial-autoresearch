@@ -8,8 +8,10 @@ from typing import Any
 
 from _pytest.monkeypatch import MonkeyPatch
 
+from autoresearch_loop.hermes import HermesQueryTrace
 from autoresearch_loop.loop import run_autoresearch
 from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
+from imu_denoise.observability import MissionControlQueries
 
 
 def test_mutation_schedule_is_baseline_first() -> None:
@@ -34,6 +36,8 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     base_overrides = [
         f"autoresearch.results_file={results_path}",
         "autoresearch.orchestrator=none",
+        f"observability.db_path={tmp_path / 'observability' / 'mission_control.db'}",
+        f"observability.blob_dir={tmp_path / 'observability' / 'blobs'}",
         "training.epochs=1",
         "training.batch_size=4",
         "data.dataset_kwargs.duration_sec=2.0",
@@ -73,6 +77,8 @@ def test_autoresearch_loop_uses_hermes_proposals_when_enabled(
     base_overrides = [
         f"autoresearch.results_file={results_path}",
         "autoresearch.orchestrator=hermes",
+        f"observability.db_path={tmp_path / 'observability' / 'mission_control.db'}",
+        f"observability.blob_dir={tmp_path / 'observability' / 'blobs'}",
         "training.epochs=1",
         "training.batch_size=4",
         "data.dataset_kwargs.duration_sec=2.0",
@@ -88,10 +94,23 @@ def test_autoresearch_loop_uses_hermes_proposals_when_enabled(
 
     monkeypatch.setattr("autoresearch_loop.hermes.hermes_backend_ready", _backend_ready)
     monkeypatch.setattr(
-        "autoresearch_loop.hermes.choose_mutation_proposal",
-        lambda **kwargs: MutationProposal(
-            description="switch to huber loss",
-            overrides=["training.loss=huber"],
+        "autoresearch_loop.hermes.choose_mutation_proposal_with_trace",
+        lambda **kwargs: (
+            MutationProposal(
+                description="switch to huber loss",
+                overrides=["training.loss=huber"],
+            ),
+            HermesQueryTrace(
+                prompt="choose",
+                command={"argv": ["hermes"]},
+                status="ok",
+                latency_ms=12.0,
+                stdout='{"candidate_index": 0, "reason": "good"}',
+                stderr="",
+                parsed_payload={"candidate_index": 0, "reason": "good"},
+                session_id="session-1",
+                reason="good",
+            ),
         ),
     )
 
@@ -105,3 +124,12 @@ def test_autoresearch_loop_uses_hermes_proposals_when_enabled(
     assert results[1].description == "switch to huber loss"
     assert results[1].proposal_source == "hermes"
     assert "training.loss=huber" in results[1].overrides
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+    assert len(queries.list_recent_decisions(limit=10)) >= 2
+    assert any(
+        call["session_id"] == "session-1"
+        for call in queries.list_recent_llm_calls(limit=10)
+    )

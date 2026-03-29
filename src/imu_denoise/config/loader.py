@@ -89,6 +89,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
         DeviceConfig,
         HermesConfig,
         ModelConfig,
+        ObservabilityConfig,
         TrainingConfig,
     )
 
@@ -99,6 +100,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
             "model": ModelConfig,
             "training": TrainingConfig,
             "autoresearch": AutoResearchConfig,
+            "observability": ObservabilityConfig,
         }
         return type_map.get(field_name)
 

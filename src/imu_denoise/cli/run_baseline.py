@@ -14,6 +14,7 @@ from imu_denoise.cli.common import add_common_config_arguments, resolve_config
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.evaluation.metrics import compute_all_metrics
+from imu_denoise.observability import ObservabilityWriter
 from imu_denoise.training.reproducibility import seed_everything
 from imu_denoise.utils.io import save_metrics
 
@@ -55,6 +56,16 @@ def main() -> int:
     config = resolve_config(args.config, args.overrides)
     seed_everything(config.training.seed)
     device_ctx = DeviceContext.from_config(config.device)
+    observability = ObservabilityWriter.from_experiment_config(config)
+    run_id = observability.start_run(
+        name=f"{config.name}-{args.baseline}",
+        phase="baseline",
+        dataset=config.data.dataset,
+        model=args.baseline,
+        device=device_ctx.device.type,
+        config=config,
+        source="runtime",
+    )
 
     _, _, test_loader = create_dataloaders(config.data, config.training, device_ctx)
     baseline = _build_baseline(args.baseline)
@@ -87,6 +98,14 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.json"
     save_metrics(metrics_path, metrics)
+    observability.register_artifact(
+        run_id=run_id,
+        path=metrics_path,
+        artifact_type="baseline_metrics",
+        label=args.baseline,
+        metadata=metrics,
+        source="runtime",
+    )
 
     assert sample_timestamps is not None
     plot_denoising_comparison(
@@ -97,11 +116,31 @@ def main() -> int:
         title=f"{args.baseline} baseline",
         save_path=output_dir / "comparison.png",
     )
+    observability.register_artifact(
+        run_id=run_id,
+        path=output_dir / "comparison.png",
+        artifact_type="figure",
+        label=f"{args.baseline}_comparison",
+        source="runtime",
+    )
     plot_psd(
         signals={"noisy": noisy_array[0], "denoised": pred_array[0], "clean": clean_array[0]},
         fs=100.0 if config.data.dataset == "blackbird" else 200.0,
         title=f"{args.baseline} baseline PSD",
         save_path=output_dir / "psd.png",
+    )
+    observability.register_artifact(
+        run_id=run_id,
+        path=output_dir / "psd.png",
+        artifact_type="figure",
+        label=f"{args.baseline}_psd",
+        source="runtime",
+    )
+    observability.finish_run(
+        run_id=run_id,
+        status="completed",
+        summary={"rmse": metrics["rmse"], "mae": metrics["mae"]},
+        source="runtime",
     )
 
     print("Baseline evaluation complete:")

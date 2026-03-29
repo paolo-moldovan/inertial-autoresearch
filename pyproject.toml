@@ -27,7 +27,11 @@ notebooks = [
     "jupyterlab>=4.0",
     "seaborn>=0.12",
 ]
-all = ["imu-denoise[euroc,dev,notebooks]"]
+monitor = [
+    "textual>=0.72",
+    "streamlit>=1.35",
+]
+all = ["imu-denoise[euroc,dev,notebooks,monitor]"]
 
 [project.scripts]
 imu-train = "imu_denoise.cli.train:main"
@@ -35,6 +39,9 @@ imu-eval = "imu_denoise.cli.evaluate:main"
 imu-data = "imu_denoise.cli.download_data:main"
 imu-preprocess = "imu_denoise.cli.preprocess_data:main"
 imu-baseline = "imu_denoise.cli.run_baseline:main"
+imu-monitor = "imu_denoise.cli.monitor:main"
+imu-dashboard = "imu_denoise.cli.dashboard:main"
+imu-observability-backfill = "imu_denoise.cli.observability_backfill:main"
 
 [build-system]
 requires = ["hatchling"]

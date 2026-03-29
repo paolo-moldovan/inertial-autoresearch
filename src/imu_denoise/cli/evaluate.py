@@ -12,6 +12,7 @@ from imu_denoise.cli.common import add_common_config_arguments, build_model, res
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
+from imu_denoise.observability import ObservabilityWriter
 from imu_denoise.training.reproducibility import seed_everything
 from imu_denoise.utils.io import load_checkpoint, save_metrics
 
@@ -41,6 +42,16 @@ def main() -> int:
     seed_everything(config.training.seed)
     device_ctx = DeviceContext.from_config(config.device)
     model = build_model(config)
+    observability = ObservabilityWriter.from_experiment_config(config)
+    run_id = observability.start_run(
+        name=f"{config.name}-evaluation",
+        phase="evaluation",
+        dataset=config.data.dataset,
+        model=config.model.name,
+        device=device_ctx.device.type,
+        config=config,
+        source="runtime",
+    )
     checkpoint_path = (
         Path(args.checkpoint) if args.checkpoint else Path(config.checkpoint_dir) / "best.pt"
     )
@@ -55,6 +66,21 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.json"
     save_metrics(metrics_path, metrics)
+    observability.register_artifact(
+        run_id=run_id,
+        path=checkpoint_path,
+        artifact_type="checkpoint",
+        label="evaluation_checkpoint",
+        source="runtime",
+    )
+    observability.register_artifact(
+        run_id=run_id,
+        path=metrics_path,
+        artifact_type="evaluation_metrics",
+        label="evaluation_metrics",
+        metadata=metrics,
+        source="runtime",
+    )
 
     sample_batch = next(iter(test_loader))
     noisy = sample_batch["noisy"].to(device_ctx.device)
@@ -71,6 +97,13 @@ def main() -> int:
         timestamps=timestamps[0],
         save_path=output_dir / "denoising_comparison.png",
     )
+    observability.register_artifact(
+        run_id=run_id,
+        path=output_dir / "denoising_comparison.png",
+        artifact_type="figure",
+        label="denoising_comparison",
+        source="runtime",
+    )
     plot_psd(
         signals={
             "noisy": noisy.cpu().float().numpy()[0],
@@ -79,6 +112,19 @@ def main() -> int:
         },
         fs=sampling_rate,
         save_path=output_dir / "psd.png",
+    )
+    observability.register_artifact(
+        run_id=run_id,
+        path=output_dir / "psd.png",
+        artifact_type="figure",
+        label="psd",
+        source="runtime",
+    )
+    observability.finish_run(
+        run_id=run_id,
+        status="completed",
+        summary={"rmse": metrics["rmse"], "mae": metrics["mae"]},
+        source="runtime",
     )
 
     print("Evaluation complete:")
