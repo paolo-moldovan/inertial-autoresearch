@@ -1,0 +1,13 @@
+services:
+  imu-denoise:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    working_dir: /app
+    command: ["python", "scripts/train.py", "--config", "configs/training/quick.yaml"]
+    environment:
+      MPLCONFIGDIR: /tmp/matplotlib
+      XDG_CACHE_HOME: /tmp
+    volumes:
+      - ../artifacts:/app/artifacts
+      - ../data:/app/data

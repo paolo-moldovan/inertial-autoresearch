@@ -25,6 +25,7 @@ class DataConfig:
     stride: int = 100  # 50% overlap by default
     normalize: bool = True
     augment: bool = True
+    dataset_kwargs: dict[str, object] = field(default_factory=dict)
     train_sequences: list[str] = field(default_factory=list)
     val_sequences: list[str] = field(default_factory=list)
     test_sequences: list[str] = field(default_factory=list)
