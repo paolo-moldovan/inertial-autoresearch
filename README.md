@@ -69,6 +69,9 @@ uv run scripts/monitor.py
 
 # Launch the Streamlit dashboard
 uv run scripts/dashboard.py
+
+# Start the whole stack with tmuxinator
+uv run scripts/start_mission_control.py
 ```
 
 ## Hermes + Ollama
@@ -96,6 +99,11 @@ The read-only surfaces are:
 - `imu-monitor` / `scripts/monitor.py`: Textual TUI for live status
 - `imu-dashboard` / `scripts/dashboard.py`: Streamlit browser dashboard
 - `imu-observability-backfill` / `scripts/observability_backfill.py`: historical import
+- `imu-mission-control` / `scripts/start_mission_control.py`: tmuxinator stack launcher
+
+The default stack config for the local Hermes + Ollama smoke path lives at
+`configs/mission_control/hermes_smoke.yaml`, and the tmuxinator project file
+is at `.tmuxinator/mission-control.yml`.
 
 ## CI And Docker
 
