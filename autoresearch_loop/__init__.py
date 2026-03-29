@@ -1,0 +1,1 @@
+"""Local autoresearch loop package."""

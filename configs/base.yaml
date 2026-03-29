@@ -1,0 +1,21 @@
+name: default
+
+device:
+  preferred: auto
+  dtype: float32
+  compile: false
+
+data:
+  dataset: euroc
+  window_size: 200
+  stride: 100
+  normalize: true
+  augment: true
+  data_dir: data
+
+training:
+  seed: 42
+  num_workers: 4
+
+output_dir: artifacts
+log_dir: artifacts/logs

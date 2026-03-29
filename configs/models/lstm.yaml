@@ -1,0 +1,6 @@
+model:
+  name: lstm
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.1
+  bidirectional: true

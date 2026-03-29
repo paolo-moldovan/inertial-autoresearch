@@ -1,0 +1,19 @@
+# Quick run for debugging — 2 epochs on synthetic data
+training:
+  epochs: 2
+  batch_size: 16
+  lr: 0.001
+  seed: 42
+  num_workers: 0
+  time_budget_sec: 0
+
+data:
+  dataset: synthetic
+  window_size: 200
+  stride: 100
+  normalize: false
+  augment: false
+  dataset_kwargs:
+    duration_sec: 8.0
+    rate_hz: 50.0
+    num_sequences: 5

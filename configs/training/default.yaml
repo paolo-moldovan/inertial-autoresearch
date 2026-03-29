@@ -1,0 +1,13 @@
+training:
+  epochs: 100
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  optimizer: adamw
+  loss: mse
+  gradient_clip: 1.0
+  early_stop_patience: 10
+  seed: 42
+  num_workers: 4
+  time_budget_sec: 0

@@ -1,0 +1,7 @@
+model:
+  name: conv1d
+  hidden_dim: 64
+  num_layers: 6
+  dropout: 0.1
+  kernel_size: 7
+  dilation_base: 2

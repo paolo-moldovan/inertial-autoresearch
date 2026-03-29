@@ -1,0 +1,19 @@
+autoresearch:
+  max_iterations: 50
+  time_budget_sec: 600
+  metric_key: val_rmse
+  metric_direction: minimize
+  results_file: artifacts/autoresearch/results.tsv
+  orchestrator: hermes    # none | hermes | researchclaw
+  hermes:
+    python_bin: vendor/hermes-agent/.venv/bin/python
+    cli_path: vendor/hermes-agent/cli.py
+    home_dir: .hermes
+    provider: custom
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3.5:latest
+    toolsets:
+      - file
+    max_turns: 6
+    timeout_sec: 90
+    healthcheck_timeout_sec: 2.0

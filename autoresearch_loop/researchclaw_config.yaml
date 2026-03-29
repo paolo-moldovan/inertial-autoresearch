@@ -1,0 +1,43 @@
+project:
+  name: "imu-denoise-autoresearch"
+  mode: "full-auto"
+
+research:
+  topic: "Autonomous IMU denoising model search on synthetic and benchmark datasets"
+  domains:
+    - "machine-learning"
+    - "robotics"
+
+runtime:
+  timezone: "Asia/Dubai"
+  max_parallel_tasks: 1
+  approval_timeout_hours: 12
+  retry_limit: 1
+
+notifications:
+  channel: "console"
+  target: ""
+  on_stage_start: true
+  on_stage_fail: true
+  on_gate_required: true
+
+knowledge_base:
+  backend: "markdown"
+  root: "artifacts/papers/researchclaw_kb"
+
+llm:
+  provider: "openai-compatible"
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"
+  primary_model: "gpt-4o-mini"
+
+experiment:
+  mode: "sandbox"
+  time_budget_sec: 300
+  max_iterations: 10
+  metric_key: "val_rmse"
+  metric_direction: "minimize"
+  sandbox:
+    python_path: ".venv/bin/python"
+    gpu_required: false
+    max_memory_mb: 8192
