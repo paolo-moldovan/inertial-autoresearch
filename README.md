@@ -106,6 +106,19 @@ Queue a rerun of a previous run for the active loop:
 uv run imu rerun --run-id <run-id-or-prefix>
 ```
 
+Control how loop baselines are chosen:
+
+```yaml
+autoresearch:
+  baseline:
+    mode: per_loop   # per_loop | global | manual
+    run_id: ""       # required when mode=manual
+```
+
+- `per_loop`: run a fresh baseline at iteration `0`
+- `global`: reuse the latest completed baseline run for the same dataset and model if one exists
+- `manual`: pin the baseline to a specific prior run id or id prefix
+
 The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is [autoresearch_loop/loop.py](/Users/paolo/development/inertial-autoresearch/autoresearch_loop/loop.py).
 
 ## Mission Control

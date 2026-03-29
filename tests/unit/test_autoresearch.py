@@ -23,6 +23,14 @@ def test_mutation_schedule_is_baseline_first() -> None:
     assert len(schedule) == 4
 
 
+def test_mutation_schedule_can_skip_baseline() -> None:
+    """Schedules without a per-loop baseline should start directly with mutations."""
+    schedule = build_mutation_schedule(3, Random(7), include_baseline=False)
+
+    assert schedule[0].description != "baseline"
+    assert len(schedule) == 3
+
+
 def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     """The local loop should write a TSV with a baseline and one mutation result."""
     results_path = tmp_path / "results.tsv"
@@ -143,3 +151,100 @@ def test_loop_parser_does_not_inject_quick_config_when_explicit_config_is_passed
     args = parser.parse_args(["--config", "configs/mission_control/hermes_euroc_subset.yaml"])
 
     assert args.config == ["configs/mission_control/hermes_euroc_subset.yaml"]
+
+
+def test_autoresearch_global_baseline_reuses_previous_baseline(tmp_path: Path) -> None:
+    """Global baseline mode should reuse the latest compatible baseline run."""
+    results_path = tmp_path / "results.tsv"
+    common_overrides = [
+        f"autoresearch.results_file={results_path}",
+        "autoresearch.orchestrator=none",
+        f"observability.db_path={tmp_path / 'observability' / 'mission_control.db'}",
+        f"observability.blob_dir={tmp_path / 'observability' / 'blobs'}",
+        "training.epochs=1",
+        "training.batch_size=4",
+        "data.dataset_kwargs.duration_sec=2.0",
+        "data.dataset_kwargs.rate_hz=20.0",
+        "data.dataset_kwargs.num_sequences=3",
+        "data.window_size=20",
+        "data.stride=10",
+    ]
+    config_paths = [
+        "configs/base.yaml",
+        "configs/device.yaml",
+        "configs/models/lstm.yaml",
+        "configs/training/quick.yaml",
+        "configs/autoresearch.yaml",
+    ]
+
+    first_results = run_autoresearch(
+        config_paths=config_paths,
+        base_overrides=[*common_overrides, "autoresearch.max_iterations=1"],
+        max_iterations=1,
+    )
+    assert len(first_results) == 2
+    assert first_results[0].status == "baseline"
+
+    second_results = run_autoresearch(
+        config_paths=config_paths,
+        base_overrides=[
+            *common_overrides,
+            "autoresearch.max_iterations=1",
+            "autoresearch.baseline.mode=global",
+        ],
+        max_iterations=1,
+    )
+    assert len(second_results) == 1
+    assert second_results[0].status in {"keep", "discard"}
+
+
+def test_autoresearch_manual_baseline_uses_selected_run(tmp_path: Path) -> None:
+    """Manual baseline mode should compare against the explicitly selected baseline run."""
+    results_path = tmp_path / "results.tsv"
+    config_paths = [
+        "configs/base.yaml",
+        "configs/device.yaml",
+        "configs/models/lstm.yaml",
+        "configs/training/quick.yaml",
+        "configs/autoresearch.yaml",
+    ]
+    common_overrides = [
+        f"autoresearch.results_file={results_path}",
+        "autoresearch.orchestrator=none",
+        f"observability.db_path={tmp_path / 'observability' / 'mission_control.db'}",
+        f"observability.blob_dir={tmp_path / 'observability' / 'blobs'}",
+        "training.epochs=1",
+        "training.batch_size=4",
+        "data.dataset_kwargs.duration_sec=2.0",
+        "data.dataset_kwargs.rate_hz=20.0",
+        "data.dataset_kwargs.num_sequences=3",
+        "data.window_size=20",
+        "data.stride=10",
+        "autoresearch.max_iterations=1",
+    ]
+
+    run_autoresearch(
+        config_paths=config_paths,
+        base_overrides=common_overrides,
+        max_iterations=1,
+    )
+
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+    baseline_run = next(
+        row for row in queries.list_recent_decisions(limit=10) if row["status"] == "baseline"
+    )
+
+    manual_results = run_autoresearch(
+        config_paths=config_paths,
+        base_overrides=[
+            *common_overrides,
+            "autoresearch.baseline.mode=manual",
+            f"autoresearch.baseline.run_id={baseline_run['run_id']}",
+        ],
+        max_iterations=1,
+    )
+    assert len(manual_results) == 1
+    assert manual_results[0].status in {"keep", "discard"}

@@ -257,6 +257,70 @@ class MissionControlQueries:
             row["rank"] = index
         return rows
 
+    def get_run_metric(self, run_id: str, *, metric_key: str = "val_rmse") -> float | None:
+        metric_keys = [metric_key]
+        if metric_key == "val_rmse":
+            metric_keys.append("rmse")
+        row = self.store.fetch_one(
+            """
+            WITH ranked_decisions AS (
+                SELECT
+                    d.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.run_id
+                        ORDER BY d.created_at DESC, d.id DESC
+                    ) AS row_num
+                FROM decisions d
+                WHERE d.run_id = ? AND d.metric_key IN (?, ?)
+            )
+            SELECT COALESCE(rd.metric_value, s.best_metric) AS metric_value
+            FROM runs r
+            LEFT JOIN ranked_decisions rd ON rd.run_id = r.id AND rd.row_num = 1
+            LEFT JOIN status_snapshots s ON s.run_id = r.id
+            WHERE r.id = ?
+            """,
+            (run_id, metric_keys[0], metric_keys[-1], run_id),
+        )
+        if row is None or row.get("metric_value") is None:
+            return None
+        return float(row["metric_value"])
+
+    def find_latest_global_baseline(
+        self,
+        *,
+        metric_key: str,
+        dataset: str,
+        model: str,
+    ) -> dict[str, Any] | None:
+        metric_keys = [metric_key]
+        if metric_key == "val_rmse":
+            metric_keys.append("rmse")
+        row = self.store.fetch_one(
+            """
+            SELECT
+                r.id AS run_id,
+                r.name AS run_name,
+                r.dataset,
+                r.model,
+                d.metric_key,
+                d.metric_value,
+                d.created_at
+            FROM decisions d
+            JOIN runs r ON r.id = d.run_id
+            WHERE r.phase = 'training'
+              AND r.status = 'completed'
+              AND r.dataset = ?
+              AND r.model = ?
+              AND d.status = 'baseline'
+              AND d.metric_key IN (?, ?)
+              AND d.metric_value IS NOT NULL
+            ORDER BY d.created_at DESC
+            LIMIT 1
+            """,
+            (dataset, model, metric_keys[0], metric_keys[-1]),
+        )
+        return row
+
     def resolve_id_fragment(self, fragment: str) -> dict[str, Any] | None:
         normalized = fragment.strip()
         if not normalized:

@@ -108,6 +108,14 @@ class HermesConfig:
 
 
 @dataclass(frozen=True)
+class AutoResearchBaselineConfig:
+    """Baseline selection policy for autoresearch loops."""
+
+    mode: str = "per_loop"  # "per_loop" | "global" | "manual"
+    run_id: str = ""
+
+
+@dataclass(frozen=True)
 class AutoResearchConfig:
     """Auto-research loop settings."""
 
@@ -117,6 +125,7 @@ class AutoResearchConfig:
     metric_direction: str = "minimize"  # "minimize" | "maximize"
     results_file: str = "artifacts/autoresearch/results.tsv"
     orchestrator: str = "none"  # "none" | "hermes" | "researchclaw"
+    baseline: AutoResearchBaselineConfig = field(default_factory=AutoResearchBaselineConfig)
     hermes: HermesConfig = field(default_factory=HermesConfig)
 
 

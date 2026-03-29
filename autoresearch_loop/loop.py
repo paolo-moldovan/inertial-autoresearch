@@ -59,6 +59,16 @@ class LoopResult:
     metrics_path: Path | None
 
 
+@dataclass(frozen=True)
+class BaselineReference:
+    """Resolved baseline policy for a loop run."""
+
+    include_baseline_run: bool
+    metric_value: float | None
+    run_id: str | None
+    description: str
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the argument parser for the local autoresearch loop."""
     parser = argparse.ArgumentParser(description="Run local config-first autoresearch iterations.")
@@ -306,6 +316,70 @@ def _best_metric_from_results(results: list[LoopResult], direction: str) -> floa
     return max(valid) if direction == "maximize" else min(valid)
 
 
+def _resolve_baseline_reference(base_config: ExperimentConfig) -> BaselineReference:
+    from imu_denoise.observability import MissionControlQueries
+
+    policy = base_config.autoresearch.baseline.mode
+    queries = MissionControlQueries(
+        db_path=Path(base_config.observability.db_path),
+        blob_dir=Path(base_config.observability.blob_dir),
+    )
+
+    if policy == "per_loop":
+        return BaselineReference(
+            include_baseline_run=True,
+            metric_value=None,
+            run_id=None,
+            description="per-loop baseline",
+        )
+
+    if policy == "global":
+        baseline = queries.find_latest_global_baseline(
+            metric_key=base_config.autoresearch.metric_key,
+            dataset=base_config.data.dataset,
+            model=base_config.model.name,
+        )
+        if baseline is None:
+            return BaselineReference(
+                include_baseline_run=True,
+                metric_value=None,
+                run_id=None,
+                description="global baseline not found; falling back to per-loop baseline",
+            )
+        return BaselineReference(
+            include_baseline_run=False,
+            metric_value=float(baseline["metric_value"]),
+            run_id=str(baseline["run_id"]),
+            description=f"global baseline {str(baseline['run_id'])[:8]}",
+        )
+
+    if policy == "manual":
+        configured_run_id = base_config.autoresearch.baseline.run_id.strip()
+        if not configured_run_id:
+            raise ValueError("autoresearch.baseline.run_id is required when mode=manual")
+        match = queries.resolve_id_fragment(configured_run_id)
+        if match is None or match["entity_type"] != "run":
+            run_id = configured_run_id
+        else:
+            run_id = str(match["id"])
+        metric_value = queries.get_run_metric(
+            run_id,
+            metric_key=base_config.autoresearch.metric_key,
+        )
+        if metric_value is None:
+            raise ValueError(
+                f"Could not resolve baseline metric for manual baseline run: {configured_run_id}"
+            )
+        return BaselineReference(
+            include_baseline_run=False,
+            metric_value=metric_value,
+            run_id=run_id,
+            description=f"manual baseline {run_id[:8]}",
+        )
+
+    raise ValueError(f"Unsupported autoresearch baseline mode: {policy}")
+
+
 def _wait_while_paused(
     *,
     loop_controller: LoopController,
@@ -450,11 +524,18 @@ def run_autoresearch(
     requested_batch_size = batch_size if pause_enabled and batch_size and batch_size > 0 else None
 
     rng = Random(base_config.training.seed)
-    schedule = build_mutation_schedule(total_iterations, rng)
+    baseline_reference = _resolve_baseline_reference(base_config)
+    schedule = build_mutation_schedule(
+        total_iterations,
+        rng,
+        include_baseline=baseline_reference.include_baseline_run,
+    )
     total_scheduled_runs = len(schedule)
     results: list[LoopResult] = []
-    best_metric = _best_metric_from_results(results, base_config.autoresearch.metric_direction)
-    best_run_id: str | None = None
+    best_metric = baseline_reference.metric_value
+    if best_metric is None:
+        best_metric = _best_metric_from_results(results, base_config.autoresearch.metric_direction)
+    best_run_id: str | None = baseline_reference.run_id
     hermes_used_descriptions: set[str] = {
         result.description for result in results if result.proposal_source == "hermes"
     }
@@ -476,6 +557,21 @@ def run_autoresearch(
             source="runtime",
         )
         raise
+
+    observability.append_event(
+        run_id=loop_run_id,
+        event_type="baseline_reference",
+        level="INFO",
+        title="baseline policy resolved",
+        payload={
+            "mode": base_config.autoresearch.baseline.mode,
+            "include_baseline_run": baseline_reference.include_baseline_run,
+            "baseline_run_id": baseline_reference.run_id,
+            "baseline_metric_value": baseline_reference.metric_value,
+            "description": baseline_reference.description,
+        },
+        source="runtime",
+    )
 
     for iteration, fallback_proposal in enumerate(schedule[len(results) :], start=len(results)):
         loop_state = loop_controller.get_loop_state(loop_run_id)
@@ -662,7 +758,7 @@ def run_autoresearch(
                 run_id=experiment_run_id,
             )
             metric_value = _metric_from_summary(summary, base_config.autoresearch.metric_key)
-            if iteration == 0:
+            if iteration == 0 and baseline_reference.include_baseline_run:
                 status = "baseline"
                 best_metric = metric_value
                 best_run_id = experiment_run_id

@@ -84,6 +84,7 @@ def _dict_to_dataclass(cls: type, data: dict[str, Any]) -> Any:
 def _resolve_type(cls: type, field_name: str) -> type | None:
     """Resolve dataclass field types from annotations."""
     from imu_denoise.config.schema import (
+        AutoResearchBaselineConfig,
         AutoResearchConfig,
         DataConfig,
         DataSubsetConfig,
@@ -107,6 +108,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
 
     if cls is AutoResearchConfig:
         nested_type_map: dict[str, type] = {
+            "baseline": AutoResearchBaselineConfig,
             "hermes": HermesConfig,
         }
         return nested_type_map.get(field_name)

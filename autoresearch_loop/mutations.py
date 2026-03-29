@@ -73,14 +73,20 @@ def default_mutation_pool() -> list[MutationProposal]:
     ]
 
 
-def build_mutation_schedule(max_iterations: int, rng: Random) -> list[MutationProposal]:
-    """Build a baseline-first mutation schedule of the requested length."""
+def build_mutation_schedule(
+    max_iterations: int,
+    rng: Random,
+    *,
+    include_baseline: bool = True,
+) -> list[MutationProposal]:
+    """Build a mutation schedule with an optional baseline-first seed proposal."""
     pool = default_mutation_pool()
     baseline = pool[0]
     candidates = pool[1:]
     rng.shuffle(candidates)
 
-    selected = [baseline]
-    while len(selected) < max_iterations + 1:
+    selected = [baseline] if include_baseline else []
+    target_length = max_iterations + 1 if include_baseline else max_iterations
+    while len(selected) < target_length:
         selected.extend(candidates)
-    return selected[: max_iterations + 1]
+    return selected[:target_length]

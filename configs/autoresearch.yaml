@@ -5,6 +5,9 @@ autoresearch:
   metric_direction: minimize
   results_file: artifacts/autoresearch/results.tsv
   orchestrator: hermes    # none | hermes | researchclaw
+  baseline:
+    mode: per_loop        # per_loop | global | manual
+    run_id: ""
   hermes:
     python_bin: vendor/hermes-agent/.venv/bin/python
     cli_path: vendor/hermes-agent/cli.py
