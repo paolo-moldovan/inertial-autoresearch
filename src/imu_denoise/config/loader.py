@@ -87,18 +87,28 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
         AutoResearchConfig,
         DataConfig,
         DeviceConfig,
+        HermesConfig,
         ModelConfig,
         TrainingConfig,
     )
 
-    type_map: dict[str, type] = {
-        "device": DeviceConfig,
-        "data": DataConfig,
-        "model": ModelConfig,
-        "training": TrainingConfig,
-        "autoresearch": AutoResearchConfig,
-    }
-    return type_map.get(field_name)
+    if cls is ExperimentConfig:
+        type_map: dict[str, type] = {
+            "device": DeviceConfig,
+            "data": DataConfig,
+            "model": ModelConfig,
+            "training": TrainingConfig,
+            "autoresearch": AutoResearchConfig,
+        }
+        return type_map.get(field_name)
+
+    if cls is AutoResearchConfig:
+        nested_type_map: dict[str, type] = {
+            "hermes": HermesConfig,
+        }
+        return nested_type_map.get(field_name)
+
+    return None
 
 
 def load_yaml(path: Path) -> dict[str, Any]:

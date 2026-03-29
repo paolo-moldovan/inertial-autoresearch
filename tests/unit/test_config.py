@@ -22,6 +22,7 @@ def test_load_config_merges_project_defaults() -> None:
     assert config.training.epochs == 2
     assert config.data.dataset == "synthetic"
     assert config.device.preferred == "auto"
+    assert config.autoresearch.hermes.model == "qwen3.5:latest"
 
 
 def test_load_config_applies_cli_overrides() -> None:
@@ -51,3 +52,17 @@ def test_checkpoint_and_figure_paths_are_derived() -> None:
 
     assert config.checkpoint_dir == Path("custom_artifacts/checkpoints/test-run")
     assert config.figures_dir == Path("custom_artifacts/figures/test-run")
+
+
+def test_load_config_builds_nested_hermes_config() -> None:
+    """Nested autoresearch.hermes settings should load into a typed dataclass."""
+    config = load_config(
+        Path("configs/autoresearch.yaml"),
+        overrides=[
+            "autoresearch.hermes.model=qwen3.5:32b",
+            "autoresearch.hermes.timeout_sec=30",
+        ],
+    )
+
+    assert config.autoresearch.hermes.model == "qwen3.5:32b"
+    assert config.autoresearch.hermes.timeout_sec == 30

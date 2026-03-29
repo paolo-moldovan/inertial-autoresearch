@@ -210,6 +210,8 @@ __marimo__/
 data/
 artifacts/
 vendor/
+.hermes/
 *.zip
 *.bag
 *.gguf
+/.hermes

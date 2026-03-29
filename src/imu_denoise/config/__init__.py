@@ -6,6 +6,7 @@ from imu_denoise.config.schema import (
     DataConfig,
     DeviceConfig,
     ExperimentConfig,
+    HermesConfig,
     ModelConfig,
     TrainingConfig,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "DataConfig",
     "DeviceConfig",
     "ExperimentConfig",
+    "HermesConfig",
     "ModelConfig",
     "TrainingConfig",
     "load_config",

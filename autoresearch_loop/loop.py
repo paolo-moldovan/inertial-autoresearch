@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from autoresearch_loop.mutations import MutationProposal
+    from imu_denoise.config import ExperimentConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -23,6 +27,7 @@ RESULTS_HEADER = [
     "iteration",
     "run_name",
     "status",
+    "proposal_source",
     "metric_key",
     "metric_value",
     "model_name",
@@ -39,6 +44,7 @@ class LoopResult:
     iteration: int
     run_name: str
     status: str
+    proposal_source: str
     metric_key: str
     metric_value: float | None
     model_name: str
@@ -96,6 +102,7 @@ def _append_result(path: Path, result: LoopResult) -> None:
         str(result.iteration),
         result.run_name,
         result.status,
+        result.proposal_source,
         result.metric_key,
         "" if result.metric_value is None else f"{result.metric_value:.6f}",
         result.model_name,
@@ -129,9 +136,9 @@ def _metric_from_summary(
 def _build_run_overrides(
     *,
     iteration: int,
-    proposal: Any,
+    proposal: MutationProposal,
     base_overrides: list[str],
-    base_config: Any,
+    base_config: ExperimentConfig,
 ) -> list[str]:
     overrides = list(base_overrides)
     overrides.extend(proposal.overrides)
@@ -139,6 +146,71 @@ def _build_run_overrides(
     if base_config.autoresearch.time_budget_sec > 0:
         overrides.append(f"training.time_budget_sec={base_config.autoresearch.time_budget_sec}")
     return overrides
+
+
+def _result_snapshot(result: LoopResult) -> dict[str, object]:
+    return {
+        "iteration": result.iteration,
+        "run_name": result.run_name,
+        "status": result.status,
+        "proposal_source": result.proposal_source,
+        "metric_key": result.metric_key,
+        "metric_value": result.metric_value,
+        "model_name": result.model_name,
+        "description": result.description,
+        "overrides": result.overrides,
+    }
+
+
+def _select_mutation_proposal(
+    *,
+    iteration: int,
+    base_config: ExperimentConfig,
+    rng: Random,
+    results: list[LoopResult],
+    fallback_proposal: MutationProposal,
+    hermes_used_descriptions: set[str],
+) -> tuple[MutationProposal, str]:
+    from autoresearch_loop.mutations import default_mutation_pool
+
+    if iteration == 0 or base_config.autoresearch.orchestrator != "hermes":
+        return fallback_proposal, "static"
+
+    from autoresearch_loop.hermes import (
+        HermesProposalError,
+        choose_mutation_proposal,
+        hermes_backend_ready,
+    )
+
+    if not hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT):
+        return fallback_proposal, "static-fallback"
+
+    candidate_pool = default_mutation_pool()[1:]
+    available_candidates = [
+        proposal
+        for proposal in candidate_pool
+        if proposal.description not in hermes_used_descriptions
+    ]
+    if not available_candidates:
+        hermes_used_descriptions.clear()
+        available_candidates = candidate_pool[:]
+        rng.shuffle(available_candidates)
+
+    try:
+        proposal = choose_mutation_proposal(
+            config=base_config.autoresearch.hermes,
+            iteration=iteration,
+            metric_key=base_config.autoresearch.metric_key,
+            metric_direction=base_config.autoresearch.metric_direction,
+            history=[_result_snapshot(result) for result in results],
+            candidates=available_candidates,
+            root=ROOT,
+        )
+    except HermesProposalError:
+        return fallback_proposal, "static-fallback"
+
+    hermes_used_descriptions.add(proposal.description)
+    return proposal, "hermes"
 
 
 def _run_single_experiment(
@@ -204,8 +276,17 @@ def run_autoresearch(
     schedule = build_mutation_schedule(total_iterations, rng)
     best_metric: float | None = None
     results: list[LoopResult] = []
+    hermes_used_descriptions: set[str] = set()
 
-    for iteration, proposal in enumerate(schedule):
+    for iteration, fallback_proposal in enumerate(schedule):
+        proposal, proposal_source = _select_mutation_proposal(
+            iteration=iteration,
+            base_config=base_config,
+            rng=rng,
+            results=results,
+            fallback_proposal=fallback_proposal,
+            hermes_used_descriptions=hermes_used_descriptions,
+        )
         run_overrides = _build_run_overrides(
             iteration=iteration,
             proposal=proposal,
@@ -237,6 +318,7 @@ def run_autoresearch(
                 iteration=iteration,
                 run_name=config.name,
                 status=status,
+                proposal_source=proposal_source,
                 metric_key=base_config.autoresearch.metric_key,
                 metric_value=metric_value,
                 model_name=config.model.name,
@@ -249,6 +331,7 @@ def run_autoresearch(
                 iteration=iteration,
                 run_name=f"autoresearch_{iteration:03d}",
                 status="crash",
+                proposal_source=proposal_source,
                 metric_key=base_config.autoresearch.metric_key,
                 metric_value=None,
                 model_name="unknown",

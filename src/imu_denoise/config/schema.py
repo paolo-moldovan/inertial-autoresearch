@@ -70,6 +70,23 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class HermesConfig:
+    """Hermes-backed orchestration settings for local LLM-driven search."""
+
+    python_bin: str = "vendor/hermes-agent/.venv/bin/python"
+    cli_path: str = "vendor/hermes-agent/cli.py"
+    home_dir: str = ".hermes"
+    provider: str = "custom"
+    base_url: str = "http://127.0.0.1:11434/v1"
+    model: str = "qwen3.5:latest"
+    api_key: str | None = None
+    toolsets: list[str] = field(default_factory=lambda: ["file"])
+    max_turns: int = 6
+    timeout_sec: int = 90
+    healthcheck_timeout_sec: float = 2.0
+
+
+@dataclass(frozen=True)
 class AutoResearchConfig:
     """Auto-research loop settings."""
 
@@ -79,6 +96,7 @@ class AutoResearchConfig:
     metric_direction: str = "minimize"  # "minimize" | "maximize"
     results_file: str = "autoresearch_loop/results.tsv"
     orchestrator: str = "none"  # "none" | "hermes" | "researchclaw"
+    hermes: HermesConfig = field(default_factory=HermesConfig)
 
 
 @dataclass(frozen=True)
