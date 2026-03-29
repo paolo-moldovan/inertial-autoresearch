@@ -11,10 +11,14 @@ from imu_denoise.cli.evaluate import run_command as run_evaluate_command
 from imu_denoise.cli.loop_control import (
     add_loop_arguments,
     add_queue_arguments,
+    add_rerun_arguments,
     add_status_arguments,
+    add_stop_arguments,
     run_loop_command,
     run_queue_command,
+    run_rerun_command,
     run_status_command,
+    run_stop_command,
 )
 from imu_denoise.cli.monitor import run_command as run_monitor_command
 from imu_denoise.cli.run_baseline import run_command as run_baseline_command
@@ -66,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Show active loop status.")
     add_status_arguments(status_parser)
     status_parser.set_defaults(handler=run_status_command, pre_handler=None)
+
+    stop_parser = subparsers.add_parser("stop", help="Request stop or terminate for the loop.")
+    add_stop_arguments(stop_parser)
+    stop_parser.set_defaults(handler=run_stop_command, pre_handler=None)
+
+    rerun_parser = subparsers.add_parser(
+        "rerun",
+        help="Queue a rerun of a previous run for the active loop.",
+    )
+    add_rerun_arguments(rerun_parser)
+    rerun_parser.set_defaults(handler=run_rerun_command, pre_handler=None)
 
     dashboard_parser = subparsers.add_parser("dashboard", help="Run the Streamlit dashboard.")
     add_common_config_arguments(dashboard_parser)

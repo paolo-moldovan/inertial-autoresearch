@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from imu_denoise.training import TrainingInterrupted  # noqa: E402
+
 RESULTS_HEADER = [
     "timestamp",
     "iteration",
@@ -63,8 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         action="append",
-        default=["configs/training/quick.yaml"],
-        help="Additional config path(s) to merge after the default stack.",
+        default=[],
+        help="Additional config path(s) to merge after the shared defaults.",
     )
     parser.add_argument(
         "--set",
@@ -238,6 +240,7 @@ def _run_single_experiment(
     from imu_denoise.observability import ObservabilityWriter
     from imu_denoise.training import (
         Trainer,
+        TrainingInterrupted,
         build_loss,
         build_optimizer_and_scheduler,
         seed_everything,
@@ -284,6 +287,8 @@ def _run_single_experiment(
         summary = trainer.fit(train_loader, val_loader, test_loader)
         _metric_from_summary(summary, metric_key)
         return config, summary, run_id
+    except TrainingInterrupted:
+        raise
     except Exception as exc:
         observability.finish_run(
             run_id=run_id,
@@ -315,6 +320,8 @@ def _wait_while_paused(
         loop_state = loop_controller.get_loop_state(loop_run_id)
         if loop_state is None:
             raise RuntimeError("Loop state disappeared while waiting for resume.")
+        if bool(loop_state.get("stop_requested")) or bool(loop_state.get("terminate_requested")):
+            return loop_state
         if loop_state["status"] != "paused":
             return loop_state
         loop_controller.heartbeat(
@@ -324,12 +331,44 @@ def _wait_while_paused(
             batch_size=batch_size,
             pause_after_iteration=loop_state.get("pause_after_iteration"),
             pause_requested=bool(loop_state.get("pause_requested")),
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
             best_metric=best_metric,
             best_run_id=best_run_id,
             active_child_run_id=None,
             status="paused",
         )
         time.sleep(0.25)
+
+
+def _finish_loop_with_status(
+    *,
+    observability: Any,
+    loop_controller: LoopController,
+    loop_run_id: str,
+    current_iteration: int,
+    max_iterations: int,
+    batch_size: int | None,
+    best_metric: float | None,
+    best_run_id: str | None,
+    status: str,
+    message: str,
+) -> None:
+    observability.finish_run(
+        run_id=loop_run_id,
+        status=status,
+        summary={"message": message},
+        source="runtime",
+    )
+    loop_controller.complete_loop(
+        loop_run_id=loop_run_id,
+        current_iteration=current_iteration,
+        max_iterations=max_iterations,
+        batch_size=batch_size,
+        best_metric=best_metric,
+        best_run_id=best_run_id,
+        status=status,
+    )
 
 
 def _resolve_results_file(
@@ -439,6 +478,35 @@ def run_autoresearch(
                 best_run_id=best_run_id,
             )
 
+        if bool(loop_state.get("terminate_requested")):
+            _finish_loop_with_status(
+                observability=observability,
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                status="terminated",
+                message=f"terminated after {len(results)} iterations",
+            )
+            return results
+        if bool(loop_state.get("stop_requested")):
+            _finish_loop_with_status(
+                observability=observability,
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                status="stopped",
+                message=f"stopped after {len(results)} iterations",
+            )
+            return results
+
         should_pause = bool(loop_state.get("pause_requested"))
         pause_reason = "manual"
         pause_after_iteration = loop_state.get("pause_after_iteration")
@@ -465,6 +533,8 @@ def run_autoresearch(
                 batch_size=requested_batch_size,
                 pause_after_iteration=pause_after_iteration,
                 pause_requested=False,
+                stop_requested=bool(loop_state.get("stop_requested")),
+                terminate_requested=bool(loop_state.get("terminate_requested")),
                 best_metric=best_metric,
                 best_run_id=best_run_id,
                 active_child_run_id=None,
@@ -560,6 +630,8 @@ def run_autoresearch(
             batch_size=requested_batch_size,
             pause_after_iteration=loop_state.get("pause_after_iteration"),
             pause_requested=bool(loop_state.get("pause_requested")),
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
             best_metric=best_metric,
             best_run_id=best_run_id,
             active_child_run_id=experiment_run_id,
@@ -633,6 +705,69 @@ def run_autoresearch(
                     loop_run_id=loop_run_id,
                     applied_run_id=experiment_run_id,
                 )
+        except TrainingInterrupted as exc:
+            result = LoopResult(
+                iteration=iteration,
+                run_name=f"autoresearch_{iteration:03d}",
+                status=exc.status,
+                proposal_source=proposal_source,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                model_name="unknown",
+                description=f"{proposal.description}: {exc}",
+                overrides=run_overrides,
+                metrics_path=None,
+            )
+            observability.record_decision(
+                run_id=loop_run_id,
+                iteration=iteration,
+                proposal_source=proposal_source,
+                description=proposal.description,
+                status=exc.status,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                overrides=run_overrides,
+                candidates=(
+                    [
+                        {
+                            "description": candidate.description,
+                            "overrides": candidate.overrides,
+                        }
+                        for candidate in candidate_pool
+                    ]
+                    if candidate_pool is not None
+                    else None
+                ),
+                reason=str(exc),
+                llm_call_id=llm_call_id,
+                source="runtime",
+            )
+            if queue_row is not None:
+                loop_controller.mark_queue_failed(
+                    proposal_id=int(queue_row["id"]),
+                    notes=str(exc),
+                )
+            _append_result(results_file, result)
+            observability.register_artifact(
+                run_id=loop_run_id,
+                path=results_file,
+                artifact_type="autoresearch_results",
+                label="results_tsv",
+                source="runtime",
+            )
+            _finish_loop_with_status(
+                observability=observability,
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                status=exc.status,
+                message=str(exc),
+            )
+            return results
         except Exception as exc:
             result = LoopResult(
                 iteration=iteration,
@@ -692,19 +827,17 @@ def run_autoresearch(
             batch_size=requested_batch_size,
             pause_after_iteration=loop_state.get("pause_after_iteration"),
             pause_requested=False,
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
             best_metric=best_metric,
             best_run_id=best_run_id,
             active_child_run_id=None,
             status="running",
         )
 
-    observability.finish_run(
-        run_id=loop_run_id,
-        status="completed",
-        summary={"message": f"completed {len(results)} iterations"},
-        source="runtime",
-    )
-    loop_controller.complete_loop(
+    _finish_loop_with_status(
+        observability=observability,
+        loop_controller=loop_controller,
         loop_run_id=loop_run_id,
         current_iteration=len(results),
         max_iterations=total_scheduled_runs,
@@ -712,6 +845,7 @@ def run_autoresearch(
         best_metric=best_metric,
         best_run_id=best_run_id,
         status="completed",
+        message=f"completed {len(results)} iterations",
     )
     return results
 
@@ -719,8 +853,9 @@ def run_autoresearch(
 def main() -> int:
     """CLI entrypoint for the local autoresearch loop."""
     args = build_parser().parse_args()
+    config_paths = list(args.config) or ["configs/training/quick.yaml"]
     results = run_autoresearch(
-        config_paths=args.config,
+        config_paths=config_paths,
         base_overrides=args.overrides,
         max_iterations=args.max_iterations,
         batch_size=args.batch or None,

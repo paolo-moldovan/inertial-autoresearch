@@ -164,6 +164,8 @@ CREATE TABLE IF NOT EXISTS loop_state (
     batch_size INTEGER,
     pause_after_iteration INTEGER,
     pause_requested INTEGER NOT NULL DEFAULT 0,
+    stop_requested INTEGER NOT NULL DEFAULT 0,
+    terminate_requested INTEGER NOT NULL DEFAULT 0,
     best_metric REAL,
     best_run_id TEXT,
     active_child_run_id TEXT,
@@ -290,7 +292,7 @@ class ObservabilityStore:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
             self._migrate(conn)
-            conn.execute("PRAGMA user_version = 2")
+            conn.execute("PRAGMA user_version = 3")
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         decision_info = conn.execute("PRAGMA table_info(decisions)").fetchall()
@@ -340,6 +342,24 @@ class ObservabilityStore:
                 """
             )
             conn.execute("PRAGMA foreign_keys=ON")
+
+        loop_state_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(loop_state)").fetchall()
+        }
+        if "stop_requested" not in loop_state_columns:
+            conn.execute(
+                """
+                ALTER TABLE loop_state
+                ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        if "terminate_requested" not in loop_state_columns:
+            conn.execute(
+                """
+                ALTER TABLE loop_state
+                ADD COLUMN terminate_requested INTEGER NOT NULL DEFAULT 0
+                """
+            )
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -567,6 +587,8 @@ class ObservabilityStore:
         batch_size: int | None,
         pause_after_iteration: int | None,
         pause_requested: bool,
+        stop_requested: bool,
+        terminate_requested: bool,
         best_metric: float | None,
         best_run_id: str | None,
         active_child_run_id: str | None,
@@ -578,10 +600,10 @@ class ObservabilityStore:
                 """
                 INSERT INTO loop_state (
                     loop_run_id, status, current_iteration, max_iterations, batch_size,
-                    pause_after_iteration, pause_requested, best_metric, best_run_id,
-                    active_child_run_id, heartbeat_at, updated_at
+                    pause_after_iteration, pause_requested, stop_requested, terminate_requested,
+                    best_metric, best_run_id, active_child_run_id, heartbeat_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(loop_run_id) DO UPDATE SET
                     status=excluded.status,
                     current_iteration=excluded.current_iteration,
@@ -589,6 +611,8 @@ class ObservabilityStore:
                     batch_size=excluded.batch_size,
                     pause_after_iteration=excluded.pause_after_iteration,
                     pause_requested=excluded.pause_requested,
+                    stop_requested=excluded.stop_requested,
+                    terminate_requested=excluded.terminate_requested,
                     best_metric=excluded.best_metric,
                     best_run_id=excluded.best_run_id,
                     active_child_run_id=excluded.active_child_run_id,
@@ -603,6 +627,8 @@ class ObservabilityStore:
                     batch_size,
                     pause_after_iteration,
                     1 if pause_requested else 0,
+                    1 if stop_requested else 0,
+                    1 if terminate_requested else 0,
                     best_metric,
                     best_run_id,
                     active_child_run_id,
@@ -634,7 +660,7 @@ class ObservabilityStore:
             """
             SELECT *
             FROM loop_state
-            WHERE status IN ('running', 'paused')
+            WHERE status IN ('running', 'paused', 'terminating')
             ORDER BY updated_at DESC
             LIMIT 1
             """

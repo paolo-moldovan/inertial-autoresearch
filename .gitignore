@@ -215,3 +215,4 @@ autoresearch_loop/results.tsv
 *.bag
 *.gguf
 /.hermes
+.DS_Store

@@ -9,6 +9,10 @@ from typing import Any
 from imu_denoise.observability.control import (
     LOOP_PAUSED,
     LOOP_RESUMED,
+    LOOP_STOP_REQUESTED,
+    LOOP_STOPPED,
+    LOOP_TERMINATE_REQUESTED,
+    LOOP_TERMINATED,
     QUEUE_APPLIED,
     QUEUE_CLAIMED,
     QUEUE_ENQUEUED,
@@ -88,7 +92,7 @@ class MissionControlQueries:
                 r.model
             FROM loop_state l
             JOIN runs r ON r.id = l.loop_run_id
-            WHERE l.status IN ('running', 'paused')
+            WHERE l.status IN ('running', 'paused', 'terminating')
             ORDER BY l.updated_at DESC
             LIMIT 1
             """
@@ -497,13 +501,17 @@ class MissionControlQueries:
         leaderboard = self.list_leaderboard(limit=limit)
         best_result = leaderboard[0] if leaderboard else None
         progress = []
+        queued: list[dict[str, Any]] = []
         if loop_state is not None:
             progress = self.list_loop_iteration_metrics(str(loop_state["loop_run_id"]))
+            queued = self.list_queued_proposals(str(loop_state["loop_run_id"]))
         return {
             "loop_state": loop_state,
             "best_result": best_result,
             "leaderboard": leaderboard,
             "progress": progress,
+            "queued_proposals": queued,
+            "recent_loop_events": self.list_recent_loop_events(limit=20),
         }
 
     def list_artifacts(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -709,11 +717,22 @@ class MissionControlQueries:
                 r.name AS run_name
             FROM events e
             LEFT JOIN runs r ON r.id = e.run_id
-            WHERE e.event_type IN (?, ?, ?, ?, ?)
+            WHERE e.event_type IN (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ORDER BY e.created_at DESC
             LIMIT ?
             """,
-            (LOOP_PAUSED, LOOP_RESUMED, QUEUE_ENQUEUED, QUEUE_CLAIMED, QUEUE_APPLIED, limit),
+            (
+                LOOP_PAUSED,
+                LOOP_RESUMED,
+                LOOP_STOP_REQUESTED,
+                LOOP_TERMINATE_REQUESTED,
+                LOOP_STOPPED,
+                LOOP_TERMINATED,
+                QUEUE_ENQUEUED,
+                QUEUE_CLAIMED,
+                QUEUE_APPLIED,
+                limit,
+            ),
         )
         for row in rows:
             row["payload"] = _loads(row.pop("payload_json"))

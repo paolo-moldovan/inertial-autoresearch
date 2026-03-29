@@ -127,6 +127,84 @@ def run_status_command(args: Any) -> int:
     )
     print(
         f"Loop {loop_state['status']}, iteration {loop_state['current_iteration']}/"
-        f"{loop_state['max_iterations']}, best={best_text}"
+        f"{loop_state['max_iterations']}, best={best_text}, "
+        f"flags=pause:{int(bool(loop_state.get('pause_requested')))} "
+        f"stop:{int(bool(loop_state.get('stop_requested')))} "
+        f"terminate:{int(bool(loop_state.get('terminate_requested')))}"
+    )
+    return 0
+
+
+def add_stop_arguments(parser: argparse.ArgumentParser) -> None:
+    add_common_config_arguments(parser)
+    parser.add_argument(
+        "--terminate",
+        action="store_true",
+        help="Force-terminate the active loop and interrupt the current training run.",
+    )
+
+
+def run_stop_command(args: Any) -> int:
+    config = resolve_config(args.config, args.overrides)
+    writer = ObservabilityWriter.from_experiment_config(config)
+    controller = LoopController.from_experiment_config(config, writer=writer)
+    state = (
+        controller.request_terminate()
+        if args.terminate
+        else controller.request_stop()
+    )
+    if state is None:
+        print("No active loop is available.")
+        return 1
+    action = "Terminate" if args.terminate else "Stop"
+    print(f"{action} requested for loop {str(state['loop_run_id'])[:8]}.")
+    return 0
+
+
+def add_rerun_arguments(parser: argparse.ArgumentParser) -> None:
+    add_common_config_arguments(parser)
+    parser.add_argument(
+        "--run-id",
+        required=True,
+        help="Run ID or unique ID prefix to requeue for the active loop.",
+    )
+    parser.add_argument(
+        "--notes",
+        type=str,
+        default="",
+        help="Optional note stored with the queued rerun.",
+    )
+
+
+def run_rerun_command(args: Any) -> int:
+    config = resolve_config(args.config, args.overrides)
+    db_path = Path(config.observability.db_path)
+    blob_dir = Path(config.observability.blob_dir)
+    queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
+    match = queries.resolve_id_fragment(args.run_id)
+    if match is None or match["entity_type"] != "run":
+        print(f"Could not resolve run ID: {args.run_id}")
+        return 1
+    run_id = str(match["id"])
+    detail = queries.get_run_detail(run_id)
+    if detail is None:
+        print(f"Run not found: {run_id}")
+        return 1
+    decisions = detail["decisions"]
+    if not decisions:
+        print(f"Run {run_id[:8]} has no decision payload to rerun.")
+        return 1
+    decision = decisions[0]
+    writer = ObservabilityWriter.from_experiment_config(config)
+    controller = LoopController.from_experiment_config(config, writer=writer)
+    proposal = controller.enqueue_proposal(
+        description=f"rerun {detail['run']['name']}",
+        overrides=list(decision.get("overrides") or []),
+        requested_by=os.environ.get("USER") or "human",
+        notes=args.notes or f"requeued from run {run_id}",
+    )
+    print(
+        f"Queued rerun #{proposal['id']} for loop {str(proposal['loop_run_id'])[:8]} "
+        f"from run {run_id[:8]}."
     )
     return 0

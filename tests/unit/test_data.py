@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from imu_denoise.config import DataConfig, DeviceConfig, TrainingConfig
+from imu_denoise.config import DataConfig, DataSubsetConfig, DeviceConfig, TrainingConfig
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.data.io import load_processed_sequence, save_processed_sequence
 from imu_denoise.data.registry import get_dataset
@@ -133,3 +133,85 @@ def test_create_dataloaders_builds_metadata_rich_batches() -> None:
     assert train_batch["dt"].dtype == torch.float32
     assert isinstance(val_batch["noisy"], torch.Tensor)
     assert isinstance(test_batch["noisy"], torch.Tensor)
+
+
+def test_subset_controls_are_reproducible_and_split_safe() -> None:
+    """Subsetting should be deterministic and preserve train/val/test isolation."""
+    data_config = DataConfig(
+        dataset="synthetic",
+        window_size=8,
+        stride=4,
+        normalize=True,
+        augment=False,
+        dataset_kwargs={"duration_sec": 2.0, "rate_hz": 8.0, "num_sequences": 6, "seed": 10},
+        subset=DataSubsetConfig(
+            enabled=True,
+            seed=123,
+            train_max_sequences=2,
+            val_max_sequences=1,
+            test_max_sequences=1,
+            train_max_windows=3,
+            val_max_windows=2,
+            test_max_windows=1,
+        ),
+    )
+    training_config = TrainingConfig(batch_size=8, num_workers=0, seed=42)
+    device_ctx = DeviceContext.from_config(DeviceConfig(preferred="cpu"))
+
+    first_train, first_val, first_test = create_dataloaders(
+        data_config,
+        training_config,
+        device_ctx,
+    )
+    second_train, second_val, second_test = create_dataloaders(
+        data_config,
+        training_config,
+        device_ctx,
+    )
+
+    first_train_ids = set(first_train.dataset._sequence_ids)  # type: ignore[attr-defined]
+    first_val_ids = set(first_val.dataset._sequence_ids)  # type: ignore[attr-defined]
+    first_test_ids = set(first_test.dataset._sequence_ids)  # type: ignore[attr-defined]
+    second_train_ids = set(second_train.dataset._sequence_ids)  # type: ignore[attr-defined]
+    second_val_ids = set(second_val.dataset._sequence_ids)  # type: ignore[attr-defined]
+    second_test_ids = set(second_test.dataset._sequence_ids)  # type: ignore[attr-defined]
+
+    assert first_train_ids == second_train_ids
+    assert first_val_ids == second_val_ids
+    assert first_test_ids == second_test_ids
+    assert len(first_train.dataset) == 3  # type: ignore[arg-type]
+    assert len(first_val.dataset) == 2  # type: ignore[arg-type]
+    assert len(first_test.dataset) == 1  # type: ignore[arg-type]
+    assert first_train_ids.isdisjoint(first_val_ids)
+    assert first_train_ids.isdisjoint(first_test_ids)
+    assert first_val_ids.isdisjoint(first_test_ids)
+
+
+def test_subset_controls_do_not_change_sampling_interval() -> None:
+    """Window subsetting should not alter per-window timestamp spacing."""
+    base_config = DataConfig(
+        dataset="synthetic",
+        window_size=8,
+        stride=4,
+        normalize=False,
+        augment=False,
+        dataset_kwargs={"duration_sec": 2.0, "rate_hz": 16.0, "num_sequences": 5, "seed": 5},
+    )
+    subset_config = DataConfig(
+        dataset=base_config.dataset,
+        window_size=base_config.window_size,
+        stride=base_config.stride,
+        normalize=base_config.normalize,
+        augment=base_config.augment,
+        dataset_kwargs=dict(base_config.dataset_kwargs),
+        subset=DataSubsetConfig(enabled=True, seed=99, train_max_windows=2, val_max_windows=1),
+    )
+    training_config = TrainingConfig(batch_size=4, num_workers=0, seed=42)
+    device_ctx = DeviceContext.from_config(DeviceConfig(preferred="cpu"))
+
+    base_train, _, _ = create_dataloaders(base_config, training_config, device_ctx)
+    subset_train, _, _ = create_dataloaders(subset_config, training_config, device_ctx)
+
+    base_dt = float(base_train.dataset[0]["dt"])
+    subset_dt = float(subset_train.dataset[0]["dt"])
+    assert base_dt == subset_dt

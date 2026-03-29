@@ -16,6 +16,26 @@ class DeviceConfig:
 
 
 @dataclass(frozen=True)
+class DataSubsetConfig:
+    """Reproducible split-local data subsetting for quick experiments."""
+
+    enabled: bool = False
+    seed: int = 42
+    train_sequence_fraction: float = 1.0
+    val_sequence_fraction: float = 1.0
+    test_sequence_fraction: float = 1.0
+    train_max_sequences: int | None = None
+    val_max_sequences: int | None = None
+    test_max_sequences: int | None = None
+    train_window_fraction: float = 1.0
+    val_window_fraction: float = 1.0
+    test_window_fraction: float = 1.0
+    train_max_windows: int | None = None
+    val_max_windows: int | None = None
+    test_max_windows: int | None = None
+
+
+@dataclass(frozen=True)
 class DataConfig:
     """Dataset and preprocessing settings."""
 
@@ -29,6 +49,7 @@ class DataConfig:
     train_sequences: list[str] = field(default_factory=list)
     val_sequences: list[str] = field(default_factory=list)
     test_sequences: list[str] = field(default_factory=list)
+    subset: DataSubsetConfig = field(default_factory=DataSubsetConfig)
     data_dir: str = "data"
 
 

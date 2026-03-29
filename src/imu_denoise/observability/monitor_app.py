@@ -44,6 +44,8 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
             ("d", "detail", "Detail"),
             ("p", "pause", "Pause"),
             ("r", "resume", "Resume"),
+            ("s", "stop", "Stop"),
+            ("t", "terminate", "Terminate"),
             ("tab", "cycle_sections", "Cycle"),
         ]
 
@@ -81,6 +83,14 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
             controller.resume_loop()
             self.refresh_data()
 
+        def action_stop(self) -> None:
+            controller.request_stop()
+            self.refresh_data()
+
+        def action_terminate(self) -> None:
+            controller.request_terminate()
+            self.refresh_data()
+
         def action_cycle_sections(self) -> None:
             self._focus_index = (self._focus_index + 1) % len(self._focus_order)
             self.query_one(self._focus_order[self._focus_index]).focus()
@@ -105,7 +115,11 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
                     f"Loop: {loop_state['status']}  |  "
                     "Iteration "
                     f"{loop_state['current_iteration']}/{loop_state['max_iterations']}  |  "
-                    f"Best: {best_text}"
+                    f"Best: {best_text}  |  "
+                    "Flags "
+                    f"pause={loop_state.get('pause_requested')} "
+                    f"stop={loop_state.get('stop_requested')} "
+                    f"term={loop_state.get('terminate_requested')}"
                 )
 
             live_widget = self.query_one("#live_run", Static)

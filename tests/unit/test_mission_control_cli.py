@@ -55,3 +55,27 @@ def test_start_mission_control_runs_tmuxinator(monkeypatch: MonkeyPatch) -> None
         "-p",
     ]
     assert Path(seen["env"]["IMU_AUTORESEARCH_ROOT"]).name == "inertial-autoresearch"
+
+
+def test_start_mission_control_uses_euroc_profile(monkeypatch: MonkeyPatch) -> None:
+    """The launcher should switch project files when the EuRoC profile is requested."""
+    seen: dict[str, Any] = {}
+
+    def _run(
+        command: list[str],
+        env: dict[str, str],
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        seen["command"] = command
+        seen["env"] = env
+        seen["check"] = check
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/tmuxinator")
+    monkeypatch.setattr("subprocess.run", _run)
+    monkeypatch.setattr("sys.argv", ["imu-mission-control", "--profile", "euroc"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert seen["command"][-1].endswith(".tmuxinator/mission-control-euroc.yml")

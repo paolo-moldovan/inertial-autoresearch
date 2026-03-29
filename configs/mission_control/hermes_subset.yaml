@@ -1,0 +1,39 @@
+name: mission-control-subset
+
+training:
+  epochs: 8
+  batch_size: 8
+  num_workers: 0
+
+data:
+  dataset: synthetic
+  window_size: 40
+  stride: 20
+  normalize: true
+  augment: false
+  dataset_kwargs:
+    duration_sec: 8.0
+    rate_hz: 50.0
+    num_sequences: 8
+    seed: 42
+  subset:
+    enabled: true
+    seed: 42
+    train_max_sequences: 3
+    val_max_sequences: 1
+    test_max_sequences: 1
+    train_max_windows: 64
+    val_max_windows: 16
+    test_max_windows: 16
+
+autoresearch:
+  max_iterations: 4
+  orchestrator: hermes
+  hermes:
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3.5:latest
+
+observability:
+  db_path: artifacts/observability/mission_control.db
+  blob_dir: artifacts/observability/blobs
+  streamlit_port: 8501

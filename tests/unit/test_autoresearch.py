@@ -9,7 +9,7 @@ from typing import Any
 from _pytest.monkeypatch import MonkeyPatch
 
 from autoresearch_loop.hermes import HermesQueryTrace
-from autoresearch_loop.loop import run_autoresearch
+from autoresearch_loop.loop import build_parser, run_autoresearch
 from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
 from imu_denoise.observability import MissionControlQueries
 
@@ -79,6 +79,7 @@ def test_autoresearch_loop_uses_hermes_proposals_when_enabled(
         "autoresearch.orchestrator=hermes",
         f"observability.db_path={tmp_path / 'observability' / 'mission_control.db'}",
         f"observability.blob_dir={tmp_path / 'observability' / 'blobs'}",
+        "observability.import_hermes_state=false",
         "training.epochs=1",
         "training.batch_size=4",
         "data.dataset_kwargs.duration_sec=2.0",
@@ -133,3 +134,12 @@ def test_autoresearch_loop_uses_hermes_proposals_when_enabled(
         call["session_id"] == "session-1"
         for call in queries.list_recent_llm_calls(limit=10)
     )
+
+
+def test_loop_parser_does_not_inject_quick_config_when_explicit_config_is_passed() -> None:
+    """Explicit loop configs should not be merged with the synthetic quick profile."""
+    parser = build_parser()
+
+    args = parser.parse_args(["--config", "configs/mission_control/hermes_euroc_subset.yaml"])
+
+    assert args.config == ["configs/mission_control/hermes_euroc_subset.yaml"]

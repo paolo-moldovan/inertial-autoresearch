@@ -86,6 +86,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
     from imu_denoise.config.schema import (
         AutoResearchConfig,
         DataConfig,
+        DataSubsetConfig,
         DeviceConfig,
         HermesConfig,
         ModelConfig,
@@ -107,6 +108,12 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
     if cls is AutoResearchConfig:
         nested_type_map: dict[str, type] = {
             "hermes": HermesConfig,
+        }
+        return nested_type_map.get(field_name)
+
+    if cls is DataConfig:
+        nested_type_map = {
+            "subset": DataSubsetConfig,
         }
         return nested_type_map.get(field_name)
 

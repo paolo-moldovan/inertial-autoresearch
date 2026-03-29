@@ -25,6 +25,14 @@ from imu_denoise.utils.logging import setup_logger
 from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
 
+class TrainingInterrupted(RuntimeError):
+    """Raised when an external control-plane signal interrupts training."""
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass(frozen=True)
 class TrainingArtifacts:
     """Paths produced by a training run."""
@@ -231,6 +239,8 @@ class Trainer:
                         )
                         break
 
+                self._check_loop_termination()
+
                 if self.early_stopping.update(val_rmse):
                     self.logger.info("Stopping early after %d epochs without improvement.", epoch)
                     self.observability.append_event(
@@ -326,6 +336,7 @@ class Trainer:
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
             for batch in dataloader:
+                self._check_loop_termination()
                 noisy, clean = self._unpack_batch(batch)
                 noisy = noisy.to(self.device_ctx.device)
                 clean = clean.to(self.device_ctx.device)
@@ -361,6 +372,18 @@ class Trainer:
                 total_batches += 1
 
         return total_loss / max(total_batches, 1)
+
+    def _check_loop_termination(self) -> None:
+        if self.parent_run_id is None or self.observability.store is None:
+            return
+        from imu_denoise.observability.control import LoopController
+
+        controller = LoopController(store=self.observability.store, writer=self.observability)
+        loop_state = controller.get_loop_state(self.parent_run_id)
+        if loop_state is None:
+            return
+        if bool(loop_state.get("terminate_requested")):
+            raise TrainingInterrupted("terminated", "Training terminated by control-plane request.")
 
     def _sampling_rate_hz(self) -> float:
         if self.config.data.dataset == "blackbird":

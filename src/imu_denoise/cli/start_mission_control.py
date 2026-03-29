@@ -8,9 +8,20 @@ import shutil
 import subprocess
 from pathlib import Path
 
+PROFILE_TO_PROJECT = {
+    "smoke": "mission-control.yml",
+    "euroc": "mission-control-euroc.yml",
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start the mission-control tmuxinator session.")
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILE_TO_PROJECT),
+        default="smoke",
+        help="Named Mission Control profile to launch.",
+    )
     parser.add_argument(
         "--project-file",
         type=str,
@@ -31,7 +42,7 @@ def main() -> int:
     project_file = (
         Path(args.project_file)
         if args.project_file
-        else repo_root / ".tmuxinator" / "mission-control.yml"
+        else repo_root / ".tmuxinator" / PROFILE_TO_PROJECT[args.profile]
     )
     if not project_file.exists():
         raise FileNotFoundError(f"tmuxinator project file not found: {project_file}")
@@ -55,4 +66,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

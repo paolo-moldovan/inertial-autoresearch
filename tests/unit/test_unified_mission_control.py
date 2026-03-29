@@ -258,3 +258,102 @@ def test_batch_pause_queue_and_resume_prioritize_human_queue(
     assert "queue_enqueued" in event_types
     assert "queue_claimed" in event_types
     assert "queue_applied" in event_types
+
+
+def test_stop_request_stops_a_paused_loop(tmp_path: Path) -> None:
+    """A stop request should end the paused loop cleanly without resuming more iterations."""
+    base_overrides = _small_runtime_overrides(tmp_path) + [
+        f"autoresearch.results_file={tmp_path / 'artifacts' / 'autoresearch' / 'results.tsv'}",
+        "autoresearch.orchestrator=none",
+        "autoresearch.max_iterations=2",
+    ]
+    holder: dict[str, Any] = {}
+
+    def _target() -> None:
+        holder["results"] = run_autoresearch(
+            config_paths=["configs/training/quick.yaml"],
+            base_overrides=base_overrides,
+            max_iterations=2,
+            batch_size=1,
+            pause_enabled=True,
+        )
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+
+    queries = MissionControlQueries(
+        db_path=tmp_path / "artifacts" / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "artifacts" / "observability" / "blobs",
+    )
+    paused_state: dict[str, Any] | None = None
+    for _ in range(200):
+        paused_state = queries.get_active_loop_state()
+        if paused_state is not None and paused_state["status"] == "paused":
+            break
+        time.sleep(0.1)
+
+    assert paused_state is not None
+    config = resolve_config(["configs/training/quick.yaml"], base_overrides)
+    writer = ObservabilityWriter.from_experiment_config(config)
+    controller = LoopController.from_experiment_config(config, writer=writer)
+    stopped = controller.request_stop(loop_run_id=str(paused_state["loop_run_id"]))
+    assert stopped is not None
+    assert stopped["stop_requested"] is True
+
+    thread.join(timeout=30.0)
+    assert not thread.is_alive()
+
+    final_status = queries.get_loop_status()
+    assert final_status is not None
+    assert final_status["status"] == "stopped"
+
+
+def test_terminate_request_interrupts_active_training_run(tmp_path: Path) -> None:
+    """A terminate request should interrupt the current child run and mark the loop terminated."""
+    base_overrides = _small_runtime_overrides(tmp_path) + [
+        f"autoresearch.results_file={tmp_path / 'artifacts' / 'autoresearch' / 'results.tsv'}",
+        "autoresearch.orchestrator=none",
+        "autoresearch.max_iterations=0",
+        "training.epochs=20",
+        "training.batch_size=1",
+        "data.dataset_kwargs.duration_sec=12.0",
+        "data.dataset_kwargs.rate_hz=50.0",
+        "data.dataset_kwargs.num_sequences=5",
+    ]
+    holder: dict[str, Any] = {}
+
+    def _target() -> None:
+        holder["results"] = run_autoresearch(
+            config_paths=["configs/training/quick.yaml"],
+            base_overrides=base_overrides,
+            max_iterations=0,
+        )
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+
+    queries = MissionControlQueries(
+        db_path=tmp_path / "artifacts" / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "artifacts" / "observability" / "blobs",
+    )
+    active_state: dict[str, Any] | None = None
+    for _ in range(200):
+        active_state = queries.get_active_loop_state()
+        if active_state is not None and active_state.get("active_child_run_id"):
+            break
+        time.sleep(0.1)
+
+    assert active_state is not None
+    config = resolve_config(["configs/training/quick.yaml"], base_overrides)
+    writer = ObservabilityWriter.from_experiment_config(config)
+    controller = LoopController.from_experiment_config(config, writer=writer)
+    terminated = controller.request_terminate(loop_run_id=str(active_state["loop_run_id"]))
+    assert terminated is not None
+    assert terminated["terminate_requested"] is True
+
+    thread.join(timeout=30.0)
+    assert not thread.is_alive()
+
+    final_status = queries.get_loop_status()
+    assert final_status is not None
+    assert final_status["status"] == "terminated"

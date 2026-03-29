@@ -12,6 +12,10 @@ from imu_denoise.observability.writer import ObservabilityWriter
 
 LOOP_PAUSED = "loop_paused"
 LOOP_RESUMED = "loop_resumed"
+LOOP_STOP_REQUESTED = "loop_stop_requested"
+LOOP_TERMINATE_REQUESTED = "loop_terminate_requested"
+LOOP_STOPPED = "loop_stopped"
+LOOP_TERMINATED = "loop_terminated"
 QUEUE_CLAIMED = "queue_claimed"
 QUEUE_APPLIED = "queue_applied"
 QUEUE_ENQUEUED = "queue_enqueued"
@@ -77,6 +81,8 @@ class LoopController:
             batch_size=batch_size,
             pause_after_iteration=pause_after_iteration,
             pause_requested=False,
+            stop_requested=False,
+            terminate_requested=False,
             best_metric=best_metric,
             best_run_id=best_run_id,
             active_child_run_id=None,
@@ -93,12 +99,15 @@ class LoopController:
         batch_size: int | None,
         pause_after_iteration: int | None,
         pause_requested: bool,
+        stop_requested: bool | None = None,
+        terminate_requested: bool | None = None,
         best_metric: float | None,
         best_run_id: str | None,
         active_child_run_id: str | None,
         status: str,
     ) -> None:
         now = _now_ts()
+        existing = self.get_loop_state(loop_run_id)
         self.store.upsert_loop_state(
             loop_run_id=loop_run_id,
             status=status,
@@ -107,6 +116,16 @@ class LoopController:
             batch_size=batch_size,
             pause_after_iteration=pause_after_iteration,
             pause_requested=pause_requested,
+            stop_requested=(
+                stop_requested
+                if stop_requested is not None
+                else bool(existing.get("stop_requested")) if existing else False
+            ),
+            terminate_requested=(
+                terminate_requested
+                if terminate_requested is not None
+                else bool(existing.get("terminate_requested")) if existing else False
+            ),
             best_metric=best_metric,
             best_run_id=best_run_id,
             active_child_run_id=active_child_run_id,
@@ -132,6 +151,8 @@ class LoopController:
             batch_size=batch_size,
             pause_after_iteration=None,
             pause_requested=False,
+            stop_requested=False,
+            terminate_requested=False,
             best_metric=best_metric,
             best_run_id=best_run_id,
             active_child_run_id=None,
@@ -178,6 +199,7 @@ class LoopController:
             values={
                 "status": "running",
                 "pause_requested": 0,
+                "stop_requested": 0,
                 "pause_after_iteration": pause_after_iteration,
                 "heartbeat_at": _now_ts(),
             },
@@ -188,6 +210,50 @@ class LoopController:
                 event_type=LOOP_RESUMED,
                 level="INFO",
                 title="loop resumed",
+                payload={"source": "control"},
+                source="runtime",
+            )
+        return self.get_loop_state(str(state["loop_run_id"]))
+
+    def request_stop(self, *, loop_run_id: str | None = None) -> dict[str, Any] | None:
+        state = self._resolve_target_loop(loop_run_id)
+        if state is None:
+            return None
+        self.store.update_loop_state(
+            loop_run_id=str(state["loop_run_id"]),
+            values={"stop_requested": 1},
+        )
+        if self.writer is not None:
+            self.writer.append_event(
+                run_id=str(state["loop_run_id"]),
+                event_type=LOOP_STOP_REQUESTED,
+                level="WARNING",
+                title="stop requested",
+                payload={"source": "control"},
+                source="runtime",
+            )
+        return self.get_loop_state(str(state["loop_run_id"]))
+
+    def request_terminate(self, *, loop_run_id: str | None = None) -> dict[str, Any] | None:
+        state = self._resolve_target_loop(loop_run_id)
+        if state is None:
+            return None
+        self.store.update_loop_state(
+            loop_run_id=str(state["loop_run_id"]),
+            values={
+                "stop_requested": 1,
+                "terminate_requested": 1,
+                "pause_requested": 0,
+                "status": "terminating",
+                "heartbeat_at": _now_ts(),
+            },
+        )
+        if self.writer is not None:
+            self.writer.append_event(
+                run_id=str(state["loop_run_id"]),
+                event_type=LOOP_TERMINATE_REQUESTED,
+                level="ERROR",
+                title="terminate requested",
                 payload={"source": "control"},
                 source="runtime",
             )
@@ -307,6 +373,8 @@ class LoopController:
             return None
         normalized = dict(row)
         normalized["pause_requested"] = bool(normalized.get("pause_requested"))
+        normalized["stop_requested"] = bool(normalized.get("stop_requested"))
+        normalized["terminate_requested"] = bool(normalized.get("terminate_requested"))
         return normalized
 
     def _normalize_queue_row(self, row: dict[str, Any]) -> dict[str, Any]:

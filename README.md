@@ -93,6 +93,19 @@ uv run imu loop --resume
 uv run imu status
 ```
 
+Request a graceful stop after the current iteration, or force-terminate the active run:
+
+```bash
+uv run imu stop
+uv run imu stop --terminate
+```
+
+Queue a rerun of a previous run for the active loop:
+
+```bash
+uv run imu rerun --run-id <run-id-or-prefix>
+```
+
 The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is [autoresearch_loop/loop.py](/Users/paolo/development/inertial-autoresearch/autoresearch_loop/loop.py).
 
 ## Mission Control
@@ -103,7 +116,8 @@ One command to run the dashboard:
 uv run --extra monitor imu dashboard
 ```
 
-That starts the Streamlit dashboard on `http://localhost:8501` by default.
+That starts the local Mission Control web dashboard on `http://127.0.0.1:8501` by default.
+It is no longer Streamlit-backed, so the page updates in place from JSON polling instead of rerunning and losing UI state.
 
 One command to run the live Textual monitor:
 
@@ -130,6 +144,14 @@ That opens one tmux window in a tiled grid with panes for:
 - autoresearch
 
 So you can watch everything at once instead of switching between tmux windows. If one command exits, that pane drops you into a shell instead of disappearing.
+
+Start the EuRoC Mission Control profile:
+
+```bash
+uv run scripts/start_mission_control.py --profile euroc
+```
+
+That uses [configs/mission_control/hermes_euroc_subset.yaml](/Users/paolo/development/inertial-autoresearch/configs/mission_control/hermes_euroc_subset.yaml) and is intended for a real-data subset run on the currently processed EuRoC Machine Hall sequences.
 
 ## Mission Control Phase 2
 
