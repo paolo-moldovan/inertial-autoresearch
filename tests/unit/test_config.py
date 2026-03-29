@@ -25,6 +25,8 @@ def test_load_config_merges_project_defaults() -> None:
     assert config.autoresearch.hermes.model == "qwen3.5:latest"
     assert config.observability.enabled is True
     assert config.observability.db_path == "artifacts/observability/mission_control.db"
+    assert config.observability.mlflow_enabled is False
+    assert config.observability.phoenix_enabled is False
 
 
 def test_load_config_applies_cli_overrides() -> None:

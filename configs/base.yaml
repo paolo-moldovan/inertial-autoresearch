@@ -26,6 +26,15 @@ observability:
   redact_secrets: true
   tui_refresh_hz: 2
   streamlit_port: 8501
+  mlflow_enabled: false
+  mlflow_tracking_uri: file:./artifacts/mlruns
+  mlflow_experiment_name: imu-mission-control
+  mlflow_log_artifacts: true
+  phoenix_enabled: false
+  phoenix_project_name: imu-mission-control
+  phoenix_endpoint: http://localhost:6006/v1/traces
+  phoenix_protocol: http/protobuf
+  phoenix_batch: false
 
 output_dir: artifacts
 log_dir: artifacts/logs

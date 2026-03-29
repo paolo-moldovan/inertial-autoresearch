@@ -111,6 +111,15 @@ class ObservabilityConfig:
     redact_secrets: bool = True
     tui_refresh_hz: int = 2
     streamlit_port: int = 8501
+    mlflow_enabled: bool = False
+    mlflow_tracking_uri: str = "file:./artifacts/mlruns"
+    mlflow_experiment_name: str = "imu-mission-control"
+    mlflow_log_artifacts: bool = True
+    phoenix_enabled: bool = False
+    phoenix_project_name: str = "imu-mission-control"
+    phoenix_endpoint: str = "http://localhost:6006/v1/traces"
+    phoenix_protocol: str = "http/protobuf"
+    phoenix_batch: bool = False
 
 
 @dataclass(frozen=True)

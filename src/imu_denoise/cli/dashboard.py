@@ -39,7 +39,7 @@ def main() -> int:
     os.environ["IMU_DASHBOARD_BLOB_DIR"] = str(blob_dir)
 
     try:
-        from streamlit.web import cli as stcli  # type: ignore[import-not-found]
+        from streamlit.web import cli as stcli
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "Streamlit is not installed. Install `imu-denoise[monitor]` to use imu-dashboard."

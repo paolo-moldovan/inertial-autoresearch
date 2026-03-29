@@ -31,7 +31,12 @@ monitor = [
     "textual>=0.72",
     "streamlit>=1.35",
 ]
-all = ["imu-denoise[euroc,dev,notebooks,monitor]"]
+monitor-adapters = [
+    "mlflow>=2.14",
+    "opentelemetry-sdk>=1.31",
+    "opentelemetry-exporter-otlp-proto-http>=1.31",
+]
+all = ["imu-denoise[euroc,dev,notebooks,monitor,monitor-adapters]"]
 
 [project.scripts]
 imu-train = "imu_denoise.cli.train:main"
@@ -42,6 +47,7 @@ imu-baseline = "imu_denoise.cli.run_baseline:main"
 imu-monitor = "imu_denoise.cli.monitor:main"
 imu-dashboard = "imu_denoise.cli.dashboard:main"
 imu-observability-backfill = "imu_denoise.cli.observability_backfill:main"
+imu-observability-sync = "imu_denoise.cli.observability_sync:main"
 imu-mission-control = "imu_denoise.cli.start_mission_control:main"
 
 [build-system]
