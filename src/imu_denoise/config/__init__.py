@@ -3,6 +3,7 @@
 from imu_denoise.config.loader import load_config, load_config_from_dict
 from imu_denoise.config.schema import (
     AutoResearchConfig,
+    AutoResearchSearchSpaceConfig,
     DataConfig,
     DataSubsetConfig,
     DeviceConfig,
@@ -15,6 +16,7 @@ from imu_denoise.config.schema import (
 
 __all__ = [
     "AutoResearchConfig",
+    "AutoResearchSearchSpaceConfig",
     "DataConfig",
     "DataSubsetConfig",
     "DeviceConfig",

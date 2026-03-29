@@ -20,6 +20,14 @@ autoresearch:
     confidence_weight: 0.15
     discard_penalty: 0.08
     crash_penalty: 0.20
+  search_space:
+    freeze: []
+    allow: []
+    deny: []
+    allow_groups: []
+    deny_groups: []
+    architecture_mode: branch
+    baseline_mode: exploit
   hermes:
     python_bin: vendor/hermes-agent/.venv/bin/python
     cli_path: vendor/hermes-agent/cli.py

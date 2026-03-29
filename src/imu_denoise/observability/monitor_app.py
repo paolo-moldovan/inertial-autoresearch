@@ -176,14 +176,27 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
                 detail_widget.update("DETAIL\nBest run detail not found.")
                 return
             identity = detail["identity"] or {}
+            lineage = detail.get("lineage") or {}
+            policy_context = detail.get("policy_context") or {}
+            parent = lineage.get("parent") or {}
+            incumbent = lineage.get("incumbent") or {}
+            related_lessons = detail.get("related_lessons") or []
+            change_diff = detail.get("change_diff") or []
             detail_widget.update(
                 "DETAIL\n"
                 f"Run: {identity.get('run_name')}\n"
                 f"Run ID: {identity.get('run_id_short')}\n"
                 f"Experiment ID: {identity.get('experiment_id_short') or 'n/a'}\n"
-                f"Curves: {len(detail['curves'])} points\n"
-                f"Artifacts: {len(detail['artifacts'])}\n"
-                f"LLM Calls: {len(detail['llm_calls'])}"
+                f"Regime: {identity.get('regime_fingerprint_short') or 'n/a'}\n"
+                "Parent: "
+                f"{parent.get('run_name') or 'n/a'} "
+                f"({parent.get('run_id_short') or 'n/a'})\n"
+                "Incumbent: "
+                f"{incumbent.get('run_name') or 'n/a'} ({incumbent.get('run_id_short') or 'n/a'})\n"
+                f"Policy: {policy_context.get('policy_mode') or 'n/a'}\n"
+                f"Why: {policy_context.get('rationale') or 'n/a'}\n"
+                f"Diffs: {len(change_diff)}  |  Curves: {len(detail['curves'])}\n"
+                f"Lessons: {len(related_lessons)}  |  LLM Calls: {len(detail['llm_calls'])}"
             )
 
     MissionControlApp().run()

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from random import Random
 from typing import Any
 
-from imu_denoise.config.schema import AutoResearchStrategyConfig
+from imu_denoise.config.schema import AutoResearchSearchSpaceConfig, AutoResearchStrategyConfig
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,8 @@ class MutationProposal:
 
     description: str
     overrides: list[str]
+    groups: tuple[str, ...] = ()
+    architecture_change: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,22 +109,27 @@ def default_mutation_pool() -> list[MutationProposal]:
         MutationProposal(
             description="lower learning rate",
             overrides=["training.lr=0.0003"],
+            groups=("training_core", "optimizer"),
         ),
         MutationProposal(
             description="higher learning rate",
             overrides=["training.lr=0.003"],
+            groups=("training_core", "optimizer"),
         ),
         MutationProposal(
             description="switch to huber loss",
             overrides=["training.loss=huber"],
+            groups=("loss",),
         ),
         MutationProposal(
             description="larger batch size",
             overrides=["training.batch_size=32"],
+            groups=("training_core",),
         ),
         MutationProposal(
             description="smaller batch size",
             overrides=["training.batch_size=8"],
+            groups=("training_core",),
         ),
         MutationProposal(
             description="conv1d baseline",
@@ -131,6 +138,8 @@ def default_mutation_pool() -> list[MutationProposal]:
                 "model.hidden_dim=64",
                 "model.num_layers=4",
             ],
+            groups=("architecture",),
+            architecture_change=True,
         ),
         MutationProposal(
             description="small transformer",
@@ -140,6 +149,8 @@ def default_mutation_pool() -> list[MutationProposal]:
                 "model.num_layers=2",
                 "model.num_heads=4",
             ],
+            groups=("architecture",),
+            architecture_change=True,
         ),
         MutationProposal(
             description="deeper lstm",
@@ -148,10 +159,13 @@ def default_mutation_pool() -> list[MutationProposal]:
                 "model.hidden_dim=128",
                 "model.num_layers=3",
             ],
+            groups=("architecture",),
+            architecture_change=True,
         ),
         MutationProposal(
             description="enable augmentation",
             overrides=["data.augment=true"],
+            groups=("augmentation", "data"),
         ),
     ]
 
@@ -173,6 +187,76 @@ def build_mutation_schedule(
     while len(selected) < target_length:
         selected.extend(candidates)
     return selected[:target_length]
+
+
+def proposal_paths(proposal: MutationProposal) -> list[str]:
+    """Return the dotted config paths touched by a proposal."""
+    paths: list[str] = []
+    for override in proposal.overrides:
+        if "=" not in override:
+            continue
+        path, _value = override.split("=", 1)
+        paths.append(path.strip())
+    return paths
+
+
+def filter_mutation_proposals(
+    proposals: list[MutationProposal],
+    search_space: AutoResearchSearchSpaceConfig,
+) -> tuple[list[MutationProposal], dict[str, list[str]]]:
+    """Filter proposals against the configured search-space constraints."""
+    allowed: list[MutationProposal] = []
+    blocked: dict[str, list[str]] = {}
+    for proposal in proposals:
+        is_allowed, reasons = _proposal_allowed(proposal, search_space)
+        if is_allowed:
+            allowed.append(proposal)
+        else:
+            blocked[proposal.description] = reasons
+    return allowed, blocked
+
+
+def _proposal_allowed(
+    proposal: MutationProposal,
+    search_space: AutoResearchSearchSpaceConfig,
+) -> tuple[bool, list[str]]:
+    groups = set(proposal.groups)
+    paths = proposal_paths(proposal)
+    reasons: list[str] = []
+
+    if search_space.architecture_mode == "fixed" and proposal.architecture_change:
+        reasons.append("architecture_fixed")
+    if search_space.architecture_mode == "tune" and proposal.architecture_change:
+        reasons.append("architecture_tune_only")
+
+    deny_groups = {item for item in search_space.deny_groups if item}
+    blocked_groups = sorted(groups & deny_groups)
+    if blocked_groups:
+        reasons.append(f"deny_groups={','.join(blocked_groups)}")
+
+    for path in paths:
+        if any(_path_matches_prefix(path, prefix) for prefix in search_space.freeze):
+            reasons.append(f"frozen:{path}")
+        if any(_path_matches_prefix(path, prefix) for prefix in search_space.deny):
+            reasons.append(f"deny:{path}")
+
+    allow_paths = [item for item in search_space.allow if item]
+    allow_groups = {item for item in search_space.allow_groups if item}
+    if allow_paths or allow_groups:
+        allowed_by_group = bool(groups & allow_groups)
+        allowed_by_path = all(
+            any(_path_matches_prefix(path, prefix) for prefix in allow_paths)
+            for path in paths
+        ) if paths else False
+        if not allowed_by_group and not allowed_by_path:
+            reasons.append("outside_allowed_search_space")
+
+    return not reasons, reasons
+
+
+def _path_matches_prefix(path: str, prefix: str) -> bool:
+    normalized_prefix = prefix.strip()
+    return path == normalized_prefix or path.startswith(normalized_prefix + ".")
 
 
 def _score_candidate(

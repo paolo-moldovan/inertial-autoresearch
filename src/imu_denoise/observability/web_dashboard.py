@@ -96,6 +96,7 @@ HTML = """<!doctype html>
     .status-line { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     .detail-grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 16px; align-items: start; }
     .stack { display: grid; gap: 16px; }
+    .mini-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
     .figure-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
     .figure-card {
       background: #0b1220;
@@ -128,6 +129,24 @@ HTML = """<!doctype html>
       text-decoration: none;
     }
     .artifact-link:hover { border-color: var(--accent); }
+    .panel {
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .panel h3, .panel h4 { margin-top: 0; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; font-size: 14px; }
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      font-size: 12px;
+      color: var(--fg);
+    }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   </style>
 </head>
 <body>
@@ -229,6 +248,15 @@ HTML = """<!doctype html>
 
     function metric(value) {
       return (typeof value === "number" && Number.isFinite(value)) ? value.toFixed(6) : "";
+    }
+
+    function valueText(value) {
+      if (value === null || value === undefined) return "n/a";
+      if (typeof value === "boolean") return value ? "true" : "false";
+      if (typeof value === "number") return Number.isFinite(value) ? String(value) : "n/a";
+      if (typeof value === "string") return value;
+      const text = JSON.stringify(value);
+      return text.length <= 80 ? text : `${text.slice(0, 77)}...`;
     }
 
     function rowHtml(cells) {
@@ -374,6 +402,12 @@ HTML = """<!doctype html>
       const curves = detail.curves || [];
       const llmCalls = detail.llm_calls || [];
       const mutationAttempts = detail.mutation_attempts || [];
+      const lineage = detail.lineage || {};
+      const parentRun = lineage.parent;
+      const incumbentRun = lineage.incumbent;
+      const policyContext = detail.policy_context || {};
+      const relatedLessons = detail.related_lessons || [];
+      const changeDiff = detail.change_diff || [];
       const latestDecision = decisions[0];
       const figureArtifacts = artifacts.filter((item) => item.artifact_type === "figure");
       const otherArtifacts = artifacts.filter((item) => item.artifact_type !== "figure");
@@ -383,12 +417,74 @@ HTML = """<!doctype html>
           <div class="metric"><div class="label">Run</div><div class="value">${detail.run.name}</div><div class="tag">${shortId(detail.run.id)}</div></div>
           <div class="metric"><div class="label">Phase</div><div class="value">${detail.run.phase}</div></div>
           <div class="metric"><div class="label">Status</div><div class="value">${detail.run.status}</div></div>
-          <div class="metric"><div class="label">Experiment</div><div class="value">${detail.identity?.experiment_id_short || "n/a"}</div></div>
+          <div class="metric"><div class="label">Experiment</div><div class="value">${detail.identity?.experiment_id_short || "n/a"}</div><div class="tag">regime ${detail.identity?.regime_fingerprint_short || "n/a"}</div></div>
         </div>
         <div class="controls">
           <button id="rerun-btn">Queue Rerun</button>
         </div>
         <div class="stack">
+          <div class="mini-grid">
+            <div class="panel">
+              <h3>Lineage</h3>
+              <div class="kv">
+                <div class="muted">Parent</div>
+                <div>${parentRun ? `${parentRun.run_name} <span class="tag">${shortId(parentRun.run_id)}</span>` : "n/a"}</div>
+                <div class="muted">Incumbent</div>
+                <div>${incumbentRun ? `${incumbentRun.run_name} <span class="tag">${shortId(incumbentRun.run_id)}</span>` : "n/a"}</div>
+                <div class="muted">Reference</div>
+                <div>${detail.change_set?.reference_kind || "n/a"}</div>
+                <div class="muted">Compared metric</div>
+                <div>${incumbentRun ? `${incumbentRun.metric_key || "metric"} ${metric(incumbentRun.metric_value)}` : "n/a"}</div>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Why Selected</h3>
+              <div class="kv">
+                <div class="muted">Source</div>
+                <div>${policyContext.proposal_source || detail.selection_event?.proposal_source || "n/a"}</div>
+                <div class="muted">Rationale</div>
+                <div>${policyContext.rationale || detail.selection_event?.rationale || "n/a"}</div>
+                <div class="muted">Policy mode</div>
+                <div>${policyContext.policy_mode || "n/a"}</div>
+                <div class="muted">Stagnating</div>
+                <div>${valueText(policyContext.stagnating)}</div>
+                <div class="muted">Explore p</div>
+                <div>${valueText(policyContext.explore_probability)}</div>
+                <div class="muted">Preferred</div>
+                <div>${policyContext.preferred_candidate_description || "n/a"}</div>
+              </div>
+            </div>
+          </div>
+          <div class="mini-grid">
+            <div class="panel">
+              <h3>Change Diff</h3>
+              ${
+                changeDiff.length
+                  ? `<table><thead><tr><th>Path</th><th>Before</th><th>After</th></tr></thead><tbody>${changeDiff.map((item) => `
+                      <tr>
+                        <td><span class="mono">${item.path || ""}</span><div class="tag">${item.category || ""}</div></td>
+                        <td>${item.before_text}</td>
+                        <td>${item.after_text}</td>
+                      </tr>
+                    `).join("")}</tbody></table>`
+                  : "<div class='muted'>No structured config diff.</div>"
+              }
+            </div>
+            <div class="panel">
+              <h3>Policy Candidates</h3>
+              ${
+                (policyContext.policy_candidates || []).length
+                  ? `<table><thead><tr><th>Candidate</th><th>Score</th><th>Notes</th></tr></thead><tbody>${policyContext.policy_candidates.map((item) => `
+                      <tr>
+                        <td>${item.description || ""}<div class="tag">${item.hermes_preferred ? "Hermes preferred" : "local"}</div></td>
+                        <td>${typeof item.total_score === "number" ? item.total_score.toFixed(3) : ""}</td>
+                        <td>${(item.reasons || []).slice(0, 3).join(", ")}</td>
+                      </tr>
+                    `).join("")}</tbody></table>`
+                  : "<div class='muted'>No policy candidate breakdown for this run.</div>"
+              }
+            </div>
+          </div>
           <div>
             <h3>Figures</h3>
             ${
@@ -409,21 +505,52 @@ HTML = """<!doctype html>
           </div>
           <div class="detail-grid">
             <div class="stack">
-              <div>
+              <div class="panel">
                 <h3>Training Curves</h3>
                 <pre>${curvePreview.length ? JSON.stringify(curvePreview, null, 2) : "No curves."}</pre>
               </div>
-              <div>
-                <h3>Decision</h3>
-                <pre>${latestDecision ? JSON.stringify(latestDecision, null, 2) : "No decision record."}</pre>
+              <div class="panel">
+                <h3>Decision Snapshot</h3>
+                <div class="kv">
+                  <div class="muted">Status</div>
+                  <div>${latestDecision?.status || "n/a"}</div>
+                  <div class="muted">Metric</div>
+                  <div>${latestDecision ? `${latestDecision.metric_key} ${metric(latestDecision.metric_value)}` : "n/a"}</div>
+                  <div class="muted">Description</div>
+                  <div>${latestDecision?.description || "n/a"}</div>
+                </div>
               </div>
-              <div>
+              <div class="panel">
                 <h3>Mutation Memory</h3>
-                <pre>${mutationAttempts.length ? JSON.stringify(mutationAttempts.slice(0, 5), null, 2) : "No mutation attempts recorded."}</pre>
+                ${
+                  mutationAttempts.length
+                    ? `<table><thead><tr><th>Signature</th><th>Delta</th><th>Status</th></tr></thead><tbody>${mutationAttempts.slice(0, 6).map((item) => `
+                        <tr>
+                          <td>${item.display_name || item.signature}</td>
+                          <td>${typeof item.metric_delta === "number" ? item.metric_delta.toFixed(4) : ""}</td>
+                          <td>${item.status}</td>
+                        </tr>
+                      `).join("")}</tbody></table>`
+                    : "<div class='muted'>No mutation attempts recorded.</div>"
+                }
+              </div>
+              <div class="panel">
+                <h3>Related Lessons</h3>
+                ${
+                  relatedLessons.length
+                    ? `<table><thead><tr><th>Severity</th><th>Mutation</th><th>Lesson</th></tr></thead><tbody>${relatedLessons.map((item) => `
+                        <tr>
+                          <td>${item.severity}</td>
+                          <td>${item.display_name}</td>
+                          <td>${item.summary}</td>
+                        </tr>
+                      `).join("")}</tbody></table>`
+                    : "<div class='muted'>No related mutation lessons yet.</div>"
+                }
               </div>
             </div>
             <div class="stack">
-              <div>
+              <div class="panel">
                 <h3>Artifacts</h3>
                 ${
                   otherArtifacts.length
@@ -436,7 +563,7 @@ HTML = """<!doctype html>
                     : "<div class='muted'>No non-figure artifacts.</div>"
                 }
               </div>
-              <div>
+              <div class="panel">
                 <h3>LLM Calls</h3>
                 <pre>${llmCalls.length ? JSON.stringify(llmCalls.slice(0, 3), null, 2) : "No LLM calls."}</pre>
               </div>

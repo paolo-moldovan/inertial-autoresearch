@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -204,13 +204,24 @@ def _select_mutation_proposal(
     results: list[LoopResult],
     fallback_proposal: MutationProposal,
     hermes_used_descriptions: set[str],
+    incumbent_summary: dict[str, object] | None,
+    mutation_lessons: list[dict[str, object]] | None,
 ) -> tuple[list[MutationProposal], int | None, str, HermesQueryTrace | None]:
-    from autoresearch_loop.mutations import default_mutation_pool
+    from autoresearch_loop.mutations import default_mutation_pool, filter_mutation_proposals
 
     if iteration == 0:
         return [fallback_proposal], 0, "static", None
 
     candidate_pool = default_mutation_pool()[1:]
+    candidate_pool, blocked_candidates = filter_mutation_proposals(
+        candidate_pool,
+        base_config.autoresearch.search_space,
+    )
+    if not candidate_pool:
+        raise RuntimeError(
+            "No mutation candidates remain after applying the autoresearch search-space "
+            f"constraints. Blocked candidates: {blocked_candidates}"
+        )
     available_candidates = [
         proposal
         for proposal in candidate_pool
@@ -251,6 +262,12 @@ def _select_mutation_proposal(
             metric_direction=base_config.autoresearch.metric_direction,
             history=[_result_snapshot(result) for result in results],
             candidates=available_candidates,
+            incumbent=incumbent_summary,
+            search_space={
+                **asdict(base_config.autoresearch.search_space),
+                "blocked_candidates": blocked_candidates,
+            },
+            mutation_lessons=mutation_lessons,
             root=ROOT,
         )
     except HermesProposalError as exc:
@@ -274,7 +291,7 @@ def _select_mutation_proposal(
 
 def _run_single_experiment(
     *,
-    base_config: ExperimentConfig,
+    config: ExperimentConfig,
     overrides: list[str],
     metric_key: str,
     parent_run_id: str | None = None,
@@ -282,7 +299,6 @@ def _run_single_experiment(
     run_id: str | None = None,
 ) -> tuple[Any, Any, str]:
     from imu_denoise.cli.common import build_model
-    from imu_denoise.config import load_config_from_dict
     from imu_denoise.data.datamodule import create_dataloaders
     from imu_denoise.device import DeviceContext
     from imu_denoise.observability import ObservabilityWriter
@@ -294,7 +310,6 @@ def _run_single_experiment(
         seed_everything,
     )
 
-    config = load_config_from_dict(asdict(base_config), overrides=overrides)
     observability = ObservabilityWriter.from_experiment_config(config)
     run_id = observability.start_run(
         name=config.name,
@@ -345,6 +360,34 @@ def _run_single_experiment(
             source="runtime",
         )
         raise
+
+
+def _resolve_reference_config_payload(
+    *,
+    base_config: ExperimentConfig,
+    incumbent_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if incumbent_config is not None:
+        return cast(dict[str, Any], json.loads(json.dumps(incumbent_config)))
+    return asdict(base_config)
+
+
+def _resolve_iteration_config(
+    *,
+    base_config: ExperimentConfig,
+    base_overrides: list[str],
+    proposal_overrides: list[str],
+    incumbent_config: dict[str, Any] | None = None,
+    extra_overrides: list[str] | None = None,
+) -> ExperimentConfig:
+    from imu_denoise.config import load_config_from_dict
+
+    reference_payload = _resolve_reference_config_payload(
+        base_config=base_config,
+        incumbent_config=incumbent_config,
+    )
+    overrides = [*base_overrides, *proposal_overrides, *(extra_overrides or [])]
+    return load_config_from_dict(reference_payload, overrides=overrides)
 
 
 def _best_metric_from_results(results: list[LoopResult], direction: str) -> float | None:
@@ -526,7 +569,6 @@ def run_autoresearch(
         choose_policy_candidate,
     )
     from imu_denoise.cli.common import resolve_config
-    from imu_denoise.config import load_config_from_dict
     from imu_denoise.observability import (
         LoopAlreadyRunningError,
         LoopController,
@@ -737,6 +779,21 @@ def run_autoresearch(
             hermes_trace = None
             preferred_candidate_index = None
         else:
+            incumbent_summary: dict[str, object] | None = None
+            if best_run_id is not None:
+                incumbent_reference = queries.get_run_reference(best_run_id)
+                if incumbent_reference is not None:
+                    incumbent_summary = {
+                        "run_id": str(incumbent_reference["run_id"]),
+                        "run_name": str(incumbent_reference["run_name"]),
+                        "model": str(incumbent_reference["model"]),
+                        "phase": str(incumbent_reference["phase"]),
+                        "metric_value": best_metric,
+                    }
+            mutation_lessons = queries.list_recent_mutation_lessons(
+                limit=6,
+                regime_fingerprint=data_regime_fingerprint(base_config),
+            )
             (
                 candidate_pool,
                 preferred_candidate_index,
@@ -749,6 +806,8 @@ def run_autoresearch(
                 results=results,
                 fallback_proposal=fallback_proposal,
                 hermes_used_descriptions=hermes_used_descriptions,
+                incumbent_summary=incumbent_summary,
+                mutation_lessons=mutation_lessons,
             )
             incumbent_config_for_policy = (
                 queries.get_run_config_payload(best_run_id) if best_run_id is not None else None
@@ -757,9 +816,11 @@ def run_autoresearch(
             policy_candidate_payloads = []
             current_regime_fingerprint = data_regime_fingerprint(base_config)
             for candidate_index, candidate in enumerate(candidate_pool):
-                candidate_config = load_config_from_dict(
-                    asdict(base_config),
-                    overrides=list(candidate.overrides),
+                candidate_config = _resolve_iteration_config(
+                    base_config=base_config,
+                    base_overrides=base_overrides,
+                    proposal_overrides=list(candidate.overrides),
+                    incumbent_config=incumbent_config_for_policy,
                 )
                 candidate_change_items = build_change_items(
                     current_config=candidate_config,
@@ -871,13 +932,26 @@ def run_autoresearch(
             source="runtime",
         )
         experiment_run_id = f"training-{iteration:03d}-{uuid4().hex}"
-        resolved_config = load_config_from_dict(asdict(base_config), overrides=run_overrides)
         selected_incumbent_run_id = best_run_id
         selected_incumbent_metric = best_metric
         incumbent_config = (
             queries.get_run_config_payload(selected_incumbent_run_id)
             if selected_incumbent_run_id is not None
             else None
+        )
+        resolved_config = _resolve_iteration_config(
+            base_config=base_config,
+            base_overrides=base_overrides,
+            proposal_overrides=list(proposal.overrides),
+            incumbent_config=incumbent_config,
+            extra_overrides=[
+                f"name=autoresearch_{iteration:03d}",
+                *(
+                    [f"training.time_budget_sec={base_config.autoresearch.time_budget_sec}"]
+                    if base_config.autoresearch.time_budget_sec > 0
+                    else []
+                ),
+            ],
         )
         reference_kind = "incumbent" if incumbent_config is not None else "base"
         selection_rationale = (
@@ -1015,7 +1089,7 @@ def run_autoresearch(
 
         try:
             config, summary, experiment_run_id = _run_single_experiment(
-                base_config=base_config,
+                config=resolved_config,
                 overrides=run_overrides,
                 metric_key=base_config.autoresearch.metric_key,
                 parent_run_id=loop_run_id,

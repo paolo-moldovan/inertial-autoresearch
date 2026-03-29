@@ -133,6 +133,19 @@ class AutoResearchStrategyConfig:
 
 
 @dataclass(frozen=True)
+class AutoResearchSearchSpaceConfig:
+    """Constraints that shape which experiment mutations Hermes may propose."""
+
+    freeze: list[str] = field(default_factory=list)
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+    allow_groups: list[str] = field(default_factory=list)
+    deny_groups: list[str] = field(default_factory=list)
+    architecture_mode: str = "branch"  # "fixed" | "tune" | "evolve" | "branch"
+    baseline_mode: str = "exploit"  # "exploit" | "mutate_baseline" | "branch_from_baseline"
+
+
+@dataclass(frozen=True)
 class AutoResearchConfig:
     """Auto-research loop settings."""
 
@@ -144,6 +157,9 @@ class AutoResearchConfig:
     orchestrator: str = "none"  # "none" | "hermes" | "researchclaw"
     baseline: AutoResearchBaselineConfig = field(default_factory=AutoResearchBaselineConfig)
     strategy: AutoResearchStrategyConfig = field(default_factory=AutoResearchStrategyConfig)
+    search_space: AutoResearchSearchSpaceConfig = field(
+        default_factory=AutoResearchSearchSpaceConfig
+    )
     hermes: HermesConfig = field(default_factory=HermesConfig)
 
 

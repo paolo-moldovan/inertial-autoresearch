@@ -67,6 +67,9 @@ def choose_mutation_proposal(
     metric_direction: str,
     history: list[dict[str, object]],
     candidates: list[MutationProposal],
+    incumbent: dict[str, object] | None,
+    search_space: dict[str, object] | None,
+    mutation_lessons: list[dict[str, object]] | None,
     root: Path,
 ) -> MutationProposal:
     """Use Hermes to choose the next config mutation from a bounded candidate set."""
@@ -77,6 +80,9 @@ def choose_mutation_proposal(
         metric_direction=metric_direction,
         history=history,
         candidates=candidates,
+        incumbent=incumbent,
+        search_space=search_space,
+        mutation_lessons=mutation_lessons,
         root=root,
     )
     return proposal
@@ -90,6 +96,9 @@ def choose_mutation_proposal_with_trace(
     metric_direction: str,
     history: list[dict[str, object]],
     candidates: list[MutationProposal],
+    incumbent: dict[str, object] | None,
+    search_space: dict[str, object] | None,
+    mutation_lessons: list[dict[str, object]] | None,
     root: Path,
 ) -> tuple[MutationProposal, HermesQueryTrace]:
     """Return the selected proposal plus the underlying Hermes trace."""
@@ -102,6 +111,9 @@ def choose_mutation_proposal_with_trace(
         metric_direction=metric_direction,
         history=history,
         candidates=candidates,
+        incumbent=incumbent,
+        search_space=search_space,
+        mutation_lessons=mutation_lessons,
     )
     trace = _run_hermes_query(prompt=prompt, config=config, root=root)
     if trace.stdout is None:
@@ -227,6 +239,9 @@ def _build_prompt(
     metric_direction: str,
     history: list[dict[str, object]],
     candidates: list[MutationProposal],
+    incumbent: dict[str, object] | None,
+    search_space: dict[str, object] | None,
+    mutation_lessons: list[dict[str, object]] | None,
 ) -> str:
     history_lines = [
         json.dumps(record, separators=(",", ":"), sort_keys=True)
@@ -238,19 +253,48 @@ def _build_prompt(
     candidate_lines = [
         (
             f"{index}. description={proposal.description!r} "
-            f"overrides={json.dumps(proposal.overrides, separators=(',', ':'))}"
+            f"overrides={json.dumps(proposal.overrides, separators=(',', ':'))} "
+            f"groups={json.dumps(list(proposal.groups), separators=(',', ':'))} "
+            f"architecture_change={json.dumps(proposal.architecture_change)}"
         )
         for index, proposal in enumerate(candidates)
     ]
+    incumbent_block = (
+        json.dumps(incumbent, separators=(",", ":"), sort_keys=True)
+        if incumbent is not None
+        else '{"note":"no incumbent yet"}'
+    )
+    search_space_block = (
+        json.dumps(search_space, separators=(",", ":"), sort_keys=True)
+        if search_space is not None
+        else '{"note":"no explicit search-space constraints"}'
+    )
+    lesson_lines = [
+        json.dumps(record, separators=(",", ":"), sort_keys=True)
+        for record in (mutation_lessons or [])[:6]
+    ]
+    if not lesson_lines:
+        lesson_lines = ['{"note":"no prior mutation lessons"}']
 
     return "\n".join(
         [
             "You are selecting the next IMU denoising experiment mutation.",
             f"Iteration: {iteration}",
             f"Objective: {metric_direction} {metric_key}",
+            "Current incumbent:",
+            incumbent_block,
+            "Search-space contract from the local controller:",
+            search_space_block,
+            "Recent mutation lessons from accepted/rejected prior runs:",
+            *lesson_lines,
             "Constraints:",
             "- Choose exactly one candidate from the provided list.",
             "- Do not invent new overrides.",
+            "- Respect the search-space contract and incumbent context.",
+            (
+                "- Prefer candidates that build on the current incumbent "
+                "unless branching is explicitly allowed."
+            ),
             (
                 "- Prefer candidates that are likely to improve validation quality "
                 "while keeping the search diverse."

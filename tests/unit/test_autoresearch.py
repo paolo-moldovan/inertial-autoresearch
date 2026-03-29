@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from random import Random
 from typing import Any
@@ -9,16 +10,19 @@ from typing import Any
 from _pytest.monkeypatch import MonkeyPatch
 
 from autoresearch_loop.hermes import HermesQueryTrace
-from autoresearch_loop.loop import build_parser, run_autoresearch
+from autoresearch_loop.hermes import _build_prompt as build_hermes_prompt
+from autoresearch_loop.loop import _resolve_iteration_config, build_parser, run_autoresearch
 from autoresearch_loop.mutations import (
     MutationPolicyCandidate,
     MutationProposal,
     build_mutation_schedule,
     choose_policy_candidate,
+    default_mutation_pool,
+    filter_mutation_proposals,
 )
 from imu_denoise.cli.common import resolve_config
 from imu_denoise.config import DataConfig, ExperimentConfig, ObservabilityConfig
-from imu_denoise.config.schema import AutoResearchStrategyConfig
+from imu_denoise.config.schema import AutoResearchSearchSpaceConfig, AutoResearchStrategyConfig
 from imu_denoise.observability import LoopController, MissionControlQueries
 from imu_denoise.observability.writer import ObservabilityWriter
 
@@ -132,6 +136,88 @@ def test_policy_explores_when_recent_results_stagnate() -> None:
     assert decision.selected.description == "small transformer"
 
 
+def test_iteration_config_inherits_from_incumbent_instead_of_resetting_to_base() -> None:
+    """Model-agnostic mutations should keep the incumbent architecture unless overridden."""
+    base_config = resolve_config(
+        ["configs/base.yaml", "configs/device.yaml", "configs/models/lstm.yaml"],
+        [],
+    )
+    incumbent_config = {
+        **asdict(base_config),
+        "model": {
+            **asdict(base_config.model),
+            "name": "conv1d",
+            "hidden_dim": 64,
+            "num_layers": 4,
+        },
+    }
+
+    resolved = _resolve_iteration_config(
+        base_config=base_config,
+        base_overrides=[],
+        proposal_overrides=["training.lr=0.0003"],
+        incumbent_config=incumbent_config,
+    )
+
+    assert resolved.model.name == "conv1d"
+    assert resolved.training.lr == 0.0003
+
+
+def test_search_space_can_freeze_architecture_for_hermes_candidates() -> None:
+    """Architecture-fixed search space should remove model-family mutations before Hermes."""
+    allowed, blocked = filter_mutation_proposals(
+        default_mutation_pool()[1:],
+        AutoResearchSearchSpaceConfig(architecture_mode="fixed"),
+    )
+
+    allowed_descriptions = {proposal.description for proposal in allowed}
+    assert "conv1d baseline" not in allowed_descriptions
+    assert "small transformer" not in allowed_descriptions
+    assert "deeper lstm" not in allowed_descriptions
+    assert blocked["conv1d baseline"] == ["architecture_fixed"]
+    assert "lower learning rate" in allowed_descriptions
+
+
+def test_hermes_prompt_includes_incumbent_constraints_and_lessons() -> None:
+    """Hermes should receive the local policy context instead of choosing semi-blindly."""
+    prompt = build_hermes_prompt(
+        iteration=3,
+        metric_key="val_rmse",
+        metric_direction="minimize",
+        history=[{"iteration": 2, "status": "keep", "metric_value": 0.16}],
+        candidates=[
+            MutationProposal(
+                description="lower learning rate",
+                overrides=["training.lr=0.0003"],
+                groups=("training_core", "optimizer"),
+            )
+        ],
+        incumbent={
+            "run_id": "run-123",
+            "run_name": "autoresearch_004",
+            "model": "conv1d",
+            "metric_value": 0.167,
+        },
+        search_space={
+            "architecture_mode": "fixed",
+            "freeze": ["model.name"],
+            "blocked_candidates": {"small transformer": ["architecture_fixed"]},
+        },
+        mutation_lessons=[
+            {
+                "signature": "training.lr:0.001->0.0003",
+                "lesson_text": "Lower learning rate helped recent conv1d runs.",
+            }
+        ],
+    )
+
+    assert "Current incumbent:" in prompt
+    assert '"model":"conv1d"' in prompt
+    assert '"architecture_mode":"fixed"' in prompt
+    assert "Recent mutation lessons" in prompt
+    assert "groups=[\"training_core\",\"optimizer\"]" in prompt
+
+
 def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     """The local loop should write a TSV with a baseline and one mutation result."""
     results_path = tmp_path / "results.tsv"
@@ -186,6 +272,10 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     assert detail["selection_event"]["policy_state"]["policy_mode"] in {"explore", "exploit"}
     assert detail["change_set"] is not None
     assert detail["change_set"]["reference_kind"] in {"base", "incumbent"}
+    assert detail["lineage"]["incumbent"] is not None
+    assert detail["policy_context"] is not None
+    assert isinstance(detail["change_diff"], list)
+    assert isinstance(detail["related_lessons"], list)
     assert detail["mutation_attempts"]
     summary = queries.get_mission_control_summary(limit=10)
     assert summary["mutation_leaderboard"]

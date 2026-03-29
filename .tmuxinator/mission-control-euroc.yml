@@ -1,7 +1,8 @@
 name: imu-mission-control-euroc
 root: <%= ENV.fetch("IMU_AUTORESEARCH_ROOT", "/Users/paolo/development/inertial-autoresearch") %>
 
-pre: uv sync --extra monitor
+on_project_start: uv sync --extra monitor
+on_project_restart: uv sync --extra monitor
 pre_window: export PYTHONUNBUFFERED=1
 
 windows:

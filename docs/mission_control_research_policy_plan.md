@@ -107,6 +107,8 @@ Acceptance:
 
 ## Phase 5: Mission Control UX for Research Policy
 
+Status: completed
+
 Goals:
 - Make lineage and policy decisions visible in the dashboard and monitor.
 
@@ -121,6 +123,12 @@ Implementation:
 
 Acceptance:
 - A human can understand why the loop selected a run without reading raw logs.
+
+Future extension:
+- Add a small committee of Hermes agents as a bounded proposal stage, where
+  multiple agents suggest candidates and the local policy still performs the
+  final evidence-based ranking. This keeps committee diversity without giving
+  up traceability or apples-to-apples control.
 
 ## Phase 6: Reproducibility and Versioning
 

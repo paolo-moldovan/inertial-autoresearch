@@ -86,6 +86,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
     from imu_denoise.config.schema import (
         AutoResearchBaselineConfig,
         AutoResearchConfig,
+        AutoResearchSearchSpaceConfig,
         AutoResearchStrategyConfig,
         DataConfig,
         DataSubsetConfig,
@@ -111,6 +112,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
         nested_type_map: dict[str, type] = {
             "baseline": AutoResearchBaselineConfig,
             "strategy": AutoResearchStrategyConfig,
+            "search_space": AutoResearchSearchSpaceConfig,
             "hermes": HermesConfig,
         }
         return nested_type_map.get(field_name)

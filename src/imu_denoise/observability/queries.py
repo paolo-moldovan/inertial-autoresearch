@@ -33,6 +33,18 @@ def _loads(value: Any) -> Any:
     return value
 
 
+def _fmt_json_value(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float, str)):
+        text = str(value)
+    else:
+        text = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
 class MissionControlQueries:
     """High-level queries over the observability store."""
 
@@ -589,12 +601,16 @@ class MissionControlQueries:
             "identity": self.get_run_identity(run_id),
             "change_set": self.get_change_set(run_id),
             "selection_event": self.get_selection_event(run_id),
+            "lineage": self.get_run_lineage(run_id),
+            "policy_context": self.get_run_policy_context(run_id),
+            "change_diff": self.get_run_change_diff(run_id),
             "timeline": self.list_events(run_id=run_id, limit=200),
             "artifacts": self.list_artifacts(run_id=run_id),
             "decisions": self.list_decisions_for_run(run_id),
             "llm_calls": self.list_llm_calls_for_run(run_id),
             "tool_calls": self.list_tool_calls(run_id=run_id, limit=200),
             "mutation_attempts": self.list_mutation_attempts(run_id=run_id, limit=100),
+            "related_lessons": self.get_related_mutation_lessons(run_id, limit=8),
             "curves": self.get_run_curves(run_id),
             "links": self.get_traceability_links(run_id),
             "logs": self.list_logs(run_id, limit=100),
@@ -652,6 +668,50 @@ class MissionControlQueries:
             return None
         return data_regime_fingerprint(payload)
 
+    def get_run_reference(self, run_id: str | None) -> dict[str, Any] | None:
+        if not run_id:
+            return None
+        row = self.store.fetch_one(
+            """
+            SELECT
+                r.id AS run_id,
+                r.name AS run_name,
+                r.phase,
+                r.status AS run_status,
+                r.iteration,
+                r.model,
+                r.dataset,
+                e.regime_fingerprint,
+                COALESCE(d.metric_value, s.best_metric) AS metric_value,
+                d.metric_key
+            FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
+            LEFT JOIN status_snapshots s ON s.run_id = r.id
+            LEFT JOIN (
+                SELECT
+                    d1.run_id,
+                    d1.metric_key,
+                    d1.metric_value
+                FROM decisions d1
+                JOIN (
+                    SELECT run_id, MAX(created_at) AS max_created_at
+                    FROM decisions
+                    GROUP BY run_id
+                ) latest ON latest.run_id = d1.run_id AND latest.max_created_at = d1.created_at
+            ) d ON d.run_id = r.id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        )
+        if row is None:
+            return None
+        row["run_id_short"] = str(row["run_id"])[:8]
+        regime_fingerprint = row.get("regime_fingerprint")
+        row["regime_fingerprint_short"] = (
+            str(regime_fingerprint)[:8] if regime_fingerprint else None
+        )
+        return row
+
     def get_change_set(self, run_id: str) -> dict[str, Any] | None:
         row = self.store.fetch_one(
             "SELECT * FROM change_sets WHERE run_id = ?",
@@ -673,6 +733,93 @@ class MissionControlQueries:
             return None
         row["policy_state"] = _loads(row.pop("policy_state_json"))
         return row
+
+    def get_run_lineage(self, run_id: str) -> dict[str, Any]:
+        change_set = self.get_change_set(run_id)
+        selection_event = self.get_selection_event(run_id)
+        parent_run_id = None if change_set is None else change_set.get("parent_run_id")
+        incumbent_run_id = None
+        if selection_event is not None and selection_event.get("incumbent_run_id"):
+            incumbent_run_id = selection_event.get("incumbent_run_id")
+        elif change_set is not None:
+            incumbent_run_id = change_set.get("incumbent_run_id")
+        return {
+            "parent": self.get_run_reference(
+                str(parent_run_id) if isinstance(parent_run_id, str) else None
+            ),
+            "incumbent": self.get_run_reference(
+                str(incumbent_run_id) if isinstance(incumbent_run_id, str) else None
+            ),
+        }
+
+    def get_run_policy_context(self, run_id: str) -> dict[str, Any] | None:
+        selection_event = self.get_selection_event(run_id)
+        if selection_event is None:
+            return None
+        policy_state = selection_event.get("policy_state")
+        if not isinstance(policy_state, dict):
+            return None
+        candidates = policy_state.get("policy_candidates")
+        return {
+            "proposal_source": selection_event.get("proposal_source"),
+            "description": selection_event.get("description"),
+            "rationale": selection_event.get("rationale"),
+            "strategy": policy_state.get("strategy"),
+            "policy_mode": policy_state.get("policy_mode"),
+            "stagnating": policy_state.get("policy_stagnating"),
+            "explore_probability": policy_state.get("policy_explore_probability"),
+            "selected_candidate_index": policy_state.get("selected_candidate_index"),
+            "preferred_candidate_index": policy_state.get("preferred_candidate_index"),
+            "preferred_candidate_description": policy_state.get("preferred_candidate_description"),
+            "policy_candidates": candidates if isinstance(candidates, list) else [],
+        }
+
+    def get_run_change_diff(self, run_id: str) -> list[dict[str, Any]]:
+        change_set = self.get_change_set(run_id)
+        if change_set is None:
+            return []
+        items = change_set.get("change_items")
+        if not isinstance(items, list):
+            return []
+        return [
+            {
+                "path": item.get("path"),
+                "category": item.get("category"),
+                "before": item.get("before"),
+                "after": item.get("after"),
+                "before_text": _fmt_json_value(item.get("before")),
+                "after_text": _fmt_json_value(item.get("after")),
+            }
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    def get_related_mutation_lessons(self, run_id: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        attempts = self.list_mutation_attempts(run_id=run_id, limit=100)
+        if not attempts:
+            return []
+        signatures = [str(item["signature"]) for item in attempts if item.get("signature")]
+        regime_fingerprint = self.get_run_regime_fingerprint(run_id)
+        if not signatures or regime_fingerprint is None:
+            return []
+        placeholders = ", ".join("?" for _ in signatures)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                l.*,
+                sig.display_name,
+                r.name AS run_name
+            FROM mutation_lessons l
+            JOIN mutation_signatures sig ON sig.signature = l.signature
+            LEFT JOIN runs r ON r.id = l.run_id
+            WHERE l.regime_fingerprint = ?
+              AND l.signature IN ({placeholders})
+            ORDER BY l.created_at DESC
+            LIMIT ?
+            """,
+            (regime_fingerprint, *signatures, limit),
+        )
+        return rows
 
     def get_traceability_links(self, run_id: str) -> dict[str, Any]:
         identity = self.get_run_identity(run_id)
