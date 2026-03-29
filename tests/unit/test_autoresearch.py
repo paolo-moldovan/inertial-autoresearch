@@ -10,9 +10,15 @@ from _pytest.monkeypatch import MonkeyPatch
 
 from autoresearch_loop.hermes import HermesQueryTrace
 from autoresearch_loop.loop import build_parser, run_autoresearch
-from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
+from autoresearch_loop.mutations import (
+    MutationPolicyCandidate,
+    MutationProposal,
+    build_mutation_schedule,
+    choose_policy_candidate,
+)
 from imu_denoise.cli.common import resolve_config
 from imu_denoise.config import DataConfig, ExperimentConfig, ObservabilityConfig
+from imu_denoise.config.schema import AutoResearchStrategyConfig
 from imu_denoise.observability import LoopController, MissionControlQueries
 from imu_denoise.observability.writer import ObservabilityWriter
 
@@ -32,6 +38,98 @@ def test_mutation_schedule_can_skip_baseline() -> None:
 
     assert schedule[0].description != "baseline"
     assert len(schedule) == 3
+
+
+def test_policy_deprioritizes_bad_mutation_history() -> None:
+    """Exploit mode should not keep selecting a mutation family with bad prior outcomes."""
+    decision = choose_policy_candidate(
+        candidates=[
+            MutationPolicyCandidate(
+                proposal=MutationProposal(
+                    description="switch to huber loss",
+                    overrides=["training.loss=huber"],
+                ),
+                signatures=["training.loss:mse->huber"],
+                stats=[
+                    {
+                        "signature": "training.loss:mse->huber",
+                        "tries": 3,
+                        "keep_count": 0,
+                        "discard_count": 2,
+                        "crash_count": 1,
+                        "avg_metric_delta": -0.05,
+                        "confidence": 0.1,
+                    }
+                ],
+                hermes_preferred=True,
+            ),
+            MutationPolicyCandidate(
+                proposal=MutationProposal(
+                    description="lower learning rate",
+                    overrides=["training.lr=0.0003"],
+                ),
+                signatures=["training.lr:0.001->0.0003"],
+                stats=[],
+            ),
+        ],
+        strategy=AutoResearchStrategyConfig(mode="exploit", max_retries_per_signature=1),
+        recent_results=[],
+        rng=Random(0),
+    )
+
+    assert decision.mode == "exploit"
+    assert decision.selected.description == "lower learning rate"
+
+
+def test_policy_explores_when_recent_results_stagnate() -> None:
+    """Adaptive mode should switch to exploration after repeated non-improving iterations."""
+    decision = choose_policy_candidate(
+        candidates=[
+            MutationPolicyCandidate(
+                proposal=MutationProposal(
+                    description="repeat known good tweak",
+                    overrides=["training.lr=0.0003"],
+                ),
+                signatures=["training.lr:0.001->0.0003"],
+                stats=[
+                    {
+                        "signature": "training.lr:0.001->0.0003",
+                        "tries": 2,
+                        "keep_count": 1,
+                        "discard_count": 1,
+                        "crash_count": 0,
+                        "avg_metric_delta": 0.02,
+                        "confidence": 0.7,
+                    }
+                ],
+            ),
+            MutationPolicyCandidate(
+                proposal=MutationProposal(
+                    description="small transformer",
+                    overrides=["model.name=transformer", "model.hidden_dim=64"],
+                ),
+                signatures=["model.name:lstm->transformer"],
+                stats=[],
+            ),
+        ],
+        strategy=AutoResearchStrategyConfig(
+            mode="adaptive",
+            explore_probability=0.0,
+            stagnation_patience=3,
+            stagnation_explore_boost=1.0,
+            exploit_top_k=1,
+        ),
+        recent_results=[
+            {"status": "discard"},
+            {"status": "discard"},
+            {"status": "discard"},
+        ],
+        rng=Random(0),
+    )
+
+    assert decision.stagnating is True
+    assert decision.mode == "explore"
+    assert decision.selected.description == "small transformer"
 
 
 def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
@@ -84,6 +182,8 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     assert detail is not None
     assert detail["selection_event"] is not None
     assert detail["selection_event"]["loop_run_id"] is not None
+    assert detail["selection_event"]["policy_state"]["strategy"]["mode"] == "adaptive"
+    assert detail["selection_event"]["policy_state"]["policy_mode"] in {"explore", "exploit"}
     assert detail["change_set"] is not None
     assert detail["change_set"]["reference_kind"] in {"base", "incumbent"}
     assert detail["mutation_attempts"]

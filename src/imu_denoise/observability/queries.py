@@ -909,6 +909,29 @@ class MissionControlQueries:
         )
         return rows
 
+    def get_mutation_stats_for_signatures(
+        self,
+        *,
+        signatures: list[str],
+        regime_fingerprint: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not signatures:
+            return {}
+        placeholders = ", ".join("?" for _ in signatures)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                s.*,
+                sig.display_name
+            FROM mutation_stats s
+            JOIN mutation_signatures sig ON sig.signature = s.signature
+            WHERE s.regime_fingerprint = ?
+              AND s.signature IN ({placeholders})
+            """,
+            (regime_fingerprint, *signatures),
+        )
+        return {str(row["signature"]): row for row in rows}
+
     def list_events(
         self,
         *,

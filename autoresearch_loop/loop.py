@@ -15,7 +15,7 @@ from uuid import uuid4
 
 if TYPE_CHECKING:
     from autoresearch_loop.hermes import HermesQueryTrace
-    from autoresearch_loop.mutations import MutationProposal
+    from autoresearch_loop.mutations import MutationPolicyCandidate, MutationProposal
     from imu_denoise.config import ExperimentConfig
     from imu_denoise.observability import LoopController, MissionControlQueries
 
@@ -183,6 +183,19 @@ def _result_snapshot(result: LoopResult) -> dict[str, object]:
     }
 
 
+def _recent_policy_results(results: list[LoopResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "iteration": result.iteration,
+            "status": result.status,
+            "proposal_source": result.proposal_source,
+            "metric_value": result.metric_value,
+            "description": result.description,
+        }
+        for result in results
+    ]
+
+
 def _select_mutation_proposal(
     *,
     iteration: int,
@@ -191,20 +204,11 @@ def _select_mutation_proposal(
     results: list[LoopResult],
     fallback_proposal: MutationProposal,
     hermes_used_descriptions: set[str],
-) -> tuple[MutationProposal, str, HermesQueryTrace | None, list[MutationProposal] | None]:
+) -> tuple[list[MutationProposal], int | None, str, HermesQueryTrace | None]:
     from autoresearch_loop.mutations import default_mutation_pool
 
-    if iteration == 0 or base_config.autoresearch.orchestrator != "hermes":
-        return fallback_proposal, "static", None, None
-
-    from autoresearch_loop.hermes import (
-        HermesProposalError,
-        choose_mutation_proposal_with_trace,
-        hermes_backend_ready,
-    )
-
-    if not hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT):
-        return fallback_proposal, "static-fallback", None, None
+    if iteration == 0:
+        return [fallback_proposal], 0, "static", None
 
     candidate_pool = default_mutation_pool()[1:]
     available_candidates = [
@@ -217,6 +221,28 @@ def _select_mutation_proposal(
         available_candidates = candidate_pool[:]
         rng.shuffle(available_candidates)
 
+    if base_config.autoresearch.orchestrator != "hermes":
+        fallback_index = 0
+        for index, candidate in enumerate(available_candidates):
+            if candidate.description == fallback_proposal.description:
+                fallback_index = index
+                break
+        return available_candidates, fallback_index, "static", None
+
+    from autoresearch_loop.hermes import (
+        HermesProposalError,
+        choose_mutation_proposal_with_trace,
+        hermes_backend_ready,
+    )
+
+    if not hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT):
+        fallback_index = 0
+        for index, candidate in enumerate(available_candidates):
+            if candidate.description == fallback_proposal.description:
+                fallback_index = index
+                break
+        return available_candidates, fallback_index, "static-fallback", None
+
     try:
         proposal, trace = choose_mutation_proposal_with_trace(
             config=base_config.autoresearch.hermes,
@@ -228,10 +254,22 @@ def _select_mutation_proposal(
             root=ROOT,
         )
     except HermesProposalError as exc:
-        return fallback_proposal, "static-fallback", exc.trace, available_candidates
+        fallback_index = 0
+        for index, candidate in enumerate(available_candidates):
+            if candidate.description == fallback_proposal.description:
+                fallback_index = index
+                break
+        return available_candidates, fallback_index, "static-fallback", exc.trace
 
-    hermes_used_descriptions.add(proposal.description)
-    return proposal, "hermes", trace, available_candidates
+    selected_index = 0
+    for index, candidate in enumerate(available_candidates):
+        if (
+            candidate.description == proposal.description
+            and candidate.overrides == proposal.overrides
+        ):
+            selected_index = index
+            break
+    return available_candidates, selected_index, "hermes", trace
 
 
 def _run_single_experiment(
@@ -481,7 +519,12 @@ def run_autoresearch(
     pause_enabled: bool = False,
 ) -> list[LoopResult]:
     """Run the baseline plus config mutations and record results to TSV."""
-    from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
+    from autoresearch_loop.mutations import (
+        MutationPolicyCandidate,
+        MutationProposal,
+        build_mutation_schedule,
+        choose_policy_candidate,
+    )
     from imu_denoise.cli.common import resolve_config
     from imu_denoise.config import load_config_from_dict
     from imu_denoise.observability import (
@@ -492,7 +535,11 @@ def run_autoresearch(
         import_hermes_state,
     )
     from imu_denoise.observability.control import LOOP_PAUSED
-    from imu_denoise.observability.lineage import data_regime_fingerprint
+    from imu_denoise.observability.lineage import (
+        build_change_items,
+        build_mutation_signatures,
+        data_regime_fingerprint,
+    )
     from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
     base_overrides = list(base_overrides or [])
@@ -676,6 +723,9 @@ def run_autoresearch(
             )
 
         queue_row = None
+        candidate_pool: list[MutationProposal] | None = None
+        policy_decision: Any | None = None
+        policy_candidate_payloads: list[dict[str, Any]] | None = None
         if iteration > 0:
             queue_row = loop_controller.claim_next_queued_proposal(loop_run_id=loop_run_id)
         if queue_row is not None:
@@ -685,9 +735,14 @@ def run_autoresearch(
             )
             proposal_source = "human-queued"
             hermes_trace = None
-            candidate_pool = None
+            preferred_candidate_index = None
         else:
-            proposal, proposal_source, hermes_trace, candidate_pool = _select_mutation_proposal(
+            (
+                candidate_pool,
+                preferred_candidate_index,
+                proposal_source,
+                hermes_trace,
+            ) = _select_mutation_proposal(
                 iteration=iteration,
                 base_config=base_config,
                 rng=rng,
@@ -695,6 +750,73 @@ def run_autoresearch(
                 fallback_proposal=fallback_proposal,
                 hermes_used_descriptions=hermes_used_descriptions,
             )
+            incumbent_config_for_policy = (
+                queries.get_run_config_payload(best_run_id) if best_run_id is not None else None
+            )
+            policy_candidates: list[MutationPolicyCandidate] = []
+            policy_candidate_payloads = []
+            current_regime_fingerprint = data_regime_fingerprint(base_config)
+            for candidate_index, candidate in enumerate(candidate_pool):
+                candidate_config = load_config_from_dict(
+                    asdict(base_config),
+                    overrides=list(candidate.overrides),
+                )
+                candidate_change_items = build_change_items(
+                    current_config=candidate_config,
+                    reference_config=(
+                        incumbent_config_for_policy
+                        if incumbent_config_for_policy is not None
+                        else base_config
+                    ),
+                    overrides=list(candidate.overrides),
+                )
+                candidate_signatures = build_mutation_signatures(candidate_change_items)
+                candidate_regime_fingerprint = data_regime_fingerprint(candidate_config)
+                signature_stats = queries.get_mutation_stats_for_signatures(
+                    signatures=[str(item["signature"]) for item in candidate_signatures],
+                    regime_fingerprint=candidate_regime_fingerprint,
+                )
+                policy_candidates.append(
+                    MutationPolicyCandidate(
+                        proposal=candidate,
+                        signatures=[str(item["signature"]) for item in candidate_signatures],
+                        stats=[
+                            signature_stats[str(item["signature"])]
+                            for item in candidate_signatures
+                            if str(item["signature"]) in signature_stats
+                        ],
+                        hermes_preferred=(
+                            preferred_candidate_index is not None
+                            and candidate_index == preferred_candidate_index
+                        ),
+                        regime_compatible=(
+                            candidate_regime_fingerprint == current_regime_fingerprint
+                        ),
+                    )
+                )
+                policy_candidate_payloads.append(
+                    {
+                        "description": candidate.description,
+                        "overrides": list(candidate.overrides),
+                        "signatures": [str(item["signature"]) for item in candidate_signatures],
+                        "regime_fingerprint": candidate_regime_fingerprint,
+                        "regime_compatible": candidate_regime_fingerprint
+                        == current_regime_fingerprint,
+                        "hermes_preferred": (
+                            preferred_candidate_index is not None
+                            and candidate_index == preferred_candidate_index
+                        ),
+                    }
+                )
+            policy_decision = choose_policy_candidate(
+                candidates=policy_candidates,
+                strategy=base_config.autoresearch.strategy,
+                recent_results=_recent_policy_results(results),
+                rng=rng,
+            )
+            proposal = policy_decision.selected
+            if proposal_source == "hermes":
+                hermes_used_descriptions.add(proposal.description)
         observability.update_status(
             run_id=loop_run_id,
             phase="autoresearch_loop",
@@ -744,6 +866,7 @@ def run_autoresearch(
                 "description": proposal.description,
                 "overrides": run_overrides,
                 "candidate_count": len(candidate_pool) if candidate_pool is not None else 0,
+                "policy_mode": None if policy_decision is None else policy_decision.mode,
             },
             source="runtime",
         )
@@ -761,9 +884,27 @@ def run_autoresearch(
             f"queued proposal #{queue_row['id']}"
             if queue_row is not None
             else (
-                hermes_trace.reason
-                if hermes_trace is not None and hermes_trace.reason
-                else f"{proposal_source} proposal selected"
+                (
+                    f"{policy_decision.mode} policy selected {proposal.description}"
+                    + (
+                        " over Hermes preference"
+                        if (
+                            policy_decision is not None
+                            and preferred_candidate_index is not None
+                            and candidate_pool is not None
+                            and 0 <= preferred_candidate_index < len(candidate_pool)
+                            and candidate_pool[preferred_candidate_index].description
+                            != proposal.description
+                        )
+                        else ""
+                    )
+                )
+                if policy_decision is not None
+                else (
+                    hermes_trace.reason
+                    if hermes_trace is not None and hermes_trace.reason
+                    else f"{proposal_source} proposal selected"
+                )
             )
         )
         candidate_count = (
@@ -784,6 +925,43 @@ def run_autoresearch(
                 "baseline_mode": base_config.autoresearch.baseline.mode,
                 "best_metric": best_metric,
                 "best_run_id": best_run_id,
+                "strategy": asdict(base_config.autoresearch.strategy),
+                "policy_mode": None if policy_decision is None else policy_decision.mode,
+                "policy_stagnating": (
+                    None if policy_decision is None else policy_decision.stagnating
+                ),
+                "policy_explore_probability": (
+                    None if policy_decision is None else policy_decision.explore_probability
+                ),
+                "selected_candidate_index": (
+                    None if policy_decision is None else policy_decision.selected_index
+                ),
+                "preferred_candidate_index": preferred_candidate_index,
+                "preferred_candidate_description": (
+                    None
+                    if preferred_candidate_index is None or candidate_pool is None
+                    else candidate_pool[preferred_candidate_index].description
+                ),
+                "policy_candidates": (
+                    None
+                    if policy_decision is None or policy_candidate_payloads is None
+                    else [
+                        {
+                            **policy_candidate_payloads[score.index],
+                            "total_score": score.total_score,
+                            "exploration_score": score.exploration_score,
+                            "novelty_score": score.novelty_score,
+                            "confidence": score.confidence,
+                            "avg_metric_delta": score.avg_metric_delta,
+                            "total_tries": score.total_tries,
+                            "keep_count": score.keep_count,
+                            "discard_count": score.discard_count,
+                            "crash_count": score.crash_count,
+                            "reasons": score.reasons,
+                        }
+                        for score in policy_decision.scored_candidates[:8]
+                    ]
+                ),
                 "candidate_descriptions": (
                     [candidate.description for candidate in candidate_pool]
                     if candidate_pool is not None

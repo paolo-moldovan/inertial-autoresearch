@@ -84,6 +84,8 @@ Acceptance:
 
 ## Phase 4: Adaptive Explore / Exploit Policy
 
+Status: completed
+
 Goals:
 - Balance exploitation of known-good mutation families with exploration of novel
   directions.

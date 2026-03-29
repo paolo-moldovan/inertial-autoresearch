@@ -116,6 +116,23 @@ class AutoResearchBaselineConfig:
 
 
 @dataclass(frozen=True)
+class AutoResearchStrategyConfig:
+    """Adaptive explore/exploit policy for autoresearch candidate selection."""
+
+    mode: str = "adaptive"  # "adaptive" | "exploit" | "explore"
+    explore_probability: float = 0.15
+    stagnation_patience: int = 3
+    stagnation_explore_boost: float = 0.20
+    exploit_top_k: int = 3
+    novelty_bonus: float = 0.10
+    max_retries_per_signature: int = 2
+    hermes_bonus: float = 0.05
+    confidence_weight: float = 0.15
+    discard_penalty: float = 0.08
+    crash_penalty: float = 0.20
+
+
+@dataclass(frozen=True)
 class AutoResearchConfig:
     """Auto-research loop settings."""
 
@@ -126,6 +143,7 @@ class AutoResearchConfig:
     results_file: str = "artifacts/autoresearch/results.tsv"
     orchestrator: str = "none"  # "none" | "hermes" | "researchclaw"
     baseline: AutoResearchBaselineConfig = field(default_factory=AutoResearchBaselineConfig)
+    strategy: AutoResearchStrategyConfig = field(default_factory=AutoResearchStrategyConfig)
     hermes: HermesConfig = field(default_factory=HermesConfig)
 
 
