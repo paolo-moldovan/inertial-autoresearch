@@ -16,7 +16,7 @@ from imu_denoise.evaluation.metrics import compute_all_metrics
 from imu_denoise.observability import ObservabilityWriter
 from imu_denoise.training.reproducibility import seed_everything
 from imu_denoise.utils.io import save_metrics
-from imu_denoise.utils.paths import build_run_paths, write_run_manifest
+from imu_denoise.utils.paths import build_run_paths, update_run_manifest, write_run_manifest
 
 
 class BaselineProtocol(Protocol):
@@ -154,6 +154,31 @@ def run_command(args: Any) -> int:
         summary={"rmse": metrics["rmse"], "mae": metrics["mae"]},
         source="runtime",
     )
+    selection_event = observability.record_selection_event(
+        run_id=run_id,
+        loop_run_id=None,
+        iteration=None,
+        proposal_source="manual",
+        description=f"{args.baseline} baseline",
+        incumbent_run_id=None,
+        candidate_count=1,
+        rationale="launched manually from the CLI",
+        policy_state={"mode": "manual", "baseline": args.baseline},
+        source="runtime",
+    )
+    change_set = observability.record_change_set(
+        run_id=run_id,
+        loop_run_id=None,
+        parent_run_id=None,
+        incumbent_run_id=None,
+        reference_kind="manual",
+        proposal_source="manual",
+        description=f"{args.baseline} baseline",
+        overrides=list(args.overrides),
+        current_config=config,
+        reference_config=None,
+        source="runtime",
+    )
     observability.record_decision(
         run_id=run_id,
         iteration=None,
@@ -164,6 +189,14 @@ def run_command(args: Any) -> int:
         metric_value=float(metrics["rmse"]),
         overrides=list(args.overrides),
         source="runtime",
+    )
+    update_run_manifest(
+        run_paths,
+        {
+            "resolved_config": observability.config_payload(config),
+            "selection_event": selection_event,
+            "change_set": change_set,
+        },
     )
 
     print("Baseline evaluation complete:")

@@ -69,6 +69,50 @@ CREATE TABLE IF NOT EXISTS decisions (
 
 CREATE INDEX IF NOT EXISTS idx_decisions_run ON decisions(run_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS change_sets (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    loop_run_id TEXT,
+    parent_run_id TEXT,
+    incumbent_run_id TEXT,
+    reference_kind TEXT NOT NULL,
+    proposal_source TEXT NOT NULL,
+    description TEXT NOT NULL,
+    overrides_json TEXT NOT NULL,
+    change_items_json TEXT NOT NULL,
+    summary_json TEXT,
+    created_at REAL NOT NULL,
+    source TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (loop_run_id) REFERENCES runs(id),
+    FOREIGN KEY (parent_run_id) REFERENCES runs(id),
+    FOREIGN KEY (incumbent_run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_sets_loop ON change_sets(loop_run_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS selection_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT UNIQUE NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,
+    loop_run_id TEXT,
+    iteration INTEGER,
+    proposal_source TEXT NOT NULL,
+    description TEXT NOT NULL,
+    incumbent_run_id TEXT,
+    candidate_count INTEGER,
+    rationale TEXT,
+    policy_state_json TEXT,
+    created_at REAL NOT NULL,
+    source TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (loop_run_id) REFERENCES runs(id),
+    FOREIGN KEY (incumbent_run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_selection_events_loop
+ON selection_events(loop_run_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS llm_calls (
     id TEXT PRIMARY KEY,
     run_id TEXT,
@@ -574,6 +618,128 @@ class ObservabilityStore:
                     None if candidates is None else _json_dumps(candidates),
                     reason,
                     llm_call_id,
+                    created_at,
+                    source,
+                ),
+            )
+
+    def upsert_change_set(
+        self,
+        *,
+        change_set_id: str,
+        run_id: str,
+        loop_run_id: str | None,
+        parent_run_id: str | None,
+        incumbent_run_id: str | None,
+        reference_kind: str,
+        proposal_source: str,
+        description: str,
+        overrides: list[str],
+        change_items: list[dict[str, Any]],
+        summary: dict[str, Any] | None,
+        created_at: float,
+        source: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO change_sets (
+                    id, run_id, loop_run_id, parent_run_id, incumbent_run_id,
+                    reference_kind, proposal_source, description, overrides_json,
+                    change_items_json, summary_json, created_at, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    id=excluded.id,
+                    loop_run_id=excluded.loop_run_id,
+                    parent_run_id=excluded.parent_run_id,
+                    incumbent_run_id=excluded.incumbent_run_id,
+                    reference_kind=excluded.reference_kind,
+                    proposal_source=excluded.proposal_source,
+                    description=excluded.description,
+                    overrides_json=excluded.overrides_json,
+                    change_items_json=excluded.change_items_json,
+                    summary_json=excluded.summary_json,
+                    created_at=excluded.created_at,
+                    source=excluded.source
+                """,
+                (
+                    change_set_id,
+                    run_id,
+                    loop_run_id,
+                    parent_run_id,
+                    incumbent_run_id,
+                    reference_kind,
+                    proposal_source,
+                    description,
+                    _json_dumps(overrides),
+                    _json_dumps(change_items),
+                    None if summary is None else _json_dumps(summary),
+                    created_at,
+                    source,
+                ),
+            )
+
+    def upsert_selection_event(
+        self,
+        *,
+        fingerprint: str | None,
+        run_id: str,
+        loop_run_id: str | None,
+        iteration: int | None,
+        proposal_source: str,
+        description: str,
+        incumbent_run_id: str | None,
+        candidate_count: int | None,
+        rationale: str | None,
+        policy_state: dict[str, Any] | None,
+        created_at: float,
+        source: str,
+    ) -> None:
+        record_fingerprint = fingerprint or _fingerprint(
+            run_id,
+            loop_run_id,
+            iteration,
+            proposal_source,
+            description,
+            incumbent_run_id,
+            candidate_count,
+            rationale,
+            source,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO selection_events (
+                    fingerprint, run_id, loop_run_id, iteration, proposal_source,
+                    description, incumbent_run_id, candidate_count, rationale,
+                    policy_state_json, created_at, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    fingerprint=excluded.fingerprint,
+                    loop_run_id=excluded.loop_run_id,
+                    iteration=excluded.iteration,
+                    proposal_source=excluded.proposal_source,
+                    description=excluded.description,
+                    incumbent_run_id=excluded.incumbent_run_id,
+                    candidate_count=excluded.candidate_count,
+                    rationale=excluded.rationale,
+                    policy_state_json=excluded.policy_state_json,
+                    created_at=excluded.created_at,
+                    source=excluded.source
+                """,
+                (
+                    record_fingerprint,
+                    run_id,
+                    loop_run_id,
+                    iteration,
+                    proposal_source,
+                    description,
+                    incumbent_run_id,
+                    candidate_count,
+                    rationale,
+                    None if policy_state is None else _json_dumps(policy_state),
                     created_at,
                     source,
                 ),

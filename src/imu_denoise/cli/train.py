@@ -17,7 +17,7 @@ from imu_denoise.training import (
     build_optimizer_and_scheduler,
     seed_everything,
 )
-from imu_denoise.utils.paths import build_run_paths
+from imu_denoise.utils.paths import build_run_paths, update_run_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +84,31 @@ def run_command(args: Any) -> int:
         run_id=run_id,
     )
     summary = trainer.fit(train_loader, val_loader, test_loader)
+    selection_event = observability.record_selection_event(
+        run_id=summary.run_id,
+        loop_run_id=None,
+        iteration=None,
+        proposal_source="manual",
+        description="manual run",
+        incumbent_run_id=None,
+        candidate_count=1,
+        rationale="launched manually from the CLI",
+        policy_state={"mode": "manual"},
+        source="runtime",
+    )
+    change_set = observability.record_change_set(
+        run_id=summary.run_id,
+        loop_run_id=None,
+        parent_run_id=None,
+        incumbent_run_id=None,
+        reference_kind="manual",
+        proposal_source="manual",
+        description="manual run",
+        overrides=list(args.overrides),
+        current_config=config,
+        reference_config=None,
+        source="runtime",
+    )
     observability.record_decision(
         run_id=summary.run_id,
         iteration=None,
@@ -94,6 +119,14 @@ def run_command(args: Any) -> int:
         metric_value=summary.best_val_rmse,
         overrides=list(args.overrides),
         source="runtime",
+    )
+    update_run_manifest(
+        run_paths,
+        {
+            "resolved_config": observability.config_payload(config),
+            "selection_event": selection_event,
+            "change_set": change_set,
+        },
     )
 
     print("Training complete:")

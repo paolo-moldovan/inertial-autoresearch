@@ -25,6 +25,11 @@ from imu_denoise.observability.events import (
     RUN_STATUS,
     TRAINING_EPOCH,
 )
+from imu_denoise.observability.lineage import (
+    build_change_items,
+    normalize_config_payload,
+    summarize_change_items,
+)
 from imu_denoise.observability.store import ObservabilityStore
 
 _REDACTED = "[REDACTED]"
@@ -449,6 +454,138 @@ class ObservabilityWriter:
             ),
         )
 
+    def record_change_set(
+        self,
+        *,
+        run_id: str,
+        loop_run_id: str | None,
+        parent_run_id: str | None,
+        incumbent_run_id: str | None,
+        reference_kind: str,
+        proposal_source: str,
+        description: str,
+        overrides: list[str],
+        current_config: Mapping[str, Any] | Any,
+        reference_config: Mapping[str, Any] | Any | None = None,
+        source: str = "runtime",
+        change_set_id: str | None = None,
+    ) -> dict[str, Any]:
+        change_items = build_change_items(
+            current_config=current_config,
+            reference_config=reference_config,
+            overrides=overrides,
+        )
+        summary = summarize_change_items(change_items)
+        created_change_set_id = change_set_id or f"changeset_{uuid4().hex}"
+        if self.store is not None:
+            self._safe(
+                self.store.upsert_change_set,
+                change_set_id=created_change_set_id,
+                run_id=run_id,
+                loop_run_id=loop_run_id,
+                parent_run_id=parent_run_id,
+                incumbent_run_id=incumbent_run_id,
+                reference_kind=reference_kind,
+                proposal_source=proposal_source,
+                description=description,
+                overrides=overrides,
+                change_items=change_items,
+                summary=summary,
+                created_at=_now_ts(),
+                source=source,
+            )
+        self.append_event(
+            run_id=run_id,
+            event_type="change_set_recorded",
+            level="INFO",
+            title=description,
+            payload={
+                "change_set_id": created_change_set_id,
+                "reference_kind": reference_kind,
+                "proposal_source": proposal_source,
+                "summary": summary,
+            },
+            source=source,
+            created_at=_now_ts(),
+            fingerprint=self._fingerprint(run_id, "change_set_recorded", created_change_set_id),
+        )
+        return {
+            "id": created_change_set_id,
+            "run_id": run_id,
+            "loop_run_id": loop_run_id,
+            "parent_run_id": parent_run_id,
+            "incumbent_run_id": incumbent_run_id,
+            "reference_kind": reference_kind,
+            "proposal_source": proposal_source,
+            "description": description,
+            "overrides": list(overrides),
+            "change_items": change_items,
+            "summary": summary,
+        }
+
+    def record_selection_event(
+        self,
+        *,
+        run_id: str,
+        loop_run_id: str | None,
+        iteration: int | None,
+        proposal_source: str,
+        description: str,
+        incumbent_run_id: str | None,
+        candidate_count: int | None,
+        rationale: str | None,
+        policy_state: dict[str, Any] | None = None,
+        source: str = "runtime",
+        fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        created_at = _now_ts()
+        sanitized_policy = self._sanitize(policy_state)
+        if self.store is not None:
+            self._safe(
+                self.store.upsert_selection_event,
+                fingerprint=fingerprint,
+                run_id=run_id,
+                loop_run_id=loop_run_id,
+                iteration=iteration,
+                proposal_source=proposal_source,
+                description=description,
+                incumbent_run_id=incumbent_run_id,
+                candidate_count=candidate_count,
+                rationale=rationale,
+                policy_state=sanitized_policy,
+                created_at=created_at,
+                source=source,
+            )
+        self.append_event(
+            run_id=run_id,
+            event_type="selection_event",
+            level="INFO",
+            title=description,
+            payload={
+                "iteration": iteration,
+                "proposal_source": proposal_source,
+                "incumbent_run_id": incumbent_run_id,
+                "candidate_count": candidate_count,
+                "rationale": rationale,
+            },
+            source=source,
+            created_at=created_at,
+            fingerprint=(
+                fingerprint or self._fingerprint(run_id, "selection_event", iteration, description)
+            ),
+        )
+        return {
+            "run_id": run_id,
+            "loop_run_id": loop_run_id,
+            "iteration": iteration,
+            "proposal_source": proposal_source,
+            "description": description,
+            "incumbent_run_id": incumbent_run_id,
+            "candidate_count": candidate_count,
+            "rationale": rationale,
+            "policy_state": sanitized_policy,
+        }
+
     def record_llm_call(
         self,
         *,
@@ -683,6 +820,14 @@ class ObservabilityWriter:
         if isinstance(sanitized, dict):
             return sanitized
         return raw
+
+    def config_payload(self, config: Mapping[str, Any] | Any) -> dict[str, Any]:
+        """Return a sanitized plain-dict payload for a config-like object."""
+        normalized = normalize_config_payload(config)
+        sanitized = self._sanitize(normalized)
+        if isinstance(sanitized, dict):
+            return sanitized
+        return normalized
 
     def _make_run_id(self, *, name: str, phase: str) -> str:
         normalized_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", name).strip("-") or "run"

@@ -100,6 +100,31 @@ def test_writer_records_run_llm_decision_and_artifacts(tmp_path: Path) -> None:
         llm_call_id=llm_call_id,
         source="runtime",
     )
+    writer.record_selection_event(
+        run_id=run_id,
+        loop_run_id=run_id,
+        iteration=1,
+        proposal_source="hermes",
+        description="switch to huber loss",
+        incumbent_run_id=None,
+        candidate_count=3,
+        rationale="good",
+        policy_state={"best_metric": 0.2},
+        source="runtime",
+    )
+    writer.record_change_set(
+        run_id=run_id,
+        loop_run_id=run_id,
+        parent_run_id=None,
+        incumbent_run_id=None,
+        reference_kind="manual",
+        proposal_source="hermes",
+        description="switch to huber loss",
+        overrides=["training.loss=huber"],
+        current_config=config,
+        reference_config=None,
+        source="runtime",
+    )
     metrics_path = tmp_path / "artifacts" / "obs-test" / "metrics.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text('{"best_val_rmse": 0.1}', encoding="utf-8")
@@ -122,6 +147,9 @@ def test_writer_records_run_llm_decision_and_artifacts(tmp_path: Path) -> None:
     assert run_detail["run"]["status"] == "completed"
     assert len(run_detail["decisions"]) == 1
     assert len(run_detail["llm_calls"]) == 1
+    assert run_detail["selection_event"] is not None
+    assert run_detail["change_set"] is not None
+    assert run_detail["change_set"]["summary"]["change_count"] >= 1
     assert any(
         artifact["artifact_type"] == "training_metrics"
         for artifact in run_detail["artifacts"]

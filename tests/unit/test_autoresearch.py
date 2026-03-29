@@ -71,6 +71,21 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     assert results_path.exists()
     lines = results_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 3
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+    mutation_run = next(
+        row
+        for row in queries.list_recent_decisions(limit=10)
+        if row["run_name"] == "autoresearch_001"
+    )
+    detail = queries.get_run_detail(str(mutation_run["run_id"]))
+    assert detail is not None
+    assert detail["selection_event"] is not None
+    assert detail["selection_event"]["loop_run_id"] is not None
+    assert detail["change_set"] is not None
+    assert detail["change_set"]["reference_kind"] in {"base", "incumbent"}
 
 
 def test_autoresearch_loop_uses_hermes_proposals_when_enabled(

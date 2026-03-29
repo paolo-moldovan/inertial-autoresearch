@@ -444,6 +444,9 @@ class Trainer:
         os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
         os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
         from matplotlib import pyplot as plt
 
         from imu_denoise.evaluation.visualization import (

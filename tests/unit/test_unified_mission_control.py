@@ -91,6 +91,10 @@ def test_imu_run_and_baseline_record_manual_decisions(tmp_path: Path) -> None:
     assert run_detail is not None
     assert run_detail["curves"]
     assert run_detail["identity"]["experiment_id"] is not None
+    assert run_detail["selection_event"] is not None
+    assert run_detail["selection_event"]["proposal_source"] == "manual"
+    assert run_detail["change_set"] is not None
+    assert run_detail["change_set"]["reference_kind"] == "manual"
     assert run_detail["links"]["experiment_id"] == run_detail["identity"]["experiment_id"]
     assert any("/runs/" in str(artifact["path"]) for artifact in run_detail["artifacts"])
     assert (

@@ -61,4 +61,13 @@ def build_run_paths(output_dir: str | Path, *, run_name: str, run_id: str) -> Ru
 def write_run_manifest(run_paths: RunPaths, payload: dict[str, Any]) -> None:
     """Write a small run manifest for human inspection and disk-only recovery."""
     run_paths.root.mkdir(parents=True, exist_ok=True)
-    run_paths.manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    existing: dict[str, Any] = {}
+    if run_paths.manifest_path.exists():
+        existing = json.loads(run_paths.manifest_path.read_text(encoding="utf-8"))
+    merged = {**existing, **payload}
+    run_paths.manifest_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+
+
+def update_run_manifest(run_paths: RunPaths, payload: dict[str, Any]) -> None:
+    """Merge additional metadata into an existing run manifest."""
+    write_run_manifest(run_paths, payload)

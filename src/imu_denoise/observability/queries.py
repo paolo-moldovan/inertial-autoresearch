@@ -591,6 +591,8 @@ class MissionControlQueries:
             "run": run,
             "experiment": experiment,
             "identity": self.get_run_identity(run_id),
+            "change_set": self.get_change_set(run_id),
+            "selection_event": self.get_selection_event(run_id),
             "timeline": self.list_events(run_id=run_id, limit=200),
             "artifacts": self.list_artifacts(run_id=run_id),
             "decisions": self.list_decisions_for_run(run_id),
@@ -625,15 +627,58 @@ class MissionControlQueries:
         row["experiment_id_short"] = str(experiment_id)[:8] if experiment_id else None
         return row
 
+    def get_run_config_payload(self, run_id: str) -> dict[str, Any] | None:
+        row = self.store.fetch_one(
+            """
+            SELECT e.config_json
+            FROM runs r
+            JOIN experiments e ON e.id = r.experiment_id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        )
+        if row is None:
+            return None
+        payload = _loads(row.get("config_json"))
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def get_change_set(self, run_id: str) -> dict[str, Any] | None:
+        row = self.store.fetch_one(
+            "SELECT * FROM change_sets WHERE run_id = ?",
+            (run_id,),
+        )
+        if row is None:
+            return None
+        row["overrides"] = _loads(row.pop("overrides_json"))
+        row["change_items"] = _loads(row.pop("change_items_json"))
+        row["summary"] = _loads(row.pop("summary_json"))
+        return row
+
+    def get_selection_event(self, run_id: str) -> dict[str, Any] | None:
+        row = self.store.fetch_one(
+            "SELECT * FROM selection_events WHERE run_id = ?",
+            (run_id,),
+        )
+        if row is None:
+            return None
+        row["policy_state"] = _loads(row.pop("policy_state_json"))
+        return row
+
     def get_traceability_links(self, run_id: str) -> dict[str, Any]:
         identity = self.get_run_identity(run_id)
         decisions = self.list_decisions_for_run(run_id)
         llm_calls = self.list_llm_calls_for_run(run_id)
+        change_set = self.get_change_set(run_id)
+        selection_event = self.get_selection_event(run_id)
         return {
             "run_id": run_id,
             "experiment_id": None if identity is None else identity.get("experiment_id"),
             "decision_ids": [row["id"] for row in decisions],
             "llm_call_ids": [row["id"] for row in llm_calls],
+            "change_set_id": None if change_set is None else change_set.get("id"),
+            "selection_event_id": None if selection_event is None else selection_event.get("id"),
         }
 
     def get_run_curves(self, run_id: str) -> list[dict[str, Any]]:

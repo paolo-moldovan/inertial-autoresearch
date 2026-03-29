@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from autoresearch_loop.hermes import HermesQueryTrace
     from autoresearch_loop.mutations import MutationProposal
     from imu_denoise.config import ExperimentConfig
-    from imu_denoise.observability import LoopController
+    from imu_denoise.observability import LoopController, MissionControlQueries
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -316,14 +316,11 @@ def _best_metric_from_results(results: list[LoopResult], direction: str) -> floa
     return max(valid) if direction == "maximize" else min(valid)
 
 
-def _resolve_baseline_reference(base_config: ExperimentConfig) -> BaselineReference:
-    from imu_denoise.observability import MissionControlQueries
-
+def _resolve_baseline_reference(
+    base_config: ExperimentConfig,
+    queries: MissionControlQueries,
+) -> BaselineReference:
     policy = base_config.autoresearch.baseline.mode
-    queries = MissionControlQueries(
-        db_path=Path(base_config.observability.db_path),
-        blob_dir=Path(base_config.observability.blob_dir),
-    )
 
     if policy == "per_loop":
         return BaselineReference(
@@ -466,6 +463,15 @@ def _resolve_results_file(
     return configured
 
 
+def _safe_update_run_manifest(run_paths: Any, payload: dict[str, Any]) -> None:
+    try:
+        from imu_denoise.utils.paths import update_run_manifest
+
+        update_run_manifest(run_paths, payload)
+    except Exception:
+        return
+
+
 def run_autoresearch(
     *,
     config_paths: list[str],
@@ -477,9 +483,11 @@ def run_autoresearch(
     """Run the baseline plus config mutations and record results to TSV."""
     from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
     from imu_denoise.cli.common import resolve_config
+    from imu_denoise.config import load_config_from_dict
     from imu_denoise.observability import (
         LoopAlreadyRunningError,
         LoopController,
+        MissionControlQueries,
         ObservabilityWriter,
         import_hermes_state,
     )
@@ -489,6 +497,10 @@ def run_autoresearch(
     base_overrides = list(base_overrides or [])
     base_config = resolve_config(config_paths, base_overrides)
     observability = ObservabilityWriter.from_experiment_config(base_config)
+    queries = MissionControlQueries(
+        db_path=Path(base_config.observability.db_path),
+        blob_dir=Path(base_config.observability.blob_dir),
+    )
     loop_name = f"{base_config.name}-autoresearch"
     loop_run_id = observability.make_run_id(name=loop_name, phase="autoresearch_loop")
     loop_controller = LoopController.from_experiment_config(base_config, writer=observability)
@@ -525,7 +537,7 @@ def run_autoresearch(
     requested_batch_size = batch_size if pause_enabled and batch_size and batch_size > 0 else None
 
     rng = Random(base_config.training.seed)
-    baseline_reference = _resolve_baseline_reference(base_config)
+    baseline_reference = _resolve_baseline_reference(base_config, queries)
     schedule = build_mutation_schedule(
         total_iterations,
         rng,
@@ -734,6 +746,76 @@ def run_autoresearch(
             source="runtime",
         )
         experiment_run_id = f"training-{iteration:03d}-{uuid4().hex}"
+        resolved_config = load_config_from_dict(asdict(base_config), overrides=run_overrides)
+        selected_incumbent_run_id = best_run_id
+        incumbent_config = (
+            queries.get_run_config_payload(selected_incumbent_run_id)
+            if selected_incumbent_run_id is not None
+            else None
+        )
+        reference_kind = "incumbent" if incumbent_config is not None else "base"
+        selection_rationale = (
+            f"queued proposal #{queue_row['id']}"
+            if queue_row is not None
+            else (
+                hermes_trace.reason
+                if hermes_trace is not None and hermes_trace.reason
+                else f"{proposal_source} proposal selected"
+            )
+        )
+        candidate_count = (
+            len(candidate_pool)
+            if candidate_pool is not None
+            else (1 if queue_row is not None or proposal_source.startswith("static") else None)
+        )
+        selection_event = observability.record_selection_event(
+            run_id=experiment_run_id,
+            loop_run_id=loop_run_id,
+            iteration=iteration,
+            proposal_source=proposal_source,
+            description=proposal.description,
+            incumbent_run_id=selected_incumbent_run_id,
+            candidate_count=candidate_count,
+            rationale=selection_rationale,
+            policy_state={
+                "baseline_mode": base_config.autoresearch.baseline.mode,
+                "best_metric": best_metric,
+                "best_run_id": best_run_id,
+                "candidate_descriptions": (
+                    [candidate.description for candidate in candidate_pool]
+                    if candidate_pool is not None
+                    else None
+                ),
+                "queued_proposal_id": None if queue_row is None else int(queue_row["id"]),
+            },
+            source="runtime",
+        )
+        change_set = observability.record_change_set(
+            run_id=experiment_run_id,
+            loop_run_id=loop_run_id,
+            parent_run_id=selected_incumbent_run_id,
+            incumbent_run_id=selected_incumbent_run_id,
+            reference_kind=reference_kind,
+            proposal_source=proposal_source,
+            description=proposal.description,
+            overrides=run_overrides,
+            current_config=resolved_config,
+            reference_config=incumbent_config if incumbent_config is not None else base_config,
+            source="runtime",
+        )
+        experiment_run_paths = build_run_paths(
+            base_config.output_dir,
+            run_name=resolved_config.name,
+            run_id=experiment_run_id,
+        )
+        _safe_update_run_manifest(
+            experiment_run_paths,
+            {
+                "resolved_config": observability.config_payload(resolved_config),
+                "selection_event": selection_event,
+                "change_set": change_set,
+            },
+        )
         loop_controller.heartbeat(
             loop_run_id=loop_run_id,
             current_iteration=len(results),
@@ -816,6 +898,18 @@ def run_autoresearch(
                     loop_run_id=loop_run_id,
                     applied_run_id=experiment_run_id,
                 )
+            _safe_update_run_manifest(
+                experiment_run_paths,
+                {
+                    "result": {
+                        "status": status,
+                        "metric_key": base_config.autoresearch.metric_key,
+                        "metric_value": metric_value,
+                        "compared_against_run_id": selected_incumbent_run_id,
+                        "new_incumbent_run_id": best_run_id,
+                    }
+                },
+            )
         except TrainingInterrupted as exc:
             result = LoopResult(
                 iteration=iteration,
@@ -852,6 +946,17 @@ def run_autoresearch(
                 reason=str(exc),
                 llm_call_id=llm_call_id,
                 source="runtime",
+            )
+            _safe_update_run_manifest(
+                experiment_run_paths,
+                {
+                    "result": {
+                        "status": exc.status,
+                        "metric_key": base_config.autoresearch.metric_key,
+                        "metric_value": None,
+                        "message": str(exc),
+                    }
+                },
             )
             if queue_row is not None:
                 loop_controller.mark_queue_failed(
@@ -915,6 +1020,17 @@ def run_autoresearch(
                 reason=str(exc),
                 llm_call_id=llm_call_id,
                 source="runtime",
+            )
+            _safe_update_run_manifest(
+                experiment_run_paths,
+                {
+                    "result": {
+                        "status": "crash",
+                        "metric_key": base_config.autoresearch.metric_key,
+                        "metric_value": None,
+                        "message": str(exc),
+                    }
+                },
             )
             if queue_row is not None:
                 loop_controller.mark_queue_failed(
