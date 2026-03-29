@@ -79,6 +79,5 @@ class DeviceContext:
     def create_scaler(self) -> Any | None:
         """Create a GradScaler if AMP is enabled with float16 on CUDA."""
         if self.amp_enabled and self.device.type == "cuda" and self.dtype == torch.float16:
-            scaler_cls = getattr(torch.amp, "GradScaler")
-            return cast(Any, scaler_cls("cuda"))
+            return cast(Any, torch.amp.GradScaler("cuda"))  # type: ignore[attr-defined]
         return None

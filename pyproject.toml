@@ -33,6 +33,7 @@ all = ["imu-denoise[euroc,dev,notebooks]"]
 imu-train = "imu_denoise.cli.train:main"
 imu-eval = "imu_denoise.cli.evaluate:main"
 imu-data = "imu_denoise.cli.download_data:main"
+imu-preprocess = "imu_denoise.cli.preprocess_data:main"
 
 [build-system]
 requires = ["hatchling"]
