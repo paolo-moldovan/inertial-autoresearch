@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from numpy.typing import NDArray
 
 # Axis labels for 6-channel IMU data (accel x/y/z, gyro x/y/z)
@@ -20,7 +23,7 @@ def plot_denoising_comparison(
     timestamps: NDArray[np.floating],
     title: str = "Denoising Comparison",
     save_path: Path | str | None = None,
-) -> plt.Figure:
+) -> Figure:
     """Plot a 6-subplot figure comparing noisy, denoised, and clean signals per IMU axis.
 
     Args:
@@ -36,10 +39,9 @@ def plot_denoising_comparison(
     """
     n_axes = noisy.shape[1]
     fig, axes = plt.subplots(n_axes, 1, figsize=(14, 2.5 * n_axes), sharex=True)
-    if n_axes == 1:
-        axes = [axes]
+    axes_list = [cast(Axes, axes)] if n_axes == 1 else [cast(Axes, ax) for ax in np.ravel(axes)]
 
-    for i, ax in enumerate(axes):
+    for i, ax in enumerate(axes_list):
         label = _IMU_AXIS_LABELS[i] if i < len(_IMU_AXIS_LABELS) else f"Axis {i}"
         ax.plot(timestamps, noisy[:, i], alpha=0.4, linewidth=0.7, label="Noisy", color="gray")
         ax.plot(timestamps, clean[:, i], linewidth=1.0, label="Clean", color="tab:blue")
@@ -55,7 +57,7 @@ def plot_denoising_comparison(
         ax.legend(loc="upper right", fontsize=7)
         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("Time (s)")
+    axes_list[-1].set_xlabel("Time (s)")
     fig.suptitle(title, fontsize=14)
     fig.tight_layout()
 
@@ -64,7 +66,7 @@ def plot_denoising_comparison(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return fig
+    return cast(Figure, fig)
 
 
 def plot_psd(
@@ -72,7 +74,7 @@ def plot_psd(
     fs: float,
     title: str = "Power Spectral Density",
     save_path: Path | str | None = None,
-) -> plt.Figure:
+) -> Figure:
     """Plot power spectral density comparison for multiple signals.
 
     Args:
@@ -107,14 +109,14 @@ def plot_psd(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return fig
+    return cast(Figure, fig)
 
 
 def plot_error_distribution(
     errors: NDArray[np.floating],
     title: str = "Error Distribution",
     save_path: Path | str | None = None,
-) -> plt.Figure:
+) -> Figure:
     """Plot histograms of error distributions per axis.
 
     Args:
@@ -129,7 +131,7 @@ def plot_error_distribution(
     cols = min(n_axes, 3)
     rows = (n_axes + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
-    axes_flat = np.asarray(axes).flatten() if n_axes > 1 else [axes]
+    axes_flat: list[Axes] = [cast(Axes, ax) for ax in np.ravel(np.asarray(axes, dtype=object))]
 
     for i in range(n_axes):
         ax = axes_flat[i]
@@ -153,13 +155,13 @@ def plot_error_distribution(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return fig
+    return cast(Figure, fig)
 
 
 def plot_training_curves(
     log_path: Path | str,
     save_path: Path | str | None = None,
-) -> plt.Figure:
+) -> Figure:
     """Plot training and validation loss curves from a JSON-lines log file.
 
     Expects each line to be a JSON object with at least ``"epoch"`` and
@@ -182,7 +184,7 @@ def plot_training_curves(
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            record = cast(dict[str, Any], json.loads(line))
             if "epoch" not in record or "train_loss" not in record:
                 continue
             epochs.append(record["epoch"])
@@ -206,4 +208,4 @@ def plot_training_curves(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return fig
+    return cast(Figure, fig)

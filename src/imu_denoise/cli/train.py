@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
 
-from imu_denoise.cli.common import add_common_config_arguments, resolve_config
+import torch
+
+from imu_denoise.cli.common import add_common_config_arguments, build_model, resolve_config
+from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
-from imu_denoise.models import get_model
+from imu_denoise.training import (
+    Trainer,
+    build_loss,
+    build_optimizer_and_scheduler,
+    seed_everything,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,30 +30,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _model_kwargs(model_name: str, config: Any) -> dict[str, object]:
-    """Build constructor kwargs for the selected built-in model."""
-    common: dict[str, object] = {
-        "hidden_dim": config.hidden_dim,
-        "num_layers": config.num_layers,
-        "dropout": config.dropout,
-    }
-    if model_name == "lstm":
-        common["bidirectional"] = config.bidirectional
-    elif model_name == "transformer":
-        common["num_heads"] = config.num_heads
-    elif model_name == "conv1d":
-        common["kernel_size"] = config.kernel_size
-        common["dilation_base"] = config.dilation_base
-    common.update(config.extra)
-    return common
-
-
 def main() -> int:
-    """Validate configuration, device selection, and model creation."""
+    """Train a denoising model or run a training preflight."""
     args = build_parser().parse_args()
     config = resolve_config(args.config, args.overrides)
+    seed_everything(config.training.seed)
     device_ctx = DeviceContext.from_config(config.device)
-    model = get_model(config.model.name, **_model_kwargs(config.model.name, config.model))
+    model = build_model(config)
+
+    if config.device.compile and device_ctx.supports_compile:
+        model = torch.compile(model)
 
     checkpoint_dir = Path(config.checkpoint_dir)
     figures_dir = Path(config.figures_dir)
@@ -65,11 +58,33 @@ def main() -> int:
     print(f"  figures_dir: {figures_dir}")
     print(f"  model_class: {model.__class__.__name__}")
 
-    if not args.dry_run:
-        raise SystemExit(
-            "Training loop is not implemented yet. Use --dry-run during Phase 1 foundation work."
-        )
+    if args.dry_run:
+        return 0
 
+    train_loader, val_loader, test_loader = create_dataloaders(
+        config.data,
+        config.training,
+        device_ctx,
+    )
+    optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+    trainer = Trainer(
+        model=model,
+        config=config,
+        device_ctx=device_ctx,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        loss_fn=build_loss(config.training.loss),
+    )
+    summary = trainer.fit(train_loader, val_loader, test_loader)
+
+    print("Training complete:")
+    print(f"  best_epoch: {summary.best_epoch}")
+    print(f"  best_val_rmse: {summary.best_val_rmse:.6f}")
+    print(f"  final_train_loss: {summary.final_train_loss:.6f}")
+    print(f"  final_val_loss: {summary.final_val_loss:.6f}")
+    print(f"  training_seconds: {summary.training_seconds:.2f}")
+    print(f"  best_checkpoint: {summary.artifacts.best_checkpoint}")
+    print(f"  metrics_path: {summary.artifacts.metrics_path}")
     return 0
 
 

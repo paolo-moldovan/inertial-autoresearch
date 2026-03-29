@@ -6,6 +6,8 @@ All metric functions accept arrays of shape ``(N, C)`` where ``C`` is typically
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -49,7 +51,7 @@ def rmse_per_axis(
     Returns:
         Array of shape ``(C,)`` with per-axis RMSE.
     """
-    return np.sqrt(np.mean((pred - target) ** 2, axis=0))
+    return cast(NDArray[np.floating], np.sqrt(np.mean((pred - target) ** 2, axis=0)))
 
 
 def spectral_divergence(

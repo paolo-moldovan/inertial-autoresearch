@@ -97,4 +97,4 @@ def load_metrics(path: Path) -> dict[str, Any]:
         Dictionary of metric names to values.
     """
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        return dict(json.load(f))
