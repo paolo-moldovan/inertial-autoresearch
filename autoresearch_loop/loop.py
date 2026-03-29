@@ -12,6 +12,7 @@ from random import Random
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from autoresearch_loop.hermes import HermesQueryTrace
     from autoresearch_loop.mutations import MutationProposal
     from imu_denoise.config import ExperimentConfig
 
@@ -170,20 +171,20 @@ def _select_mutation_proposal(
     results: list[LoopResult],
     fallback_proposal: MutationProposal,
     hermes_used_descriptions: set[str],
-) -> tuple[MutationProposal, str]:
+) -> tuple[MutationProposal, str, HermesQueryTrace | None, list[MutationProposal] | None]:
     from autoresearch_loop.mutations import default_mutation_pool
 
     if iteration == 0 or base_config.autoresearch.orchestrator != "hermes":
-        return fallback_proposal, "static"
+        return fallback_proposal, "static", None, None
 
     from autoresearch_loop.hermes import (
         HermesProposalError,
-        choose_mutation_proposal,
+        choose_mutation_proposal_with_trace,
         hermes_backend_ready,
     )
 
     if not hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT):
-        return fallback_proposal, "static-fallback"
+        return fallback_proposal, "static-fallback", None, None
 
     candidate_pool = default_mutation_pool()[1:]
     available_candidates = [
@@ -197,7 +198,7 @@ def _select_mutation_proposal(
         rng.shuffle(available_candidates)
 
     try:
-        proposal = choose_mutation_proposal(
+        proposal, trace = choose_mutation_proposal_with_trace(
             config=base_config.autoresearch.hermes,
             iteration=iteration,
             metric_key=base_config.autoresearch.metric_key,
@@ -206,11 +207,11 @@ def _select_mutation_proposal(
             candidates=available_candidates,
             root=ROOT,
         )
-    except HermesProposalError:
-        return fallback_proposal, "static-fallback"
+    except HermesProposalError as exc:
+        return fallback_proposal, "static-fallback", exc.trace, available_candidates
 
     hermes_used_descriptions.add(proposal.description)
-    return proposal, "hermes"
+    return proposal, "hermes", trace, available_candidates
 
 
 def _run_single_experiment(
@@ -218,11 +219,14 @@ def _run_single_experiment(
     config_paths: list[str],
     overrides: list[str],
     metric_key: str,
-) -> tuple[Any, Any]:
+    parent_run_id: str | None = None,
+    iteration: int | None = None,
+) -> tuple[Any, Any, str]:
     from imu_denoise.cli.common import build_model
     from imu_denoise.config import load_config
     from imu_denoise.data.datamodule import create_dataloaders
     from imu_denoise.device import DeviceContext
+    from imu_denoise.observability import ObservabilityWriter
     from imu_denoise.training import (
         Trainer,
         build_loss,
@@ -231,27 +235,53 @@ def _run_single_experiment(
     )
 
     config = load_config(*config_paths, overrides=overrides)
+    observability = ObservabilityWriter.from_experiment_config(config)
+    run_id = observability.start_run(
+        name=config.name,
+        phase="training",
+        dataset=config.data.dataset,
+        model=config.model.name,
+        device=config.device.preferred,
+        parent_run_id=parent_run_id,
+        iteration=iteration,
+        config=config,
+        overrides=overrides,
+        objective_metric=metric_key,
+        objective_direction="minimize",
+        source="runtime",
+    )
     seed_everything(config.training.seed)
     device_ctx = DeviceContext.from_config(config.device)
     model = build_model(config)
-
-    train_loader, val_loader, test_loader = create_dataloaders(
-        config.data,
-        config.training,
-        device_ctx,
-    )
-    optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
-    trainer = Trainer(
-        model=model,
-        config=config,
-        device_ctx=device_ctx,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        loss_fn=build_loss(config.training.loss),
-    )
-    summary = trainer.fit(train_loader, val_loader, test_loader)
-    _metric_from_summary(summary, metric_key)
-    return config, summary
+    try:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            config.data,
+            config.training,
+            device_ctx,
+        )
+        optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+        trainer = Trainer(
+            model=model,
+            config=config,
+            device_ctx=device_ctx,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loss_fn=build_loss(config.training.loss),
+            observability=observability,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+        )
+        summary = trainer.fit(train_loader, val_loader, test_loader)
+        _metric_from_summary(summary, metric_key)
+        return config, summary, run_id
+    except Exception as exc:
+        observability.finish_run(
+            run_id=run_id,
+            status="failed",
+            summary={"message": str(exc)},
+            source="runtime",
+        )
+        raise
 
 
 def run_autoresearch(
@@ -263,9 +293,23 @@ def run_autoresearch(
     """Run the baseline plus config mutations and record results to TSV."""
     from autoresearch_loop.mutations import build_mutation_schedule
     from imu_denoise.config import load_config
+    from imu_denoise.observability import ObservabilityWriter, import_hermes_state
 
     base_overrides = list(base_overrides or [])
     base_config = load_config(*config_paths, overrides=base_overrides)
+    observability = ObservabilityWriter.from_experiment_config(base_config)
+    loop_run_id = observability.start_run(
+        name=f"{base_config.name}-autoresearch",
+        phase="autoresearch_loop",
+        dataset=base_config.data.dataset,
+        model=base_config.model.name,
+        device=base_config.device.preferred,
+        config=base_config,
+        overrides=base_overrides,
+        objective_metric=base_config.autoresearch.metric_key,
+        objective_direction=base_config.autoresearch.metric_direction,
+        source="runtime",
+    )
     total_iterations = (
         max_iterations if max_iterations is not None else base_config.autoresearch.max_iterations
     )
@@ -279,7 +323,7 @@ def run_autoresearch(
     hermes_used_descriptions: set[str] = set()
 
     for iteration, fallback_proposal in enumerate(schedule):
-        proposal, proposal_source = _select_mutation_proposal(
+        proposal, proposal_source, hermes_trace, candidate_pool = _select_mutation_proposal(
             iteration=iteration,
             base_config=base_config,
             rng=rng,
@@ -287,18 +331,66 @@ def run_autoresearch(
             fallback_proposal=fallback_proposal,
             hermes_used_descriptions=hermes_used_descriptions,
         )
+        observability.update_status(
+            run_id=loop_run_id,
+            phase="autoresearch_loop",
+            epoch=iteration,
+            best_metric=best_metric,
+            last_metric=results[-1].metric_value if results else None,
+            message=f"iteration {iteration}",
+            source="runtime",
+        )
+        llm_call_id: str | None = None
+        if hermes_trace is not None:
+            llm_call_id = observability.record_llm_call(
+                run_id=loop_run_id,
+                provider=base_config.autoresearch.hermes.provider,
+                model=base_config.autoresearch.hermes.model,
+                base_url=base_config.autoresearch.hermes.base_url,
+                status=hermes_trace.status,
+                latency_ms=hermes_trace.latency_ms,
+                prompt=hermes_trace.prompt,
+                response=hermes_trace.stdout,
+                stdout_text=hermes_trace.stdout,
+                stderr_text=hermes_trace.stderr,
+                parsed_payload=hermes_trace.parsed_payload,
+                command=hermes_trace.command,
+                session_id=hermes_trace.session_id,
+                reason=hermes_trace.reason,
+                source="runtime",
+            )
+            if base_config.observability.import_hermes_state:
+                import_hermes_state(
+                    writer=observability,
+                    hermes_home=Path(base_config.autoresearch.hermes.home_dir),
+                )
         run_overrides = _build_run_overrides(
             iteration=iteration,
             proposal=proposal,
             base_overrides=base_overrides,
             base_config=base_config,
         )
+        observability.append_event(
+            run_id=loop_run_id,
+            event_type="candidate_generation",
+            level="INFO",
+            title=f"iteration {iteration} proposal selected",
+            payload={
+                "proposal_source": proposal_source,
+                "description": proposal.description,
+                "overrides": run_overrides,
+                "candidate_count": len(candidate_pool) if candidate_pool is not None else 0,
+            },
+            source="runtime",
+        )
 
         try:
-            config, summary = _run_single_experiment(
+            config, summary, experiment_run_id = _run_single_experiment(
                 config_paths=config_paths,
                 overrides=run_overrides,
                 metric_key=base_config.autoresearch.metric_key,
+                parent_run_id=loop_run_id,
+                iteration=iteration,
             )
             metric_value = _metric_from_summary(summary, base_config.autoresearch.metric_key)
             if iteration == 0:
@@ -326,6 +418,30 @@ def run_autoresearch(
                 overrides=run_overrides,
                 metrics_path=summary.artifacts.metrics_path,
             )
+            observability.record_decision(
+                run_id=experiment_run_id,
+                iteration=iteration,
+                proposal_source=proposal_source,
+                description=proposal.description,
+                status=status,
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=metric_value,
+                overrides=run_overrides,
+                candidates=(
+                    [
+                        {
+                            "description": candidate.description,
+                            "overrides": candidate.overrides,
+                        }
+                        for candidate in candidate_pool
+                    ]
+                    if candidate_pool is not None
+                    else None
+                ),
+                reason=hermes_trace.reason if hermes_trace is not None else None,
+                llm_call_id=llm_call_id,
+                source="runtime",
+            )
         except Exception as exc:
             result = LoopResult(
                 iteration=iteration,
@@ -339,10 +455,47 @@ def run_autoresearch(
                 overrides=run_overrides,
                 metrics_path=None,
             )
+            observability.record_decision(
+                run_id=loop_run_id,
+                iteration=iteration,
+                proposal_source=proposal_source,
+                description=proposal.description,
+                status="crash",
+                metric_key=base_config.autoresearch.metric_key,
+                metric_value=None,
+                overrides=run_overrides,
+                candidates=(
+                    [
+                        {
+                            "description": candidate.description,
+                            "overrides": candidate.overrides,
+                        }
+                        for candidate in candidate_pool
+                    ]
+                    if candidate_pool is not None
+                    else None
+                ),
+                reason=str(exc),
+                llm_call_id=llm_call_id,
+                source="runtime",
+            )
 
         _append_result(results_file, result)
+        observability.register_artifact(
+            run_id=loop_run_id,
+            path=results_file,
+            artifact_type="autoresearch_results",
+            label="results_tsv",
+            source="runtime",
+        )
         results.append(result)
 
+    observability.finish_run(
+        run_id=loop_run_id,
+        status="completed",
+        summary={"message": f"completed {len(results)} iterations"},
+        source="runtime",
+    )
     return results
 
 

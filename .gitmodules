@@ -1,0 +1,18 @@
+[submodule "vendor/AutoResearchClaw"]
+	path = vendor/AutoResearchClaw
+	url = https://github.com/paolo-moldovan/AutoResearchClaw.git
+[submodule "vendor/Blackbird-Dataset"]
+	path = vendor/Blackbird-Dataset
+	url = https://github.com/paolo-moldovan/Blackbird-Dataset.git
+[submodule "vendor/autoresearch"]
+	path = vendor/autoresearch
+	url = https://github.com/paolo-moldovan/autoresearch.git
+[submodule "vendor/dataset_tools"]
+	path = vendor/dataset_tools
+	url = https://github.com/paolo-moldovan/dataset_tools.git
+[submodule "vendor/hermes-agent"]
+	path = vendor/hermes-agent
+	url = https://github.com/paolo-moldovan/hermes-agent.git
+[submodule "vendor/llama.cpp"]
+	path = vendor/llama.cpp
+	url = https://github.com/paolo-moldovan/llama.cpp.git

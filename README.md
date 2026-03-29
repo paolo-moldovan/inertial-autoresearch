@@ -16,6 +16,7 @@ The repo now includes:
 - Hermes-driven autoresearch orchestration via local Ollama (`qwen3.5`)
 - model zoo with LSTM, Conv1D, and Transformer baselines
 - classical baselines with Kalman and complementary smoothing
+- mission-control observability with SQLite-backed traces, backfill, TUI, and dashboard
 - package-backed CLI entrypoints, CI, and Docker assets
 - synthetic quick-run path for fast verification
 
@@ -59,6 +60,15 @@ uv run scripts/run_baseline.py \
 
 # Run one baseline + one mutation in the local autoresearch loop
 uv run autoresearch_loop/loop.py --max-iterations 1
+
+# Backfill historical logs and import Hermes sessions into mission control
+uv run scripts/observability_backfill.py
+
+# Launch the live TUI monitor
+uv run scripts/monitor.py
+
+# Launch the Streamlit dashboard
+uv run scripts/dashboard.py
 ```
 
 ## Hermes + Ollama
@@ -69,6 +79,23 @@ model. The current integration is config-first: Hermes chooses the next safe
 mutation from the bounded candidate pool, while training and evaluation still
 run through the local Python stack. If Hermes or Ollama is unavailable, the
 loop falls back to the deterministic built-in mutation schedule.
+
+## Mission Control
+
+Mission control stores a repo-local observability database under
+`artifacts/observability/` and indexes:
+
+- live run status and training epochs
+- autoresearch decisions and mutation history
+- raw Hermes/Ollama prompt and response traces
+- Hermes session imports from `.hermes/`
+- registered artifacts such as checkpoints, metrics, and figures
+
+The read-only surfaces are:
+
+- `imu-monitor` / `scripts/monitor.py`: Textual TUI for live status
+- `imu-dashboard` / `scripts/dashboard.py`: Streamlit browser dashboard
+- `imu-observability-backfill` / `scripts/observability_backfill.py`: historical import
 
 ## CI And Docker
 

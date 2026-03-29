@@ -23,6 +23,8 @@ def test_load_config_merges_project_defaults() -> None:
     assert config.data.dataset == "synthetic"
     assert config.device.preferred == "auto"
     assert config.autoresearch.hermes.model == "qwen3.5:latest"
+    assert config.observability.enabled is True
+    assert config.observability.db_path == "artifacts/observability/mission_control.db"
 
 
 def test_load_config_applies_cli_overrides() -> None:

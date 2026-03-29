@@ -8,6 +8,7 @@ from imu_denoise.config.schema import (
     ExperimentConfig,
     HermesConfig,
     ModelConfig,
+    ObservabilityConfig,
     TrainingConfig,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "ExperimentConfig",
     "HermesConfig",
     "ModelConfig",
+    "ObservabilityConfig",
     "TrainingConfig",
     "load_config",
 ]

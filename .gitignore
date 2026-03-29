@@ -209,7 +209,6 @@ __marimo__/
 # Project-specific
 data/
 artifacts/
-vendor/
 .hermes/
 autoresearch_loop/results.tsv
 *.zip
