@@ -14,6 +14,28 @@ PROFILE_TO_PROJECT = {
 }
 
 
+def _project_session_name(project_file: Path) -> str | None:
+    for line in project_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("name:"):
+            _, value = stripped.split(":", 1)
+            session_name = value.strip()
+            return session_name or None
+    return None
+
+
+def _tmux_session_exists(session_name: str) -> bool:
+    tmux_bin = shutil.which("tmux")
+    if tmux_bin is None:
+        return False
+    completed = subprocess.run(
+        [tmux_bin, "has-session", "-t", session_name],
+        check=False,
+        capture_output=True,
+    )
+    return completed.returncode == 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start the mission-control tmuxinator session.")
     parser.add_argument(
@@ -46,6 +68,11 @@ def main() -> int:
     )
     if not project_file.exists():
         raise FileNotFoundError(f"tmuxinator project file not found: {project_file}")
+
+    session_name = _project_session_name(project_file)
+    if session_name and _tmux_session_exists(session_name):
+        print(f"Mission Control session already exists: {session_name}")
+        return 1
 
     tmuxinator_bin = shutil.which("tmuxinator")
     if tmuxinator_bin is None:

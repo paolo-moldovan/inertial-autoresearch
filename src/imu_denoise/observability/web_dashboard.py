@@ -184,14 +184,18 @@ HTML = """<!doctype html>
       const loop = data.loop_state;
       const best = data.best_result;
       const statusLine = document.getElementById("status-line");
+      document.getElementById("pause-btn").disabled = !loop || loop.status !== "running";
+      document.getElementById("resume-btn").disabled = !loop || loop.status !== "paused";
+      document.getElementById("stop-btn").disabled = !loop || !["running", "paused"].includes(loop.status);
+      document.getElementById("terminate-btn").disabled = !loop || !["running", "paused", "terminating"].includes(loop.status);
       if (!loop) {
-        statusLine.textContent = "No active loop.";
+        statusLine.textContent = "No current loop.";
       } else {
         statusLine.innerHTML = `
           <span>Loop <strong>${shortId(loop.loop_run_id)}</strong> is <strong>${loop.status}</strong></span>
           <span>Iteration <strong>${loop.current_iteration}/${loop.max_iterations}</strong></span>
           <span>Best <strong>${best ? metric(best.metric_value) : "n/a"}</strong></span>
-          <span>Flags: pause=${loop.pause_requested} stop=${loop.stop_requested} terminate=${loop.terminate_requested}</span>
+          <span>Flags pause=${loop.pause_requested} stop=${loop.stop_requested} terminate=${loop.terminate_requested}</span>
         `;
       }
 
@@ -213,11 +217,8 @@ HTML = """<!doctype html>
       document.getElementById("events-body").innerHTML = data.recent_loop_events.map((row) =>
         rowHtml([row.event_type, row.title || "", shortId(row.run_id)])
       ).join("") || rowHtml(["", "<span class='muted'>no events</span>", ""]);
-    }
 
-    async function refreshDecisions() {
-      const data = await getJson("/api/decisions");
-      document.getElementById("decisions-body").innerHTML = data.map((row) =>
+      document.getElementById("decisions-body").innerHTML = (data.recent_decisions || []).map((row) =>
         rowHtml([
           row.iteration ?? "",
           row.proposal_source,
@@ -226,11 +227,8 @@ HTML = """<!doctype html>
           metric(row.metric_value),
         ])
       ).join("");
-    }
 
-    async function refreshLlm() {
-      const data = await getJson("/api/llm");
-      document.getElementById("llm-body").innerHTML = data.map((row) =>
+      document.getElementById("llm-body").innerHTML = (data.recent_llm_calls || []).map((row) =>
         rowHtml([
           shortId(row.id),
           row.model || "unknown",
@@ -289,7 +287,7 @@ HTML = """<!doctype html>
     }
 
     async function refreshAll() {
-      await Promise.all([refreshSummary(), refreshDecisions(), refreshLlm()]);
+      await refreshSummary();
       await refreshRunDetail();
       document.querySelectorAll("[data-run-id]").forEach((row) => {
         row.onclick = async () => {

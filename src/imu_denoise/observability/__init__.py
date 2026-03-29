@@ -1,7 +1,7 @@
 """Mission-control observability helpers."""
 
 from imu_denoise.observability.backfill import backfill_observability
-from imu_denoise.observability.control import LoopController
+from imu_denoise.observability.control import LoopAlreadyRunningError, LoopController
 from imu_denoise.observability.hermes_import import import_hermes_state
 from imu_denoise.observability.queries import MissionControlQueries
 from imu_denoise.observability.store import BlobStore, ObservabilityStore
@@ -16,6 +16,7 @@ from imu_denoise.observability.writer import (
 __all__ = [
     "BlobStore",
     "LoopController",
+    "LoopAlreadyRunningError",
     "MissionControlQueries",
     "ObservabilityLogHandler",
     "ObservabilityStore",

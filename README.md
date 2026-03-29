@@ -138,12 +138,18 @@ uv run scripts/start_mission_control.py
 ```
 
 That opens one tmux window in a tiled grid with panes for:
+- control
 - backfill
 - monitor
 - dashboard
 - autoresearch
 
-So you can watch everything at once instead of switching between tmux windows. If one command exits, that pane drops you into a shell instead of disappearing.
+The `control` pane is the session supervisor. In that pane you can:
+- type `1`, `2`, `3`, `4` to jump between panes
+- type `list` to show pane mappings
+- type `exit` or press `Ctrl-C` to kill the entire Mission Control session immediately
+
+So you can watch everything at once instead of switching between tmux windows.
 
 Start the EuRoC Mission Control profile:
 

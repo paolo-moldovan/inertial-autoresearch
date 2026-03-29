@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS import_state (
 );
 """
 
+ACTIVE_LOOP_HEARTBEAT_TIMEOUT_SEC = 120.0
+
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -637,6 +639,86 @@ class ObservabilityStore:
                 ),
             )
 
+    def acquire_loop_slot(
+        self,
+        *,
+        loop_run_id: str,
+        status: str,
+        current_iteration: int,
+        max_iterations: int,
+        batch_size: int | None,
+        pause_after_iteration: int | None,
+        pause_requested: bool,
+        stop_requested: bool,
+        terminate_requested: bool,
+        best_metric: float | None,
+        best_run_id: str | None,
+        active_child_run_id: str | None,
+        heartbeat_at: float,
+        updated_at: float,
+    ) -> str | None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active = conn.execute(
+                """
+                SELECT l.loop_run_id
+                FROM loop_state l
+                JOIN runs r ON r.id = l.loop_run_id
+                WHERE l.loop_run_id != ?
+                  AND l.status IN ('running', 'paused', 'terminating')
+                  AND l.heartbeat_at >= ?
+                  AND r.status = 'running'
+                ORDER BY l.heartbeat_at DESC, l.updated_at DESC
+                LIMIT 1
+                """,
+                (loop_run_id, _now_ts() - ACTIVE_LOOP_HEARTBEAT_TIMEOUT_SEC),
+            ).fetchone()
+            if active is not None:
+                conn.rollback()
+                return str(active["loop_run_id"])
+            conn.execute(
+                """
+                INSERT INTO loop_state (
+                    loop_run_id, status, current_iteration, max_iterations, batch_size,
+                    pause_after_iteration, pause_requested, stop_requested, terminate_requested,
+                    best_metric, best_run_id, active_child_run_id, heartbeat_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(loop_run_id) DO UPDATE SET
+                    status=excluded.status,
+                    current_iteration=excluded.current_iteration,
+                    max_iterations=excluded.max_iterations,
+                    batch_size=excluded.batch_size,
+                    pause_after_iteration=excluded.pause_after_iteration,
+                    pause_requested=excluded.pause_requested,
+                    stop_requested=excluded.stop_requested,
+                    terminate_requested=excluded.terminate_requested,
+                    best_metric=excluded.best_metric,
+                    best_run_id=excluded.best_run_id,
+                    active_child_run_id=excluded.active_child_run_id,
+                    heartbeat_at=excluded.heartbeat_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    loop_run_id,
+                    status,
+                    current_iteration,
+                    max_iterations,
+                    batch_size,
+                    pause_after_iteration,
+                    1 if pause_requested else 0,
+                    1 if stop_requested else 0,
+                    1 if terminate_requested else 0,
+                    best_metric,
+                    best_run_id,
+                    active_child_run_id,
+                    heartbeat_at,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+        return None
+
     def update_loop_state(
         self,
         *,
@@ -658,9 +740,24 @@ class ObservabilityStore:
     def fetch_active_loop_state(self) -> dict[str, Any] | None:
         return self.fetch_one(
             """
+            SELECT l.*
+            FROM loop_state l
+            WHERE status IN ('running', 'paused', 'terminating')
+              AND heartbeat_at >= ?
+              AND loop_run_id IN (
+                  SELECT id FROM runs WHERE status = 'running'
+              )
+            ORDER BY heartbeat_at DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (_now_ts() - ACTIVE_LOOP_HEARTBEAT_TIMEOUT_SEC,),
+        )
+
+    def fetch_latest_loop_state(self) -> dict[str, Any] | None:
+        return self.fetch_one(
+            """
             SELECT *
             FROM loop_state
-            WHERE status IN ('running', 'paused', 'terminating')
             ORDER BY updated_at DESC
             LIMIT 1
             """

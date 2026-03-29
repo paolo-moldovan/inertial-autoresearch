@@ -9,7 +9,12 @@ from typing import Any
 
 from autoresearch_loop.loop import run_autoresearch
 from imu_denoise.cli.common import add_common_config_arguments, resolve_config
-from imu_denoise.observability import LoopController, MissionControlQueries, ObservabilityWriter
+from imu_denoise.observability import (
+    LoopAlreadyRunningError,
+    LoopController,
+    MissionControlQueries,
+    ObservabilityWriter,
+)
 
 
 def add_loop_arguments(parser: argparse.ArgumentParser) -> None:
@@ -53,13 +58,20 @@ def run_loop_command(args: Any) -> int:
         )
         return 0
 
-    results = run_autoresearch(
-        config_paths=list(args.config),
-        base_overrides=list(args.overrides),
-        max_iterations=args.max_iterations,
-        batch_size=args.batch or None,
-        pause_enabled=bool(args.pause),
-    )
+    try:
+        results = run_autoresearch(
+            config_paths=list(args.config),
+            base_overrides=list(args.overrides),
+            max_iterations=args.max_iterations,
+            batch_size=args.batch or None,
+            pause_enabled=bool(args.pause),
+        )
+    except LoopAlreadyRunningError as exc:
+        print(
+            "Another loop is already active. "
+            f"Blocking loop: {exc.blocking_loop_run_id[:8]}"
+        )
+        return 1
     print(f"Completed {len(results)} autoresearch runs.")
     return 0
 

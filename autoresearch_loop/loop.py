@@ -402,7 +402,12 @@ def run_autoresearch(
     """Run the baseline plus config mutations and record results to TSV."""
     from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
     from imu_denoise.cli.common import resolve_config
-    from imu_denoise.observability import LoopController, ObservabilityWriter, import_hermes_state
+    from imu_denoise.observability import (
+        LoopAlreadyRunningError,
+        LoopController,
+        ObservabilityWriter,
+        import_hermes_state,
+    )
     from imu_denoise.observability.control import LOOP_PAUSED
     from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
@@ -453,15 +458,24 @@ def run_autoresearch(
     hermes_used_descriptions: set[str] = {
         result.description for result in results if result.proposal_source == "hermes"
     }
-    loop_controller.initialize_loop(
-        loop_run_id=loop_run_id,
-        max_iterations=total_scheduled_runs,
-        batch_size=requested_batch_size,
-        pause_enabled=pause_enabled,
-        current_iteration=len(results),
-        best_metric=best_metric,
-        best_run_id=best_run_id,
-    )
+    try:
+        loop_controller.initialize_loop(
+            loop_run_id=loop_run_id,
+            max_iterations=total_scheduled_runs,
+            batch_size=requested_batch_size,
+            pause_enabled=pause_enabled,
+            current_iteration=len(results),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+        )
+    except LoopAlreadyRunningError:
+        observability.finish_run(
+            run_id=loop_run_id,
+            status="failed",
+            summary={"message": "another loop is already active"},
+            source="runtime",
+        )
+        raise
 
     for iteration, fallback_proposal in enumerate(schedule[len(results) :], start=len(results)):
         loop_state = loop_controller.get_loop_state(loop_run_id)

@@ -80,6 +80,8 @@ class MissionControlQueries:
         if row is None:
             return None
         row["pause_requested"] = bool(row.get("pause_requested"))
+        row["stop_requested"] = bool(row.get("stop_requested"))
+        row["terminate_requested"] = bool(row.get("terminate_requested"))
         return row
 
     def get_active_loop_state(self) -> dict[str, Any] | None:
@@ -101,6 +103,31 @@ class MissionControlQueries:
             return None
         row["pause_requested"] = bool(row.get("pause_requested"))
         return row
+
+    def get_latest_loop_state(self) -> dict[str, Any] | None:
+        row = self.store.fetch_latest_loop_state()
+        if row is None:
+            return None
+        loop_run_id = str(row["loop_run_id"])
+        run = self.store.fetch_one(
+            "SELECT name AS loop_name, dataset, model, status AS run_status FROM runs WHERE id = ?",
+            (loop_run_id,),
+        )
+        if run is not None:
+            row["loop_name"] = run.get("loop_name")
+            row["dataset"] = run.get("dataset")
+            row["model"] = run.get("model")
+            row["run_status"] = run.get("run_status")
+        row["pause_requested"] = bool(row.get("pause_requested"))
+        row["stop_requested"] = bool(row.get("stop_requested"))
+        row["terminate_requested"] = bool(row.get("terminate_requested"))
+        return row
+
+    def get_current_loop_state(self) -> dict[str, Any] | None:
+        active = self.get_active_loop_state()
+        if active is not None:
+            return active
+        return self.get_latest_loop_state()
 
     def list_active_runs(self) -> list[dict[str, Any]]:
         return self.store.fetch_all(
@@ -294,9 +321,21 @@ class MissionControlQueries:
             row["summary"] = _loads(row.pop("summary_json"))
         return rows
 
-    def list_recent_decisions(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_recent_decisions(
+        self,
+        *,
+        limit: int = 50,
+        loop_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_clause = ""
+        params: list[Any] = []
+        if loop_run_id is not None:
+            where_clause = (
+                "WHERE (r.parent_run_id = ? OR d.run_id = ?)"
+            )
+            params.extend([loop_run_id, loop_run_id])
         rows = self.store.fetch_all(
-            """
+            f"""
             SELECT
                 d.id,
                 d.run_id,
@@ -315,19 +354,30 @@ class MissionControlQueries:
                 d.source
             FROM decisions d
             LEFT JOIN runs r ON r.id = d.run_id
+            {where_clause}
             ORDER BY d.created_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (*params, limit),
         )
         for row in rows:
             row["overrides"] = _loads(row.pop("overrides_json"))
             row["candidates"] = _loads(row.pop("candidates_json"))
         return rows
 
-    def list_recent_llm_calls(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_recent_llm_calls(
+        self,
+        *,
+        limit: int = 50,
+        loop_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_clause = ""
+        params: list[Any] = []
+        if loop_run_id is not None:
+            where_clause = "WHERE (l.run_id = ? OR r.parent_run_id = ?)"
+            params.extend([loop_run_id, loop_run_id])
         rows = self.store.fetch_all(
-            """
+            f"""
             SELECT
                 l.id,
                 l.run_id,
@@ -348,10 +398,11 @@ class MissionControlQueries:
                 l.source
             FROM llm_calls l
             LEFT JOIN runs r ON r.id = l.run_id
+            {where_clause}
             ORDER BY l.created_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (*params, limit),
         )
         for row in rows:
             row["parsed_payload"] = _loads(row.pop("parsed_payload_json"))
@@ -497,21 +548,38 @@ class MissionControlQueries:
         return parsed
 
     def get_mission_control_summary(self, *, limit: int = 10) -> dict[str, Any]:
-        loop_state = self.get_active_loop_state()
+        loop_state = self.get_current_loop_state()
         leaderboard = self.list_leaderboard(limit=limit)
         best_result = leaderboard[0] if leaderboard else None
         progress = []
         queued: list[dict[str, Any]] = []
+        recent_decisions = self.list_recent_decisions(limit=20)
+        recent_llm_calls = self.list_recent_llm_calls(limit=20)
+        recent_loop_events = self.list_recent_loop_events(limit=20)
         if loop_state is not None:
             progress = self.list_loop_iteration_metrics(str(loop_state["loop_run_id"]))
             queued = self.list_queued_proposals(str(loop_state["loop_run_id"]))
+            recent_decisions = self.list_recent_decisions(
+                limit=20,
+                loop_run_id=str(loop_state["loop_run_id"]),
+            )
+            recent_llm_calls = self.list_recent_llm_calls(
+                limit=20,
+                loop_run_id=str(loop_state["loop_run_id"]),
+            )
+            recent_loop_events = self.list_recent_loop_events(
+                limit=20,
+                loop_run_id=str(loop_state["loop_run_id"]),
+            )
         return {
             "loop_state": loop_state,
             "best_result": best_result,
             "leaderboard": leaderboard,
             "progress": progress,
             "queued_proposals": queued,
-            "recent_loop_events": self.list_recent_loop_events(limit=20),
+            "recent_loop_events": recent_loop_events,
+            "recent_decisions": recent_decisions,
+            "recent_llm_calls": recent_llm_calls,
         }
 
     def list_artifacts(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -709,30 +777,40 @@ class MissionControlQueries:
             row["overrides"] = _loads(row.pop("overrides_json"))
         return rows
 
-    def list_recent_loop_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_recent_loop_events(
+        self,
+        *,
+        limit: int = 50,
+        loop_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [
+            LOOP_PAUSED,
+            LOOP_RESUMED,
+            LOOP_STOP_REQUESTED,
+            LOOP_TERMINATE_REQUESTED,
+            LOOP_STOPPED,
+            LOOP_TERMINATED,
+            QUEUE_ENQUEUED,
+            QUEUE_CLAIMED,
+            QUEUE_APPLIED,
+        ]
+        where_suffix = ""
+        if loop_run_id is not None:
+            where_suffix = " AND e.run_id = ?"
+            params.append(loop_run_id)
         rows = self.store.fetch_all(
-            """
+            f"""
             SELECT
                 e.*,
                 r.name AS run_name
             FROM events e
             LEFT JOIN runs r ON r.id = e.run_id
             WHERE e.event_type IN (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            {where_suffix}
             ORDER BY e.created_at DESC
             LIMIT ?
             """,
-            (
-                LOOP_PAUSED,
-                LOOP_RESUMED,
-                LOOP_STOP_REQUESTED,
-                LOOP_TERMINATE_REQUESTED,
-                LOOP_STOPPED,
-                LOOP_TERMINATED,
-                QUEUE_ENQUEUED,
-                QUEUE_CLAIMED,
-                QUEUE_APPLIED,
-                limit,
-            ),
+            (*params, limit),
         )
         for row in rows:
             row["payload"] = _loads(row.pop("payload_json"))

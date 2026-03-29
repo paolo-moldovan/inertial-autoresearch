@@ -21,6 +21,14 @@ QUEUE_APPLIED = "queue_applied"
 QUEUE_ENQUEUED = "queue_enqueued"
 
 
+class LoopAlreadyRunningError(RuntimeError):
+    """Raised when a second loop tries to acquire the singleton control plane."""
+
+    def __init__(self, blocking_loop_run_id: str) -> None:
+        super().__init__(f"Another loop is already active: {blocking_loop_run_id}")
+        self.blocking_loop_run_id = blocking_loop_run_id
+
+
 def _now_ts() -> float:
     return time.time()
 
@@ -73,7 +81,7 @@ class LoopController:
         pause_after_iteration = None
         if pause_enabled and batch_size is not None:
             pause_after_iteration = current_iteration + batch_size
-        self.store.upsert_loop_state(
+        blocking_loop_run_id = self.store.acquire_loop_slot(
             loop_run_id=loop_run_id,
             status="running",
             current_iteration=current_iteration,
@@ -89,6 +97,8 @@ class LoopController:
             heartbeat_at=_now_ts(),
             updated_at=_now_ts(),
         )
+        if blocking_loop_run_id is not None:
+            raise LoopAlreadyRunningError(blocking_loop_run_id)
 
     def heartbeat(
         self,

@@ -224,6 +224,7 @@ class Trainer:
                     best_metric=best_val_rmse if best_val_rmse != float("inf") else None,
                     source="runtime",
                 )
+                self._heartbeat_parent_loop(best_metric=best_val_rmse)
 
                 if self.config.training.time_budget_sec > 0:
                     elapsed = time.perf_counter() - start_time
@@ -384,6 +385,42 @@ class Trainer:
             return
         if bool(loop_state.get("terminate_requested")):
             raise TrainingInterrupted("terminated", "Training terminated by control-plane request.")
+
+    def _heartbeat_parent_loop(self, *, best_metric: float) -> None:
+        if self.parent_run_id is None or self.observability.store is None:
+            return
+        from imu_denoise.observability.control import LoopController
+
+        controller = LoopController(store=self.observability.store, writer=self.observability)
+        loop_state = controller.get_loop_state(self.parent_run_id)
+        if loop_state is None:
+            return
+        controller.heartbeat(
+            loop_run_id=self.parent_run_id,
+            current_iteration=int(loop_state["current_iteration"]),
+            max_iterations=int(loop_state["max_iterations"]),
+            batch_size=(
+                int(loop_state["batch_size"])
+                if isinstance(loop_state.get("batch_size"), int)
+                else None
+            ),
+            pause_after_iteration=(
+                int(loop_state["pause_after_iteration"])
+                if isinstance(loop_state.get("pause_after_iteration"), int)
+                else None
+            ),
+            pause_requested=bool(loop_state.get("pause_requested")),
+            stop_requested=bool(loop_state.get("stop_requested")),
+            terminate_requested=bool(loop_state.get("terminate_requested")),
+            best_metric=best_metric if best_metric != float("inf") else None,
+            best_run_id=(
+                str(loop_state["best_run_id"])
+                if loop_state.get("best_run_id") is not None
+                else None
+            ),
+            active_child_run_id=self.run_id,
+            status=str(loop_state.get("status") or "running"),
+        )
 
     def _sampling_rate_hz(self) -> float:
         if self.config.data.dataset == "blackbird":

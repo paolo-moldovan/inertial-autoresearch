@@ -16,7 +16,12 @@ from imu_denoise.cli import imu
 from imu_denoise.cli.common import resolve_config
 from imu_denoise.models import get_model, list_models
 from imu_denoise.models import registry as model_registry
-from imu_denoise.observability import LoopController, MissionControlQueries, ObservabilityWriter
+from imu_denoise.observability import (
+    LoopAlreadyRunningError,
+    LoopController,
+    MissionControlQueries,
+    ObservabilityWriter,
+)
 
 
 def _run_imu_command(argv: list[str]) -> int:
@@ -357,3 +362,55 @@ def test_terminate_request_interrupts_active_training_run(tmp_path: Path) -> Non
     final_status = queries.get_loop_status()
     assert final_status is not None
     assert final_status["status"] == "terminated"
+
+
+def test_singleton_loop_guard_rejects_second_live_loop(tmp_path: Path) -> None:
+    """Only one live loop should be able to acquire the Mission Control control plane."""
+    config = resolve_config(
+        ["configs/training/quick.yaml"],
+        _small_runtime_overrides(tmp_path),
+    )
+    writer = ObservabilityWriter.from_experiment_config(config)
+    controller = LoopController.from_experiment_config(config, writer=writer)
+
+    loop_one = writer.start_run(
+        name="loop-one",
+        phase="autoresearch_loop",
+        dataset=config.data.dataset,
+        model=config.model.name,
+        device=config.device.preferred,
+        config=config,
+        overrides=[],
+        objective_metric=config.autoresearch.metric_key,
+        objective_direction=config.autoresearch.metric_direction,
+        source="runtime",
+    )
+    controller.initialize_loop(
+        loop_run_id=loop_one,
+        max_iterations=4,
+        batch_size=None,
+        pause_enabled=False,
+        current_iteration=0,
+    )
+
+    loop_two = writer.start_run(
+        name="loop-two",
+        phase="autoresearch_loop",
+        dataset=config.data.dataset,
+        model=config.model.name,
+        device=config.device.preferred,
+        config=config,
+        overrides=[],
+        objective_metric=config.autoresearch.metric_key,
+        objective_direction=config.autoresearch.metric_direction,
+        source="runtime",
+    )
+
+    with pytest.raises(LoopAlreadyRunningError):
+        controller.initialize_loop(
+            loop_run_id=loop_two,
+            max_iterations=4,
+            batch_size=None,
+            pause_enabled=False,
+            current_iteration=0,
+        )

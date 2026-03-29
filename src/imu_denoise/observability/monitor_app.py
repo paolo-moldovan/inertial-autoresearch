@@ -144,7 +144,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
 
             decisions_widget = self.query_one("#recent_decisions", DataTable)
             decisions_widget.clear()
-            self._decision_rows = queries.list_recent_decisions(limit=12)
+            self._decision_rows = list(summary.get("recent_decisions") or [])
             for row in self._decision_rows:
                 decisions_widget.add_row(
                     str(row.get("iteration") or ""),

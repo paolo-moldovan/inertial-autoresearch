@@ -8,7 +8,8 @@ windows:
   - mission-control:
       layout: tiled
       panes:
-        - uv run scripts/observability_backfill.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
-        - uv run scripts/monitor.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
-        - uv run scripts/dashboard.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
-        - uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+        - tmux select-pane -T control; /bin/bash scripts/mission_control_supervisor.sh
+        - tmux select-pane -T backfill; uv run scripts/observability_backfill.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+        - tmux select-pane -T monitor; uv run scripts/monitor.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+        - tmux select-pane -T dashboard; uv run scripts/dashboard.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+        - tmux select-pane -T autoresearch; uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
