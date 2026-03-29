@@ -9,15 +9,18 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+# NDArray alias that avoids the np.floating[Any] parameterisation issue
+_FloatArray = NDArray[np.float64]
 
-def _ensure_batch(q: NDArray[np.floating]) -> tuple[NDArray[np.floating], bool]:
+
+def _ensure_batch(q: np.ndarray) -> tuple[np.ndarray, bool]:
     """Promote a single quaternion to a batch of one. Returns (q, was_single)."""
     if q.ndim == 1:
         return q[np.newaxis, :], True
     return q, False
 
 
-def quat_multiply(q1: NDArray[np.floating], q2: NDArray[np.floating]) -> NDArray[np.floating]:
+def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Hamilton product of two quaternions (scalar-first convention).
 
     Args:
@@ -45,11 +48,11 @@ def quat_multiply(q1: NDArray[np.floating], q2: NDArray[np.floating]) -> NDArray
     )
 
     if single1 and single2:
-        return result[0]
+        return np.asarray(result[0])
     return result
 
 
-def quat_conjugate(q: NDArray[np.floating]) -> NDArray[np.floating]:
+def quat_conjugate(q: np.ndarray) -> np.ndarray:
     """Compute the conjugate of a quaternion (negate the vector part).
 
     Args:
@@ -66,7 +69,7 @@ def quat_conjugate(q: NDArray[np.floating]) -> NDArray[np.floating]:
     return conj
 
 
-def quat_to_rotation_matrix(q: NDArray[np.floating]) -> NDArray[np.floating]:
+def quat_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
     """Convert unit quaternion(s) to 3x3 rotation matrix/matrices.
 
     Args:
@@ -95,14 +98,14 @@ def quat_to_rotation_matrix(q: NDArray[np.floating]) -> NDArray[np.floating]:
     R[:, 2, 2] = 1 - 2 * (x * x + y * y)
 
     if single:
-        return R[0]
+        return np.asarray(R[0])
     return R
 
 
 def quat_to_angular_velocity(
-    q: NDArray[np.floating],
-    timestamps: NDArray[np.floating],
-) -> NDArray[np.floating]:
+    q: np.ndarray,
+    timestamps: np.ndarray,
+) -> np.ndarray:
     """Compute angular velocity in the body frame from a quaternion time series.
 
     Uses numerical differentiation (central differences where possible) and the
@@ -151,9 +154,9 @@ def quat_to_angular_velocity(
 
 
 def rotate_vector(
-    q: NDArray[np.floating],
-    v: NDArray[np.floating],
-) -> NDArray[np.floating]:
+    q: np.ndarray,
+    v: np.ndarray,
+) -> np.ndarray:
     """Rotate vector(s) by quaternion(s) using the sandwich product ``q * v * q_conj``.
 
     Args:
@@ -180,5 +183,5 @@ def rotate_vector(
 
     result = rotated[:, 1:]
     if single_q and single_v:
-        return result[0]
+        return np.asarray(result[0])
     return result

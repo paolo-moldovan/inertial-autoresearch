@@ -10,17 +10,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from numpy.typing import NDArray
 
 # Axis labels for 6-channel IMU data (accel x/y/z, gyro x/y/z)
 _IMU_AXIS_LABELS = ["Accel X", "Accel Y", "Accel Z", "Gyro X", "Gyro Y", "Gyro Z"]
 
 
 def plot_denoising_comparison(
-    noisy: NDArray[np.floating],
-    denoised: NDArray[np.floating],
-    clean: NDArray[np.floating],
-    timestamps: NDArray[np.floating],
+    noisy: np.ndarray,
+    denoised: np.ndarray,
+    clean: np.ndarray,
+    timestamps: np.ndarray,
     title: str = "Denoising Comparison",
     save_path: Path | str | None = None,
 ) -> Figure:
@@ -38,8 +37,10 @@ def plot_denoising_comparison(
         The matplotlib Figure object.
     """
     n_axes = noisy.shape[1]
-    fig, axes = plt.subplots(n_axes, 1, figsize=(14, 2.5 * n_axes), sharex=True)
-    axes_list = [cast(Axes, axes)] if n_axes == 1 else [cast(Axes, ax) for ax in np.ravel(axes)]
+    fig: Figure
+    raw_axes: Any
+    fig, raw_axes = plt.subplots(n_axes, 1, figsize=(14, 2.5 * n_axes), sharex=True)
+    axes_list: list[Axes] = [raw_axes] if n_axes == 1 else list(raw_axes)
 
     for i, ax in enumerate(axes_list):
         label = _IMU_AXIS_LABELS[i] if i < len(_IMU_AXIS_LABELS) else f"Axis {i}"
@@ -66,11 +67,11 @@ def plot_denoising_comparison(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return cast(Figure, fig)
+    return fig
 
 
 def plot_psd(
-    signals: dict[str, NDArray[np.floating]],
+    signals: dict[str, np.ndarray],
     fs: float,
     title: str = "Power Spectral Density",
     save_path: Path | str | None = None,
@@ -87,6 +88,8 @@ def plot_psd(
     Returns:
         The matplotlib Figure object.
     """
+    fig: Figure
+    ax: Any
     fig, ax = plt.subplots(figsize=(10, 5))
 
     for label, sig in signals.items():
@@ -109,11 +112,11 @@ def plot_psd(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return cast(Figure, fig)
+    return fig
 
 
 def plot_error_distribution(
-    errors: NDArray[np.floating],
+    errors: np.ndarray,
     title: str = "Error Distribution",
     save_path: Path | str | None = None,
 ) -> Figure:
@@ -130,8 +133,10 @@ def plot_error_distribution(
     n_axes = errors.shape[1]
     cols = min(n_axes, 3)
     rows = (n_axes + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
-    axes_flat: list[Axes] = [cast(Axes, ax) for ax in np.ravel(np.asarray(axes, dtype=object))]
+    fig: Figure
+    raw_all: Any
+    fig, raw_all = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
+    axes_flat: list[Axes] = [cast(Axes, ax) for ax in np.asarray(raw_all, dtype=object).ravel()]
 
     for i in range(n_axes):
         ax = axes_flat[i]
@@ -155,7 +160,7 @@ def plot_error_distribution(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return cast(Figure, fig)
+    return fig
 
 
 def plot_training_curves(
@@ -184,7 +189,7 @@ def plot_training_curves(
             line = line.strip()
             if not line:
                 continue
-            record = cast(dict[str, Any], json.loads(line))
+            record: dict[str, Any] = json.loads(line)
             if "epoch" not in record or "train_loss" not in record:
                 continue
             epochs.append(record["epoch"])
@@ -192,15 +197,17 @@ def plot_training_curves(
             if "val_loss" in record:
                 val_losses.append(record["val_loss"])
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(epochs, train_losses, label="Train Loss", linewidth=1.2)
+    fig: Figure
+    ax2: Any
+    fig, ax2 = plt.subplots(figsize=(10, 5))
+    ax2.plot(epochs, train_losses, label="Train Loss", linewidth=1.2)
     if val_losses and len(val_losses) == len(epochs):
-        ax.plot(epochs, val_losses, label="Val Loss", linewidth=1.2)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.set_title("Training Curves")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+        ax2.plot(epochs, val_losses, label="Val Loss", linewidth=1.2)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Loss")
+    ax2.set_title("Training Curves")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
     fig.tight_layout()
 
     if save_path is not None:
@@ -208,4 +215,4 @@ def plot_training_curves(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    return cast(Figure, fig)
+    return fig
