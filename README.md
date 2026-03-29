@@ -1,90 +1,155 @@
 # IMU Denoising Auto-Research
 
-Autonomous research pipeline for IMU (Inertial Measurement Unit) signal denoising. Combines deep learning models with classical signal processing baselines, evaluated on EuRoC Machine Hall and MIT Blackbird datasets.
+Autonomous research pipeline for IMU denoising with deep models, classical baselines, Hermes + Ollama orchestration, and Mission Control observability.
 
-## Quick Start
+## Setup
 
-### Setup
+Base dev environment:
+
 ```bash
-git clone <repo>
-cd inertial-autoresearch
-uv sync --extra dev  # Install with dev tools
+uv sync --extra dev
 ```
 
-### Training
+With Mission Control UIs:
+
 ```bash
-# Train LSTM on EuRoC
+uv sync --extra dev --extra monitor
+```
+
+With Phase 2 observability adapters (MLflow + Phoenix):
+
+```bash
+uv sync --extra dev --extra monitor --extra monitor-adapters
+```
+
+## Core Commands
+
+Train a model:
+
+```bash
 uv run scripts/train.py --config configs/models/lstm.yaml
-
-# Quick debug run on synthetic data (2 epochs)
-uv run scripts/train.py --config configs/training/quick.yaml
-
-# Override from CLI
-uv run scripts/train.py --config configs/models/lstm.yaml --set training.lr=0.0001
 ```
 
-## Key Features
+Quick synthetic smoke run:
 
-✓ **Multi-Device Support**: CUDA, MPS (Apple Silicon), CPU with auto-detection  
-✓ **Model Zoo**: LSTM, Conv1D, Transformer denoisers with residual connections  
-✓ **Data Pipelines**: EuRoC (200Hz), Blackbird (100Hz), Synthetic IMU generators  
-✓ **Config System**: YAML-based hierarchical configuration with CLI overrides  
-✓ **Training Engine**: Time-budgeted training, callbacks, reproducibility  
-✓ **Evaluation**: RMSE, MAE, spectral divergence, visualization  
-✓ **Classical Baselines**: Kalman filter, complementary filter  
-✓ **Auto-Research**: Fast iteration loop + full 23-stage ResearchClaw pipeline  
-✓ **Tests**: 33 unit tests, linting (ruff), type checking (mypy)  
-
-## Architecture
-
+```bash
+uv run scripts/train.py --config configs/models/lstm.yaml --config configs/training/quick.yaml
 ```
-src/imu_denoise/
-├── config/       # YAML loading + frozen dataclasses
-├── device/       # CUDA/MPS/CPU abstraction
-├── data/         # Dataset registry, transforms, splits
-├── models/       # BaseDenoiser + LSTM/Conv1D/Transformer
-├── training/     # Trainer, callbacks, losses, optimizers
-├── evaluation/   # Metrics, evaluator, visualization
-├── classical/    # Kalman, complementary filter
-└── utils/        # Logging, I/O, quaternion math
+
+Evaluate a checkpoint:
+
+```bash
+uv run scripts/evaluate.py \
+  --config configs/models/lstm.yaml \
+  --config configs/training/quick.yaml \
+  --checkpoint artifacts/checkpoints/default/best.pt
+```
+
+Run a classical baseline:
+
+```bash
+uv run scripts/run_baseline.py --config configs/training/quick.yaml --baseline kalman
+```
+
+Preprocess data:
+
+```bash
+uv run scripts/preprocess_data.py
+```
+
+## AutoResearch
+
+Local Hermes + Ollama smoke run:
+
+```bash
+uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml
+```
+
+The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is `autoresearch_loop/loop.py`.
+
+## Mission Control
+
+One command to run the dashboard:
+
+```bash
+uv run --extra monitor imu-dashboard
+```
+
+That starts the Streamlit dashboard on `http://localhost:8501` by default.
+
+One command to run the live Textual monitor:
+
+```bash
+uv run --extra monitor imu-monitor
+```
+
+Backfill existing artifacts and Hermes state into Mission Control:
+
+```bash
+uv run --extra monitor imu-observability-backfill
+```
+
+Start the full tmuxinator Mission Control session:
+
+```bash
+uv run scripts/start_mission_control.py
+```
+
+That session starts:
+- backfill
+- monitor
+- dashboard
+- autoresearch
+
+## Mission Control Phase 2
+
+Enable the external adapter config:
+
+```bash
+uv run --extra monitor-adapters imu-observability-sync \
+  --config configs/mission_control/adapters.yaml \
+  --target all
+```
+
+Sync only MLflow:
+
+```bash
+uv run --extra monitor-adapters imu-observability-sync \
+  --config configs/mission_control/adapters.yaml \
+  --target mlflow
+```
+
+Sync only Phoenix:
+
+```bash
+uv run --extra monitor-adapters imu-observability-sync \
+  --config configs/mission_control/adapters.yaml \
+  --target phoenix
 ```
 
 ## Testing
 
+Focused unit tests:
+
 ```bash
-uv run -m pytest tests/unit/ -v  # 33 tests pass ✓
-uv run ruff check src/           # All checks pass ✓
-uv run mypy src/                 # Type checking
+uv run --extra dev python -m pytest tests/unit
 ```
 
-## Device Support
+Lint:
 
-Auto-detects: **CUDA > MPS > CPU**
-
-Override via config:
 ```bash
-uv run scripts/train.py --set device.preferred=cpu
+uv run --extra dev ruff check src tests scripts
 ```
 
-MPS limitations: no bfloat16, no torch.compile
+Type checking:
 
-## Auto-Research
-
-**Mode 1: Fast Loop**
 ```bash
-python autoresearch_loop/loop.py --max-iterations 50 --time-budget-sec 600
+uv run --extra dev mypy src
 ```
 
-**Mode 2: Full Pipeline**
-```bash
-uv run -m vendor.AutoResearchClaw run --config autoresearch_loop/researchclaw_config.yaml
-```
+## Notes
 
-## References
-
-- EuRoC: http://projects.asl.ethz.ch/datasets/
-- Blackbird: https://blackbird-dataset.mit.edu/
-- AutoResearchClaw: 23-stage autonomous research pipeline
-- Hermes Agent: AI agent orchestration
-
-See CLAUDE.md for detailed architecture documentation.
+- Device auto-detection is `CUDA > MPS > CPU`.
+- Override device manually with `--set device.preferred=cpu`.
+- Default Mission Control database: `artifacts/observability/mission_control.db`
+- Default Mission Control blob store: `artifacts/observability/blobs`
