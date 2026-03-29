@@ -231,6 +231,10 @@ class ObservabilityWriter:
             )
         return created_run_id
 
+    def make_run_id(self, *, name: str, phase: str) -> str:
+        """Create a stable unique run identifier without writing any records."""
+        return self._make_run_id(name=name, phase=phase)
+
     def finish_run(
         self,
         *,
@@ -391,7 +395,7 @@ class ObservabilityWriter:
         self,
         *,
         run_id: str | None,
-        iteration: int,
+        iteration: int | None,
         proposal_source: str,
         description: str,
         status: str,

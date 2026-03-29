@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fingerprint TEXT UNIQUE NOT NULL,
     run_id TEXT,
-    iteration INTEGER NOT NULL,
+    iteration INTEGER,
     proposal_source TEXT NOT NULL,
     description TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -156,6 +156,44 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS loop_state (
+    loop_run_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    current_iteration INTEGER NOT NULL,
+    max_iterations INTEGER NOT NULL,
+    batch_size INTEGER,
+    pause_after_iteration INTEGER,
+    pause_requested INTEGER NOT NULL DEFAULT 0,
+    best_metric REAL,
+    best_run_id TEXT,
+    active_child_run_id TEXT,
+    heartbeat_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (loop_run_id) REFERENCES runs(id),
+    FOREIGN KEY (best_run_id) REFERENCES runs(id),
+    FOREIGN KEY (active_child_run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_state_status ON loop_state(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS queued_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    loop_run_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    description TEXT NOT NULL,
+    overrides_json TEXT NOT NULL,
+    requested_by TEXT,
+    created_at REAL NOT NULL,
+    claimed_at REAL,
+    applied_run_id TEXT,
+    notes TEXT,
+    FOREIGN KEY (loop_run_id) REFERENCES runs(id),
+    FOREIGN KEY (applied_run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_queued_proposals_lookup
+ON queued_proposals(loop_run_id, status, created_at ASC);
+
 CREATE TABLE IF NOT EXISTS status_snapshots (
     run_id TEXT PRIMARY KEY,
     phase TEXT,
@@ -251,7 +289,57 @@ class ObservabilityStore:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
-            conn.execute("PRAGMA user_version = 1")
+            self._migrate(conn)
+            conn.execute("PRAGMA user_version = 2")
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        decision_info = conn.execute("PRAGMA table_info(decisions)").fetchall()
+        needs_decision_migration = False
+        for row in decision_info:
+            if row["name"] == "iteration" and int(row["notnull"]) == 1:
+                needs_decision_migration = True
+                break
+        if needs_decision_migration:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(
+                """
+                ALTER TABLE decisions RENAME TO decisions_old;
+
+                CREATE TABLE decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT UNIQUE NOT NULL,
+                    run_id TEXT,
+                    iteration INTEGER,
+                    proposal_source TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    metric_key TEXT NOT NULL,
+                    metric_value REAL,
+                    overrides_json TEXT NOT NULL,
+                    candidates_json TEXT,
+                    reason TEXT,
+                    llm_call_id TEXT,
+                    created_at REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES runs(id)
+                );
+
+                INSERT INTO decisions (
+                    id, fingerprint, run_id, iteration, proposal_source, description,
+                    status, metric_key, metric_value, overrides_json, candidates_json,
+                    reason, llm_call_id, created_at, source
+                )
+                SELECT
+                    id, fingerprint, run_id, iteration, proposal_source, description,
+                    status, metric_key, metric_value, overrides_json, candidates_json,
+                    reason, llm_call_id, created_at, source
+                FROM decisions_old;
+
+                DROP TABLE decisions_old;
+                CREATE INDEX IF NOT EXISTS idx_decisions_run ON decisions(run_id, created_at DESC);
+                """
+            )
+            conn.execute("PRAGMA foreign_keys=ON")
 
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -417,7 +505,7 @@ class ObservabilityStore:
         *,
         fingerprint: str | None,
         run_id: str | None,
-        iteration: int,
+        iteration: int | None,
         proposal_source: str,
         description: str,
         status: str,
@@ -468,6 +556,198 @@ class ObservabilityStore:
                     source,
                 ),
             )
+
+    def upsert_loop_state(
+        self,
+        *,
+        loop_run_id: str,
+        status: str,
+        current_iteration: int,
+        max_iterations: int,
+        batch_size: int | None,
+        pause_after_iteration: int | None,
+        pause_requested: bool,
+        best_metric: float | None,
+        best_run_id: str | None,
+        active_child_run_id: str | None,
+        heartbeat_at: float,
+        updated_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO loop_state (
+                    loop_run_id, status, current_iteration, max_iterations, batch_size,
+                    pause_after_iteration, pause_requested, best_metric, best_run_id,
+                    active_child_run_id, heartbeat_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(loop_run_id) DO UPDATE SET
+                    status=excluded.status,
+                    current_iteration=excluded.current_iteration,
+                    max_iterations=excluded.max_iterations,
+                    batch_size=excluded.batch_size,
+                    pause_after_iteration=excluded.pause_after_iteration,
+                    pause_requested=excluded.pause_requested,
+                    best_metric=excluded.best_metric,
+                    best_run_id=excluded.best_run_id,
+                    active_child_run_id=excluded.active_child_run_id,
+                    heartbeat_at=excluded.heartbeat_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    loop_run_id,
+                    status,
+                    current_iteration,
+                    max_iterations,
+                    batch_size,
+                    pause_after_iteration,
+                    1 if pause_requested else 0,
+                    best_metric,
+                    best_run_id,
+                    active_child_run_id,
+                    heartbeat_at,
+                    updated_at,
+                ),
+            )
+
+    def update_loop_state(
+        self,
+        *,
+        loop_run_id: str,
+        values: dict[str, Any],
+    ) -> None:
+        if not values:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE loop_state SET {assignments}, updated_at = ? WHERE loop_run_id = ?",
+                (*values.values(), _now_ts(), loop_run_id),
+            )
+
+    def fetch_loop_state(self, loop_run_id: str) -> dict[str, Any] | None:
+        return self.fetch_one("SELECT * FROM loop_state WHERE loop_run_id = ?", (loop_run_id,))
+
+    def fetch_active_loop_state(self) -> dict[str, Any] | None:
+        return self.fetch_one(
+            """
+            SELECT *
+            FROM loop_state
+            WHERE status IN ('running', 'paused')
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        )
+
+    def insert_queued_proposal(
+        self,
+        *,
+        loop_run_id: str,
+        status: str,
+        description: str,
+        overrides: list[str],
+        requested_by: str | None,
+        created_at: float,
+        claimed_at: float | None,
+        applied_run_id: str | None,
+        notes: str | None,
+    ) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO queued_proposals (
+                    loop_run_id, status, description, overrides_json, requested_by,
+                    created_at, claimed_at, applied_run_id, notes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    loop_run_id,
+                    status,
+                    description,
+                    _json_dumps(overrides),
+                    requested_by,
+                    created_at,
+                    claimed_at,
+                    applied_run_id,
+                    notes,
+                ),
+            )
+        row_id = cursor.lastrowid
+        if row_id is None:
+            raise RuntimeError("Failed to insert queued proposal.")
+        return int(row_id)
+
+    def claim_next_queued_proposal(
+        self,
+        *,
+        loop_run_id: str,
+        claimed_at: float,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT *
+                FROM queued_proposals
+                WHERE loop_run_id = ? AND status = 'pending'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (loop_run_id,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            conn.execute(
+                """
+                UPDATE queued_proposals
+                SET status = 'claimed', claimed_at = ?
+                WHERE id = ?
+                """,
+                (claimed_at, row["id"]),
+            )
+            conn.commit()
+            payload = dict(row)
+            payload["status"] = "claimed"
+            payload["claimed_at"] = claimed_at
+            return payload
+
+    def update_queued_proposal(
+        self,
+        *,
+        proposal_id: int,
+        status: str,
+        applied_run_id: str | None = None,
+        notes: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE queued_proposals
+                SET status = ?,
+                    applied_run_id = COALESCE(?, applied_run_id),
+                    notes = COALESCE(?, notes)
+                WHERE id = ?
+                """,
+                (status, applied_run_id, notes, proposal_id),
+            )
+
+    def fetch_queued_proposals(
+        self,
+        *,
+        loop_run_id: str,
+    ) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            """
+            SELECT *
+            FROM queued_proposals
+            WHERE loop_run_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (loop_run_id,),
+        )
 
     def insert_llm_call(
         self,
@@ -799,4 +1079,3 @@ class ObservabilityStore:
                 """,
                 (source_key, cursor_real, cursor_text, _now_ts()),
             )
-

@@ -22,23 +22,27 @@ from imu_denoise.training.callbacks import CheckpointManager, EarlyStopping
 from imu_denoise.training.losses import LossFn
 from imu_denoise.utils.io import save_metrics
 from imu_denoise.utils.logging import setup_logger
+from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
 
 @dataclass(frozen=True)
 class TrainingArtifacts:
     """Paths produced by a training run."""
 
+    run_dir: Path
     checkpoint_dir: Path
     best_checkpoint: Path
     last_checkpoint: Path
     metrics_path: Path
     history_path: Path
+    runtime_log_path: Path
 
 
 @dataclass(frozen=True)
 class TrainingSummary:
     """Compact result of a completed training run."""
 
+    run_id: str
     best_epoch: int
     best_val_rmse: float
     final_train_loss: float
@@ -70,18 +74,28 @@ class Trainer:
         self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.scaler = device_ctx.create_scaler()
-        self.logger = setup_logger(config.name, log_dir=config.log_dir)
-        self.checkpoints = CheckpointManager(config.checkpoint_dir)
+        self.observability = observability or ObservabilityWriter.from_experiment_config(
+            config,
+            logger=None,
+        )
+        self.run_id = run_id or self.observability.make_run_id(name=config.name, phase="training")
+        self.run_paths = build_run_paths(
+            config.output_dir,
+            run_name=config.name,
+            run_id=self.run_id,
+        )
+        self.logger = setup_logger(
+            f"{config.name}.{self.run_paths.root.name}",
+            log_dir=str(self.run_paths.logs_dir),
+            log_filename="runtime",
+        )
+        self.observability.logger = self.logger
+        self.checkpoints = CheckpointManager(self.run_paths.checkpoints_dir)
         self.early_stopping = EarlyStopping(
             patience=config.training.early_stop_patience,
             mode="min",
         )
-        self.history_path = Path(config.log_dir) / f"{config.name}.history.jsonl"
-        self.observability = observability or ObservabilityWriter.from_experiment_config(
-            config,
-            logger=self.logger,
-        )
-        self.run_id = run_id
+        self.history_path = self.run_paths.history_path
         self.parent_run_id = parent_run_id
 
     def fit(
@@ -96,7 +110,7 @@ class Trainer:
         best_val_rmse = float("inf")
         last_train_loss = float("nan")
         last_val_loss = float("nan")
-        run_id = self.run_id or self.observability.start_run(
+        run_id = self.observability.start_run(
             name=self.config.name,
             phase="training",
             dataset=self.config.data.dataset,
@@ -107,9 +121,19 @@ class Trainer:
             objective_metric="val_rmse",
             objective_direction="minimize",
             source="runtime",
+            run_id=self.run_id,
         )
         log_handler = self.observability.create_log_handler(run_id)
         self.logger.addHandler(log_handler)
+        write_run_manifest(
+            self.run_paths,
+            {
+                "run_id": run_id,
+                "name": self.config.name,
+                "phase": "training",
+                "parent_run_id": self.parent_run_id,
+            },
+        )
         self.observability.update_status(
             run_id=run_id,
             phase="training",
@@ -236,7 +260,7 @@ class Trainer:
                 "training_seconds": elapsed,
                 "test_metrics": test_metrics,
             }
-            metrics_path = Path(self.config.output_dir) / self.config.name / "metrics.json"
+            metrics_path = self.run_paths.metrics_path
             save_metrics(metrics_path, summary_metrics)
             self.observability.register_artifact(
                 run_id=run_id,
@@ -255,13 +279,16 @@ class Trainer:
             )
 
             artifacts = TrainingArtifacts(
-                checkpoint_dir=self.config.checkpoint_dir,
+                run_dir=self.run_paths.root,
+                checkpoint_dir=self.run_paths.checkpoints_dir,
                 best_checkpoint=self.checkpoints.best_path,
                 last_checkpoint=self.checkpoints.last_path,
                 metrics_path=metrics_path,
                 history_path=self.history_path,
+                runtime_log_path=self.run_paths.runtime_log_path,
             )
             summary = TrainingSummary(
+                run_id=run_id,
                 best_epoch=best_epoch,
                 best_val_rmse=best_val_rmse,
                 final_train_loss=last_train_loss,

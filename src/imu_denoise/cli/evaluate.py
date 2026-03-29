@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -12,9 +13,10 @@ from imu_denoise.cli.common import add_common_config_arguments, build_model, res
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
-from imu_denoise.observability import ObservabilityWriter
+from imu_denoise.observability import MissionControlQueries, ObservabilityWriter
 from imu_denoise.training.reproducibility import seed_everything
 from imu_denoise.utils.io import load_checkpoint, save_metrics
+from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,9 +32,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def _resolve_checkpoint_path(config: Any, args_checkpoint: str) -> Path:
+    if args_checkpoint:
+        return Path(args_checkpoint)
+
+    queries = MissionControlQueries(
+        db_path=Path(config.observability.db_path),
+        blob_dir=Path(config.observability.blob_dir),
+    )
+    for run in queries.list_runs(limit=500):
+        if run["phase"] != "training" or run["status"] != "completed":
+            continue
+        if run["name"] != config.name:
+            continue
+        for artifact in queries.list_artifacts(run_id=str(run["id"])):
+            if artifact["artifact_type"] != "checkpoint" or artifact.get("label") != "best":
+                continue
+            path = Path(str(artifact["path"]))
+            if path.exists():
+                return path
+
+    legacy_path = Path(config.checkpoint_dir) / "best.pt"
+    if legacy_path.exists():
+        return legacy_path
+    raise FileNotFoundError(
+        "No checkpoint was provided and no matching completed training run checkpoint was found."
+    )
+
+
+def run_command(args: Any) -> int:
     """Evaluate a checkpoint and save metrics/figures."""
-    args = build_parser().parse_args()
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
@@ -43,18 +72,28 @@ def main() -> int:
     device_ctx = DeviceContext.from_config(config.device)
     model = build_model(config)
     observability = ObservabilityWriter.from_experiment_config(config)
+    run_name = f"{config.name}-evaluation"
+    run_id = observability.make_run_id(name=run_name, phase="evaluation")
+    run_paths = build_run_paths(config.output_dir, run_name=run_name, run_id=run_id)
     run_id = observability.start_run(
-        name=f"{config.name}-evaluation",
+        name=run_name,
         phase="evaluation",
         dataset=config.data.dataset,
         model=config.model.name,
         device=device_ctx.device.type,
         config=config,
         source="runtime",
+        run_id=run_id,
     )
-    checkpoint_path = (
-        Path(args.checkpoint) if args.checkpoint else Path(config.checkpoint_dir) / "best.pt"
+    write_run_manifest(
+        run_paths,
+        {
+            "run_id": run_id,
+            "name": run_name,
+            "phase": "evaluation",
+        },
     )
+    checkpoint_path = _resolve_checkpoint_path(config, args.checkpoint)
 
     _, _, test_loader = create_dataloaders(config.data, config.training, device_ctx)
     evaluator = Evaluator(model, device_ctx)
@@ -62,9 +101,9 @@ def main() -> int:
     sampling_rate = 100.0 if config.data.dataset == "blackbird" else 200.0
     metrics = evaluator.evaluate(test_loader, fs=sampling_rate)
 
-    output_dir = Path(config.output_dir) / config.name / "evaluation"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "metrics.json"
+    run_paths.root.mkdir(parents=True, exist_ok=True)
+    run_paths.figures_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_paths.metrics_path
     save_metrics(metrics_path, metrics)
     observability.register_artifact(
         run_id=run_id,
@@ -95,11 +134,11 @@ def main() -> int:
         denoised=pred[0],
         clean=clean[0],
         timestamps=timestamps[0],
-        save_path=output_dir / "denoising_comparison.png",
+        save_path=run_paths.figures_dir / "denoising_comparison.png",
     )
     observability.register_artifact(
         run_id=run_id,
-        path=output_dir / "denoising_comparison.png",
+        path=run_paths.figures_dir / "denoising_comparison.png",
         artifact_type="figure",
         label="denoising_comparison",
         source="runtime",
@@ -111,11 +150,11 @@ def main() -> int:
             "clean": clean[0],
         },
         fs=sampling_rate,
-        save_path=output_dir / "psd.png",
+        save_path=run_paths.figures_dir / "psd.png",
     )
     observability.register_artifact(
         run_id=run_id,
-        path=output_dir / "psd.png",
+        path=run_paths.figures_dir / "psd.png",
         artifact_type="figure",
         label="psd",
         source="runtime",
@@ -133,6 +172,11 @@ def main() -> int:
     print(f"  rmse: {metrics['rmse']:.6f}")
     print(f"  mae: {metrics['mae']:.6f}")
     return 0
+
+
+def main() -> int:
+    """CLI entrypoint."""
+    return run_command(build_parser().parse_args())
 
 
 if __name__ == "__main__":

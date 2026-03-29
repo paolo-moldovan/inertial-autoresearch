@@ -137,6 +137,10 @@ class ExperimentConfig:
     log_dir: str = "artifacts/logs"
 
     @property
+    def runs_dir(self) -> Path:
+        return Path(self.output_dir) / "runs"
+
+    @property
     def checkpoint_dir(self) -> Path:
         return Path(self.output_dir) / "checkpoints" / self.name
 

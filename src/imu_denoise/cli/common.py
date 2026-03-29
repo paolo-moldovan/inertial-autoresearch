@@ -18,6 +18,11 @@ DEFAULT_CONFIG_PATHS = (
 )
 
 
+def _has_explicit_model_config(config_paths: Sequence[Path], model_name: str) -> bool:
+    target = (Path("configs/models") / f"{model_name}.yaml").resolve()
+    return any(path.resolve() == target for path in config_paths if path.exists())
+
+
 def add_common_config_arguments(parser: argparse.ArgumentParser) -> None:
     """Add shared config arguments used by package CLI commands."""
     parser.add_argument(
@@ -37,7 +42,18 @@ def add_common_config_arguments(parser: argparse.ArgumentParser) -> None:
 
 def resolve_config(cli_config_paths: Sequence[str], overrides: Sequence[str]) -> ExperimentConfig:
     """Load the experiment config from defaults plus CLI additions."""
-    config_paths = [*DEFAULT_CONFIG_PATHS, *(Path(path) for path in cli_config_paths)]
+    explicit_paths = [Path(path) for path in cli_config_paths]
+    probe_config = load_config(
+        *DEFAULT_CONFIG_PATHS,
+        *explicit_paths,
+        overrides=list(overrides),
+    )
+    selected_model = probe_config.model.name
+    auto_model_path = Path("configs/models") / f"{selected_model}.yaml"
+    config_paths = list(DEFAULT_CONFIG_PATHS)
+    if auto_model_path.exists() and not _has_explicit_model_config(explicit_paths, selected_model):
+        config_paths.append(auto_model_path)
+    config_paths.extend(explicit_paths)
     return load_config(*config_paths, overrides=list(overrides))
 
 

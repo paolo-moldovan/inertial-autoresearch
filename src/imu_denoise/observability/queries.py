@@ -6,6 +6,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from imu_denoise.observability.control import (
+    LOOP_PAUSED,
+    LOOP_RESUMED,
+    QUEUE_APPLIED,
+    QUEUE_CLAIMED,
+    QUEUE_ENQUEUED,
+)
+from imu_denoise.observability.events import TRAINING_EPOCH
 from imu_denoise.observability.store import ObservabilityStore
 
 
@@ -50,6 +58,45 @@ class MissionControlQueries:
             "llm_calls": int(llm_calls["count"]) if llm_calls is not None else 0,
             "latest_metric": latest_metric,
         }
+
+    def get_loop_status(self) -> dict[str, Any] | None:
+        row = self.store.fetch_one(
+            """
+            SELECT
+                l.*,
+                r.name AS loop_name,
+                r.dataset,
+                r.model
+            FROM loop_state l
+            JOIN runs r ON r.id = l.loop_run_id
+            ORDER BY l.updated_at DESC
+            LIMIT 1
+            """
+        )
+        if row is None:
+            return None
+        row["pause_requested"] = bool(row.get("pause_requested"))
+        return row
+
+    def get_active_loop_state(self) -> dict[str, Any] | None:
+        row = self.store.fetch_one(
+            """
+            SELECT
+                l.*,
+                r.name AS loop_name,
+                r.dataset,
+                r.model
+            FROM loop_state l
+            JOIN runs r ON r.id = l.loop_run_id
+            WHERE l.status IN ('running', 'paused')
+            ORDER BY l.updated_at DESC
+            LIMIT 1
+            """
+        )
+        if row is None:
+            return None
+        row["pause_requested"] = bool(row.get("pause_requested"))
+        return row
 
     def list_active_runs(self) -> list[dict[str, Any]]:
         return self.store.fetch_all(
@@ -103,6 +150,120 @@ class MissionControlQueries:
             """,
             (limit,),
         )
+
+    def list_runs_by_source(
+        self,
+        proposal_source: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rows = self.store.fetch_all(
+            """
+            SELECT
+                r.*,
+                d.proposal_source,
+                d.status AS decision_status,
+                d.metric_key,
+                d.metric_value,
+                d.created_at AS decision_created_at
+            FROM runs r
+            JOIN decisions d ON d.run_id = r.id
+            WHERE d.proposal_source = ?
+            ORDER BY d.created_at DESC
+            LIMIT ?
+            """,
+            (proposal_source, limit),
+        )
+        return rows
+
+    def list_leaderboard(
+        self,
+        *,
+        limit: int = 10,
+        metric_key: str = "val_rmse",
+    ) -> list[dict[str, Any]]:
+        metric_keys = [metric_key]
+        if metric_key == "val_rmse":
+            metric_keys.append("rmse")
+        rows = self.store.fetch_all(
+            """
+            WITH ranked_decisions AS (
+                SELECT
+                    d.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.run_id
+                        ORDER BY d.created_at DESC, d.id DESC
+                    ) AS row_num
+                FROM decisions d
+                WHERE d.metric_key IN (?, ?)
+            )
+            SELECT
+                r.id AS run_id,
+                r.name AS run_name,
+                r.model,
+                r.phase,
+                r.status AS run_status,
+                r.experiment_id,
+                rd.proposal_source,
+                rd.status AS decision_status,
+                rd.metric_key,
+                COALESCE(rd.metric_value, s.best_metric) AS metric_value,
+                rd.iteration,
+                rd.description,
+                r.started_at
+            FROM runs r
+            LEFT JOIN ranked_decisions rd ON rd.run_id = r.id AND rd.row_num = 1
+            LEFT JOIN status_snapshots s ON s.run_id = r.id
+            WHERE r.phase IN ('training', 'baseline')
+              AND r.status = 'completed'
+              AND COALESCE(rd.metric_value, s.best_metric) IS NOT NULL
+            ORDER BY COALESCE(rd.metric_value, s.best_metric) ASC, r.started_at DESC
+            LIMIT ?
+            """,
+            (metric_keys[0], metric_keys[-1], limit),
+        )
+        for index, row in enumerate(rows, start=1):
+            row["rank"] = index
+        return rows
+
+    def resolve_id_fragment(self, fragment: str) -> dict[str, Any] | None:
+        normalized = fragment.strip()
+        if not normalized:
+            return None
+        like_value = f"{normalized}%"
+        match_specs = [
+            (
+                "run",
+                "SELECT id, name AS label FROM runs "
+                "WHERE id LIKE ? ORDER BY started_at DESC LIMIT 2",
+            ),
+            (
+                "experiment",
+                "SELECT id, name AS label FROM experiments "
+                "WHERE id LIKE ? ORDER BY created_at DESC LIMIT 2",
+            ),
+            (
+                "llm_call",
+                "SELECT id, model AS label FROM llm_calls "
+                "WHERE id LIKE ? ORDER BY created_at DESC LIMIT 2",
+            ),
+        ]
+        matches: list[dict[str, Any]] = []
+        for entity_type, query in match_specs:
+            rows = self.store.fetch_all(query, (like_value,))
+            if len(rows) == 1:
+                matches.append(
+                    {
+                        "entity_type": entity_type,
+                        "id": rows[0]["id"],
+                        "label": rows[0].get("label"),
+                    }
+                )
+            elif len(rows) > 1:
+                return None
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def list_experiments(self, *, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.store.fetch_all(
@@ -243,12 +404,106 @@ class MissionControlQueries:
         return {
             "run": run,
             "experiment": experiment,
+            "identity": self.get_run_identity(run_id),
             "timeline": self.list_events(run_id=run_id, limit=200),
             "artifacts": self.list_artifacts(run_id=run_id),
             "decisions": self.list_decisions_for_run(run_id),
             "llm_calls": self.list_llm_calls_for_run(run_id),
             "tool_calls": self.list_tool_calls(run_id=run_id, limit=200),
+            "curves": self.get_run_curves(run_id),
+            "links": self.get_traceability_links(run_id),
             "logs": self.list_logs(run_id, limit=100),
+        }
+
+    def get_run_identity(self, run_id: str) -> dict[str, Any] | None:
+        row = self.store.fetch_one(
+            """
+            SELECT
+                r.id AS run_id,
+                r.name AS run_name,
+                r.phase,
+                r.status AS run_status,
+                r.iteration,
+                r.experiment_id,
+                e.name AS experiment_name
+            FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        )
+        if row is None:
+            return None
+        row["run_id_short"] = str(row["run_id"])[:8]
+        experiment_id = row.get("experiment_id")
+        row["experiment_id_short"] = str(experiment_id)[:8] if experiment_id else None
+        return row
+
+    def get_traceability_links(self, run_id: str) -> dict[str, Any]:
+        identity = self.get_run_identity(run_id)
+        decisions = self.list_decisions_for_run(run_id)
+        llm_calls = self.list_llm_calls_for_run(run_id)
+        return {
+            "run_id": run_id,
+            "experiment_id": None if identity is None else identity.get("experiment_id"),
+            "decision_ids": [row["id"] for row in decisions],
+            "llm_call_ids": [row["id"] for row in llm_calls],
+        }
+
+    def get_run_curves(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.store.fetch_all(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE run_id = ? AND event_type = ?
+            ORDER BY created_at ASC
+            """,
+            (run_id, TRAINING_EPOCH),
+        )
+        curves: list[dict[str, Any]] = []
+        for row in rows:
+            payload = _loads(row["payload_json"])
+            if isinstance(payload, dict):
+                curves.append(payload)
+        if curves:
+            return curves
+
+        history_artifact = self.store.fetch_one(
+            """
+            SELECT path
+            FROM artifacts
+            WHERE run_id = ? AND artifact_type = 'history'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        )
+        if history_artifact is None:
+            return []
+        history_path = Path(str(history_artifact["path"]))
+        if not history_path.exists():
+            return []
+        parsed: list[dict[str, Any]] = []
+        for line in history_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                parsed.append(payload)
+        return parsed
+
+    def get_mission_control_summary(self, *, limit: int = 10) -> dict[str, Any]:
+        loop_state = self.get_active_loop_state()
+        leaderboard = self.list_leaderboard(limit=limit)
+        best_result = leaderboard[0] if leaderboard else None
+        progress = []
+        if loop_state is not None:
+            progress = self.list_loop_iteration_metrics(str(loop_state["loop_run_id"]))
+        return {
+            "loop_state": loop_state,
+            "best_result": best_result,
+            "leaderboard": leaderboard,
+            "progress": progress,
         }
 
     def list_artifacts(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -306,6 +561,26 @@ class MissionControlQueries:
         for row in rows:
             row["overrides"] = _loads(row.pop("overrides_json"))
             row["candidates"] = _loads(row.pop("candidates_json"))
+        return rows
+
+    def list_loop_iteration_metrics(self, loop_run_id: str) -> list[dict[str, Any]]:
+        rows = self.store.fetch_all(
+            """
+            SELECT
+                d.iteration,
+                d.metric_key,
+                d.metric_value,
+                d.status,
+                r.id AS run_id,
+                r.name AS run_name,
+                d.description
+            FROM decisions d
+            JOIN runs r ON r.id = d.run_id
+            WHERE r.parent_run_id = ? AND d.metric_value IS NOT NULL
+            ORDER BY COALESCE(d.iteration, 999999) ASC, d.created_at ASC
+            """,
+            (loop_run_id,),
+        )
         return rows
 
     def list_llm_calls_for_run(self, run_id: str) -> list[dict[str, Any]]:
@@ -418,4 +693,28 @@ class MissionControlQueries:
             row["requested"] = _loads(row.pop("requested_json"))
             row["resolved"] = _loads(row.pop("resolved_json"))
             row["missing"] = _loads(row.pop("missing_json"))
+        return rows
+
+    def list_queued_proposals(self, loop_run_id: str) -> list[dict[str, Any]]:
+        rows = self.store.fetch_queued_proposals(loop_run_id=loop_run_id)
+        for row in rows:
+            row["overrides"] = _loads(row.pop("overrides_json"))
+        return rows
+
+    def list_recent_loop_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.store.fetch_all(
+            """
+            SELECT
+                e.*,
+                r.name AS run_name
+            FROM events e
+            LEFT JOIN runs r ON r.id = e.run_id
+            WHERE e.event_type IN (?, ?, ?, ?, ?)
+            ORDER BY e.created_at DESC
+            LIMIT ?
+            """,
+            (LOOP_PAUSED, LOOP_RESUMED, QUEUE_ENQUEUED, QUEUE_CLAIMED, QUEUE_APPLIED, limit),
+        )
+        for row in rows:
+            row["payload"] = _loads(row.pop("payload_json"))
         return rows

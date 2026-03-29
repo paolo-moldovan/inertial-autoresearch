@@ -5,16 +5,10 @@ pre: uv sync --extra monitor
 pre_window: export PYTHONUNBUFFERED=1
 
 windows:
-  - backfill:
+  - mission-control:
+      layout: tiled
       panes:
         - uv run scripts/observability_backfill.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
-  - monitor:
-      panes:
-        - uv run scripts/monitor.py --config configs/mission_control/hermes_smoke.yaml
-  - dashboard:
-      panes:
-        - uv run scripts/dashboard.py --config configs/mission_control/hermes_smoke.yaml
-  - autoresearch:
-      panes:
-        - uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml
-
+        - uv run scripts/monitor.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+        - uv run scripts/dashboard.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+        - uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l

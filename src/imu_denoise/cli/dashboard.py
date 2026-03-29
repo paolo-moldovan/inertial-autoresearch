@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from imu_denoise.cli.common import add_common_config_arguments, resolve_config
 
@@ -29,8 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def run_command(args: Any) -> int:
     config = resolve_config(args.config, args.overrides)
     db_path = Path(args.db_path or config.observability.db_path).resolve()
     blob_dir = Path(args.blob_dir or config.observability.blob_dir).resolve()
@@ -57,6 +57,10 @@ def main() -> int:
     ]
     result = stcli.main()
     return 0 if result is None else int(result)
+
+
+def main() -> int:
+    return run_command(build_parser().parse_args())
 
 
 if __name__ == "__main__":

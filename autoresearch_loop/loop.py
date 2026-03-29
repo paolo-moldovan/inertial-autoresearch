@@ -5,16 +5,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from autoresearch_loop.hermes import HermesQueryTrace
     from autoresearch_loop.mutations import MutationProposal
     from imu_denoise.config import ExperimentConfig
+    from imu_denoise.observability import LoopController
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -60,14 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         action="append",
-        default=[
-            "configs/base.yaml",
-            "configs/device.yaml",
-            "configs/models/lstm.yaml",
-            "configs/training/quick.yaml",
-            "configs/autoresearch.yaml",
-        ],
-        help="Config path(s) to merge. Defaults to a synthetic quick autoresearch stack.",
+        default=["configs/training/quick.yaml"],
+        help="Additional config path(s) to merge after the default stack.",
     )
     parser.add_argument(
         "--set",
@@ -81,6 +78,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override autoresearch.max_iterations.",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=0,
+        help="Pause after this many completed runs when --pause is enabled.",
+    )
+    parser.add_argument(
+        "--pause",
+        action="store_true",
+        help="Enable batch pause/review mode.",
     )
     return parser
 
@@ -216,14 +224,15 @@ def _select_mutation_proposal(
 
 def _run_single_experiment(
     *,
-    config_paths: list[str],
+    base_config: ExperimentConfig,
     overrides: list[str],
     metric_key: str,
     parent_run_id: str | None = None,
     iteration: int | None = None,
+    run_id: str | None = None,
 ) -> tuple[Any, Any, str]:
     from imu_denoise.cli.common import build_model
-    from imu_denoise.config import load_config
+    from imu_denoise.config import load_config_from_dict
     from imu_denoise.data.datamodule import create_dataloaders
     from imu_denoise.device import DeviceContext
     from imu_denoise.observability import ObservabilityWriter
@@ -234,7 +243,7 @@ def _run_single_experiment(
         seed_everything,
     )
 
-    config = load_config(*config_paths, overrides=overrides)
+    config = load_config_from_dict(asdict(base_config), overrides=overrides)
     observability = ObservabilityWriter.from_experiment_config(config)
     run_id = observability.start_run(
         name=config.name,
@@ -249,6 +258,7 @@ def _run_single_experiment(
         objective_metric=metric_key,
         objective_direction="minimize",
         source="runtime",
+        run_id=run_id,
     )
     seed_everything(config.training.seed)
     device_ctx = DeviceContext.from_config(config.device)
@@ -284,22 +294,87 @@ def _run_single_experiment(
         raise
 
 
+def _best_metric_from_results(results: list[LoopResult], direction: str) -> float | None:
+    valid = [result.metric_value for result in results if result.metric_value is not None]
+    if not valid:
+        return None
+    return max(valid) if direction == "maximize" else min(valid)
+
+
+def _wait_while_paused(
+    *,
+    loop_controller: LoopController,
+    loop_run_id: str,
+    total_iterations: int,
+    batch_size: int | None,
+    current_iteration: int,
+    best_metric: float | None,
+    best_run_id: str | None,
+) -> dict[str, Any]:
+    while True:
+        loop_state = loop_controller.get_loop_state(loop_run_id)
+        if loop_state is None:
+            raise RuntimeError("Loop state disappeared while waiting for resume.")
+        if loop_state["status"] != "paused":
+            return loop_state
+        loop_controller.heartbeat(
+            loop_run_id=loop_run_id,
+            current_iteration=current_iteration,
+            max_iterations=total_iterations,
+            batch_size=batch_size,
+            pause_after_iteration=loop_state.get("pause_after_iteration"),
+            pause_requested=bool(loop_state.get("pause_requested")),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+            active_child_run_id=None,
+            status="paused",
+        )
+        time.sleep(0.25)
+
+
+def _resolve_results_file(
+    *,
+    base_config: ExperimentConfig,
+    loop_run_id: str,
+    loop_name: str,
+) -> Path:
+    from imu_denoise.config import AutoResearchConfig
+    from imu_denoise.utils.paths import build_run_paths
+
+    configured = Path(base_config.autoresearch.results_file)
+    default_path = Path(AutoResearchConfig().results_file)
+    if configured == default_path:
+        return build_run_paths(
+            base_config.output_dir,
+            run_name=loop_name,
+            run_id=loop_run_id,
+        ).loop_results_path
+    return configured
+
+
 def run_autoresearch(
     *,
     config_paths: list[str],
     base_overrides: list[str] | None = None,
     max_iterations: int | None = None,
+    batch_size: int | None = None,
+    pause_enabled: bool = False,
 ) -> list[LoopResult]:
     """Run the baseline plus config mutations and record results to TSV."""
-    from autoresearch_loop.mutations import build_mutation_schedule
-    from imu_denoise.config import load_config
-    from imu_denoise.observability import ObservabilityWriter, import_hermes_state
+    from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
+    from imu_denoise.cli.common import resolve_config
+    from imu_denoise.observability import LoopController, ObservabilityWriter, import_hermes_state
+    from imu_denoise.observability.control import LOOP_PAUSED
+    from imu_denoise.utils.paths import build_run_paths, write_run_manifest
 
     base_overrides = list(base_overrides or [])
-    base_config = load_config(*config_paths, overrides=base_overrides)
+    base_config = resolve_config(config_paths, base_overrides)
     observability = ObservabilityWriter.from_experiment_config(base_config)
+    loop_name = f"{base_config.name}-autoresearch"
+    loop_run_id = observability.make_run_id(name=loop_name, phase="autoresearch_loop")
+    loop_controller = LoopController.from_experiment_config(base_config, writer=observability)
     loop_run_id = observability.start_run(
-        name=f"{base_config.name}-autoresearch",
+        name=loop_name,
         phase="autoresearch_loop",
         dataset=base_config.data.dataset,
         model=base_config.model.name,
@@ -309,35 +384,129 @@ def run_autoresearch(
         objective_metric=base_config.autoresearch.metric_key,
         objective_direction=base_config.autoresearch.metric_direction,
         source="runtime",
+        run_id=loop_run_id,
+    )
+    write_run_manifest(
+        build_run_paths(base_config.output_dir, run_name=loop_name, run_id=loop_run_id),
+        {
+            "run_id": loop_run_id,
+            "name": loop_name,
+            "phase": "autoresearch_loop",
+        },
     )
     total_iterations = (
         max_iterations if max_iterations is not None else base_config.autoresearch.max_iterations
     )
-    results_file = Path(base_config.autoresearch.results_file)
+    results_file = _resolve_results_file(
+        base_config=base_config,
+        loop_run_id=loop_run_id,
+        loop_name=loop_name,
+    )
     _ensure_results_file(results_file)
+    requested_batch_size = batch_size if pause_enabled and batch_size and batch_size > 0 else None
 
     rng = Random(base_config.training.seed)
     schedule = build_mutation_schedule(total_iterations, rng)
-    best_metric: float | None = None
+    total_scheduled_runs = len(schedule)
     results: list[LoopResult] = []
-    hermes_used_descriptions: set[str] = set()
+    best_metric = _best_metric_from_results(results, base_config.autoresearch.metric_direction)
+    best_run_id: str | None = None
+    hermes_used_descriptions: set[str] = {
+        result.description for result in results if result.proposal_source == "hermes"
+    }
+    loop_controller.initialize_loop(
+        loop_run_id=loop_run_id,
+        max_iterations=total_scheduled_runs,
+        batch_size=requested_batch_size,
+        pause_enabled=pause_enabled,
+        current_iteration=len(results),
+        best_metric=best_metric,
+        best_run_id=best_run_id,
+    )
 
-    for iteration, fallback_proposal in enumerate(schedule):
-        proposal, proposal_source, hermes_trace, candidate_pool = _select_mutation_proposal(
-            iteration=iteration,
-            base_config=base_config,
-            rng=rng,
-            results=results,
-            fallback_proposal=fallback_proposal,
-            hermes_used_descriptions=hermes_used_descriptions,
-        )
+    for iteration, fallback_proposal in enumerate(schedule[len(results) :], start=len(results)):
+        loop_state = loop_controller.get_loop_state(loop_run_id)
+        if loop_state is None:
+            raise RuntimeError("Missing loop state for autoresearch loop.")
+        if loop_state["status"] == "paused":
+            loop_state = _wait_while_paused(
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                total_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                current_iteration=len(results),
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+            )
+
+        should_pause = bool(loop_state.get("pause_requested"))
+        pause_reason = "manual"
+        pause_after_iteration = loop_state.get("pause_after_iteration")
+        if (
+            isinstance(pause_after_iteration, int)
+            and pause_after_iteration > 0
+            and len(results) >= pause_after_iteration
+        ):
+            should_pause = True
+            pause_reason = "batch"
+        if should_pause:
+            observability.append_event(
+                run_id=loop_run_id,
+                event_type=LOOP_PAUSED,
+                level="INFO",
+                title="loop paused",
+                payload={"reason": pause_reason, "current_iteration": len(results)},
+                source="runtime",
+            )
+            loop_controller.heartbeat(
+                loop_run_id=loop_run_id,
+                current_iteration=len(results),
+                max_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                pause_after_iteration=pause_after_iteration,
+                pause_requested=False,
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+                active_child_run_id=None,
+                status="paused",
+            )
+            loop_state = _wait_while_paused(
+                loop_controller=loop_controller,
+                loop_run_id=loop_run_id,
+                total_iterations=total_scheduled_runs,
+                batch_size=requested_batch_size,
+                current_iteration=len(results),
+                best_metric=best_metric,
+                best_run_id=best_run_id,
+            )
+
+        queue_row = None
+        if iteration > 0:
+            queue_row = loop_controller.claim_next_queued_proposal(loop_run_id=loop_run_id)
+        if queue_row is not None:
+            proposal = MutationProposal(
+                description=str(queue_row["description"]),
+                overrides=list(queue_row["overrides"]),
+            )
+            proposal_source = "human-queued"
+            hermes_trace = None
+            candidate_pool = None
+        else:
+            proposal, proposal_source, hermes_trace, candidate_pool = _select_mutation_proposal(
+                iteration=iteration,
+                base_config=base_config,
+                rng=rng,
+                results=results,
+                fallback_proposal=fallback_proposal,
+                hermes_used_descriptions=hermes_used_descriptions,
+            )
         observability.update_status(
             run_id=loop_run_id,
             phase="autoresearch_loop",
-            epoch=iteration,
+            epoch=len(results),
             best_metric=best_metric,
             last_metric=results[-1].metric_value if results else None,
-            message=f"iteration {iteration}",
+            message=f"iteration {len(results)}",
             source="runtime",
         )
         llm_call_id: str | None = None
@@ -383,19 +552,34 @@ def run_autoresearch(
             },
             source="runtime",
         )
+        experiment_run_id = f"training-{iteration:03d}-{uuid4().hex}"
+        loop_controller.heartbeat(
+            loop_run_id=loop_run_id,
+            current_iteration=len(results),
+            max_iterations=total_scheduled_runs,
+            batch_size=requested_batch_size,
+            pause_after_iteration=loop_state.get("pause_after_iteration"),
+            pause_requested=bool(loop_state.get("pause_requested")),
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+            active_child_run_id=experiment_run_id,
+            status="running",
+        )
 
         try:
             config, summary, experiment_run_id = _run_single_experiment(
-                config_paths=config_paths,
+                base_config=base_config,
                 overrides=run_overrides,
                 metric_key=base_config.autoresearch.metric_key,
                 parent_run_id=loop_run_id,
                 iteration=iteration,
+                run_id=experiment_run_id,
             )
             metric_value = _metric_from_summary(summary, base_config.autoresearch.metric_key)
             if iteration == 0:
                 status = "baseline"
                 best_metric = metric_value
+                best_run_id = experiment_run_id
             elif _is_better(
                 metric_value,
                 best_metric,
@@ -403,6 +587,7 @@ def run_autoresearch(
             ):
                 status = "keep"
                 best_metric = metric_value
+                best_run_id = experiment_run_id
             else:
                 status = "discard"
 
@@ -442,6 +627,12 @@ def run_autoresearch(
                 llm_call_id=llm_call_id,
                 source="runtime",
             )
+            if queue_row is not None:
+                loop_controller.mark_queue_applied(
+                    proposal_id=int(queue_row["id"]),
+                    loop_run_id=loop_run_id,
+                    applied_run_id=experiment_run_id,
+                )
         except Exception as exc:
             result = LoopResult(
                 iteration=iteration,
@@ -479,6 +670,11 @@ def run_autoresearch(
                 llm_call_id=llm_call_id,
                 source="runtime",
             )
+            if queue_row is not None:
+                loop_controller.mark_queue_failed(
+                    proposal_id=int(queue_row["id"]),
+                    notes=str(exc),
+                )
 
         _append_result(results_file, result)
         observability.register_artifact(
@@ -489,12 +685,33 @@ def run_autoresearch(
             source="runtime",
         )
         results.append(result)
+        loop_controller.heartbeat(
+            loop_run_id=loop_run_id,
+            current_iteration=len(results),
+            max_iterations=total_scheduled_runs,
+            batch_size=requested_batch_size,
+            pause_after_iteration=loop_state.get("pause_after_iteration"),
+            pause_requested=False,
+            best_metric=best_metric,
+            best_run_id=best_run_id,
+            active_child_run_id=None,
+            status="running",
+        )
 
     observability.finish_run(
         run_id=loop_run_id,
         status="completed",
         summary={"message": f"completed {len(results)} iterations"},
         source="runtime",
+    )
+    loop_controller.complete_loop(
+        loop_run_id=loop_run_id,
+        current_iteration=len(results),
+        max_iterations=total_scheduled_runs,
+        batch_size=requested_batch_size,
+        best_metric=best_metric,
+        best_run_id=best_run_id,
+        status="completed",
     )
     return results
 
@@ -506,6 +723,8 @@ def main() -> int:
         config_paths=args.config,
         base_overrides=args.overrides,
         max_iterations=args.max_iterations,
+        batch_size=args.batch or None,
+        pause_enabled=args.pause,
     )
     print(f"Completed {len(results)} autoresearch runs.")
     if results:

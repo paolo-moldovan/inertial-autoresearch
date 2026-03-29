@@ -48,13 +48,15 @@ class _JsonLinesFormatter(logging.Formatter):
 def setup_logger(
     name: str,
     log_dir: str | None = None,
+    log_filename: str | None = None,
     level: str = "INFO",
 ) -> logging.Logger:
     """Create and configure a logger with console output and optional file logging.
 
     Args:
         name: Logger name, typically the module or experiment name.
-        log_dir: If provided, write JSON-lines log to ``<log_dir>/<name>.jsonl``.
+        log_dir: If provided, write JSON-lines log to ``<log_dir>/<file>.jsonl``.
+        log_filename: Optional filename stem for the JSON-lines log.
         level: Logging level as a string (``"DEBUG"``, ``"INFO"``, etc.).
 
     Returns:
@@ -74,7 +76,8 @@ def setup_logger(
     if log_dir is not None:
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_path / f"{name}.jsonl", encoding="utf-8")
+        file_stem = log_filename or name
+        fh = logging.FileHandler(log_path / f"{file_stem}.jsonl", encoding="utf-8")
         fh.setFormatter(_JsonLinesFormatter())
         logger.addHandler(fh)
 
