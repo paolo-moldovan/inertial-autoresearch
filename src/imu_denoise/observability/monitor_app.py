@@ -37,7 +37,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
         can_focus = True
 
     class MissionControlApp(App[None]):
-        """Minimal live console for status, live run, and recent decisions."""
+        """Minimal live console for status, current run, and recent decisions."""
 
         BINDINGS = [
             ("q", "quit", "Quit"),
@@ -52,7 +52,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
         def __init__(self) -> None:
             super().__init__()
             self._detail_open = False
-            self._focus_order = ["#status", "#live_run", "#recent_decisions", "#detail"]
+            self._focus_order = ["#status", "#live_run", "#hermes", "#recent_decisions", "#detail"]
             self._focus_index = 0
             self._decision_rows: list[dict[str, Any]] = []
 
@@ -61,6 +61,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
             with Vertical():
                 yield FocusableStatic(id="status")
                 yield FocusableStatic(id="live_run")
+                yield FocusableStatic(id="hermes")
                 yield DataTable(id="recent_decisions")
                 yield FocusableStatic(id="detail")
             yield Footer()
@@ -98,6 +99,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
         def refresh_data(self) -> None:
             summary = queries.get_mission_control_summary(limit=10)
             loop_state = summary["loop_state"]
+            current_run = summary.get("current_run")
             best_result = summary["best_result"]
 
             status_widget = self.query_one("#status", Static)
@@ -123,9 +125,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
                 )
 
             live_widget = self.query_one("#live_run", Static)
-            active_runs = queries.list_active_runs()
-            if active_runs:
-                current = active_runs[0]
+            if current_run is not None:
                 progress_ratio = 0.0
                 max_iterations = float(loop_state["max_iterations"]) if loop_state else 0.0
                 if max_iterations > 0 and loop_state is not None:
@@ -133,14 +133,44 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
                         float(loop_state["current_iteration"]) / max_iterations,
                         1.0,
                     )
+                current_metric = _fmt_metric(
+                    current_run.get("last_metric") or current_run.get("metric_value")
+                )
                 live_widget.update(
-                    "LIVE RUN\n"
-                    f"{current['name']}  |  epoch {current.get('epoch') or '-'}  |  "
-                    f"val_rmse {_fmt_metric(current.get('last_metric'))}\n"
+                    "CURRENT RUN\n"
+                    f"{current_run['run_name']} ({current_run.get('model') or 'n/a'})  |  "
+                    f"epoch {current_run.get('epoch') or '-'}  |  "
+                    f"metric {current_metric}\n"
+                    f"status={current_run.get('status') or 'n/a'}  "
+                    f"decision={current_run.get('decision_status') or 'n/a'}\n"
                     f"{_progress_bar(progress_ratio)}"
                 )
             else:
-                live_widget.update("LIVE RUN\nNo active experiment run.")
+                live_widget.update("CURRENT RUN\nNo current experiment run.")
+
+            hermes_widget = self.query_one("#hermes", Static)
+            hermes_runtime = summary.get("hermes_runtime")
+            if hermes_runtime is None:
+                hermes_widget.update("HERMES\nNo Hermes runtime data.")
+            else:
+                toolsets = ", ".join(
+                    str(item) for item in hermes_runtime.get("toolsets") or []
+                ) or "n/a"
+                skills = ", ".join(
+                    str(item) for item in hermes_runtime.get("skills") or []
+                ) or "n/a"
+                hermes_widget.update(
+                    "HERMES\n"
+                    f"Model: {hermes_runtime.get('model') or 'n/a'}  |  "
+                    f"Provider: {hermes_runtime.get('provider') or 'n/a'}\n"
+                    f"Toolsets: {toolsets}\n"
+                    f"Skills: {skills}\n"
+                    "Session: "
+                    f"{str(hermes_runtime.get('latest_session_id') or 'n/a')[:8]}  |  "
+                    "Last: "
+                    f"{hermes_runtime.get('latest_status') or 'n/a'} "
+                    f"{_fmt_latency(hermes_runtime.get('latest_latency_ms'))}"
+                )
 
             decisions_widget = self.query_one("#recent_decisions", DataTable)
             decisions_widget.clear()
@@ -205,6 +235,12 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
 def _fmt_metric(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f"{float(value):.4f}"
+    return ""
+
+
+def _fmt_latency(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return f"({float(value):.1f} ms)"
     return ""
 
 

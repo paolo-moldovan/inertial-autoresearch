@@ -203,12 +203,18 @@ def proposal_paths(proposal: MutationProposal) -> list[str]:
 def filter_mutation_proposals(
     proposals: list[MutationProposal],
     search_space: AutoResearchSearchSpaceConfig,
+    *,
+    incumbent_model_name: str | None = None,
 ) -> tuple[list[MutationProposal], dict[str, list[str]]]:
     """Filter proposals against the configured search-space constraints."""
     allowed: list[MutationProposal] = []
     blocked: dict[str, list[str]] = {}
     for proposal in proposals:
-        is_allowed, reasons = _proposal_allowed(proposal, search_space)
+        is_allowed, reasons = _proposal_allowed(
+            proposal,
+            search_space,
+            incumbent_model_name=incumbent_model_name,
+        )
         if is_allowed:
             allowed.append(proposal)
         else:
@@ -219,6 +225,8 @@ def filter_mutation_proposals(
 def _proposal_allowed(
     proposal: MutationProposal,
     search_space: AutoResearchSearchSpaceConfig,
+    *,
+    incumbent_model_name: str | None = None,
 ) -> tuple[bool, list[str]]:
     groups = set(proposal.groups)
     paths = proposal_paths(proposal)
@@ -228,6 +236,14 @@ def _proposal_allowed(
         reasons.append("architecture_fixed")
     if search_space.architecture_mode == "tune" and proposal.architecture_change:
         reasons.append("architecture_tune_only")
+    proposed_model_name = _proposed_model_name(proposal)
+    if (
+        search_space.baseline_mode == "exploit"
+        and incumbent_model_name
+        and proposed_model_name is not None
+        and proposed_model_name != incumbent_model_name
+    ):
+        reasons.append(f"exploit_incumbent_model={incumbent_model_name}")
 
     deny_groups = {item for item in search_space.deny_groups if item}
     blocked_groups = sorted(groups & deny_groups)
@@ -257,6 +273,15 @@ def _proposal_allowed(
 def _path_matches_prefix(path: str, prefix: str) -> bool:
     normalized_prefix = prefix.strip()
     return path == normalized_prefix or path.startswith(normalized_prefix + ".")
+
+
+def _proposed_model_name(proposal: MutationProposal) -> str | None:
+    for override in proposal.overrides:
+        if not override.startswith("model.name="):
+            continue
+        _key, value = override.split("=", 1)
+        return value.strip()
+    return None
 
 
 def _score_candidate(

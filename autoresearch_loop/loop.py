@@ -216,6 +216,11 @@ def _select_mutation_proposal(
     candidate_pool, blocked_candidates = filter_mutation_proposals(
         candidate_pool,
         base_config.autoresearch.search_space,
+        incumbent_model_name=(
+            str(incumbent_summary["model"])
+            if incumbent_summary is not None and incumbent_summary.get("model") is not None
+            else None
+        ),
     )
     if not candidate_pool:
         raise RuntimeError(
@@ -1053,7 +1058,7 @@ def run_autoresearch(
             reference_kind=reference_kind,
             proposal_source=proposal_source,
             description=proposal.description,
-            overrides=run_overrides,
+            overrides=list(proposal.overrides),
             current_config=resolved_config,
             reference_config=incumbent_config if incumbent_config is not None else base_config,
             source="runtime",

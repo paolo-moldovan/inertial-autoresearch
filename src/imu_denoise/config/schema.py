@@ -101,7 +101,11 @@ class HermesConfig:
     base_url: str = "http://127.0.0.1:11434/v1"
     model: str = "qwen3.5:latest"
     api_key: str | None = None
-    toolsets: list[str] = field(default_factory=lambda: ["file"])
+    toolsets: list[str] = field(
+        default_factory=lambda: ["file", "memory", "session_search", "skills"]
+    )
+    skills: list[str] = field(default_factory=lambda: ["imu-autoresearch-policy"])
+    pass_session_id: bool = True
     max_turns: int = 6
     timeout_sec: int = 90
     healthcheck_timeout_sec: float = 2.0

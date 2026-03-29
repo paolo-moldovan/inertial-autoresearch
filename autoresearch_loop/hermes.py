@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from autoresearch_loop.mutations import MutationProposal
 from imu_denoise.config import HermesConfig
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_PROJECT_SKILLS_DIR = Path(__file__).resolve().parent / "hermes_skills"
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,13 @@ def _run_hermes_query(*, prompt: str, config: HermesConfig, root: Path) -> Herme
     env = os.environ.copy()
     hermes_home = (root / config.home_dir).resolve()
     env["HERMES_HOME"] = str(hermes_home)
+    _sync_project_skills(hermes_home)
+
+    if config.skills:
+        command.extend(["--skills", ",".join(config.skills)])
+    if config.pass_session_id:
+        command.append("--pass_session_id")
+
     command_payload = {
         "argv": command,
         "cwd": str(root),
@@ -230,6 +239,20 @@ def _run_hermes_query(*, prompt: str, config: HermesConfig, root: Path) -> Herme
         )
 
     return trace
+
+
+def _sync_project_skills(hermes_home: Path) -> None:
+    if not _PROJECT_SKILLS_DIR.exists():
+        return
+    skills_root = hermes_home / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    for skill_dir in _PROJECT_SKILLS_DIR.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        destination = skills_root / skill_dir.name
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(skill_dir, destination)
 
 
 def _build_prompt(

@@ -242,6 +242,11 @@ def test_batch_pause_queue_and_resume_prioritize_human_queue(
     assert queued
     assert queued[0]["description"] == "try huber loss from human queue"
 
+    summary = queries.get_mission_control_summary(limit=10)
+    assert summary["current_run"] is not None
+    assert summary["current_run"]["is_active"] is False
+    assert summary["current_run"]["run_name"] == "autoresearch_000"
+
     resumed_state = controller.resume_loop(loop_run_id=str(paused_state["loop_run_id"]))
     assert resumed_state is not None
     assert resumed_state["status"] == "running"

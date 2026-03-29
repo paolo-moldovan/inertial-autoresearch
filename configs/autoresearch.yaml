@@ -37,6 +37,12 @@ autoresearch:
     model: qwen3.5:latest
     toolsets:
       - file
+      - memory
+      - session_search
+      - skills
+    skills:
+      - imu-autoresearch-policy
+    pass_session_id: true
     max_turns: 6
     timeout_sec: 90
     healthcheck_timeout_sec: 2.0

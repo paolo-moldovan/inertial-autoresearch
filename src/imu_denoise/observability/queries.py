@@ -923,8 +923,15 @@ class MissionControlQueries:
             limit=10,
             regime_fingerprint=mutation_regime_fingerprint,
         )
+        current_run = self.get_current_run_summary(
+            None if loop_state is None else str(loop_state["loop_run_id"])
+        )
+        hermes_runtime = self.get_hermes_runtime_summary(
+            loop_run_id=None if loop_state is None else str(loop_state["loop_run_id"])
+        )
         return {
             "loop_state": loop_state,
+            "current_run": current_run,
             "best_result": best_result,
             "leaderboard": leaderboard,
             "progress": progress,
@@ -935,6 +942,96 @@ class MissionControlQueries:
             "regime_fingerprint": comparison_regime_fingerprint,
             "mutation_leaderboard": mutation_leaderboard,
             "recent_mutation_lessons": recent_mutation_lessons,
+            "hermes_runtime": hermes_runtime,
+        }
+
+    def get_current_run_summary(self, loop_run_id: str | None) -> dict[str, Any] | None:
+        if not loop_run_id:
+            return None
+        loop_state = self.store.fetch_one(
+            "SELECT * FROM loop_state WHERE loop_run_id = ?",
+            (loop_run_id,),
+        )
+        current_run_id: str | None = None
+        if loop_state is not None and loop_state.get("active_child_run_id"):
+            current_run_id = str(loop_state["active_child_run_id"])
+        if current_run_id is None:
+            latest_child = self.store.fetch_one(
+                """
+                SELECT id
+                FROM runs
+                WHERE parent_run_id = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (loop_run_id,),
+            )
+            if latest_child is not None and latest_child.get("id"):
+                current_run_id = str(latest_child["id"])
+        if current_run_id is None:
+            return None
+        detail = self.get_run_detail(current_run_id)
+        if detail is None:
+            return None
+        run = detail["run"]
+        latest_decision = detail["decisions"][0] if detail["decisions"] else None
+        return {
+            "run_id": run["id"],
+            "run_name": run["name"],
+            "phase": run["phase"],
+            "status": run["status"],
+            "model": run["model"],
+            "dataset": run["dataset"],
+            "epoch": run.get("epoch"),
+            "last_metric": run.get("last_metric"),
+            "best_metric": run.get("best_metric"),
+            "heartbeat_at": run.get("heartbeat_at"),
+            "status_message": run.get("status_message"),
+            "decision_status": None if latest_decision is None else latest_decision.get("status"),
+            "decision_description": (
+                None if latest_decision is None else latest_decision.get("description")
+            ),
+            "metric_key": (
+                None if latest_decision is None else latest_decision.get("metric_key")
+            ),
+            "metric_value": (
+                None if latest_decision is None else latest_decision.get("metric_value")
+            ),
+            "llm_call_count": len(detail["llm_calls"]),
+            "artifact_count": len(detail["artifacts"]),
+            "is_active": bool(
+                loop_state is not None and loop_state.get("active_child_run_id") == current_run_id
+            ),
+        }
+
+    def get_hermes_runtime_summary(self, *, loop_run_id: str | None) -> dict[str, Any] | None:
+        if loop_run_id is None:
+            return None
+        payload = self.get_run_config_payload(loop_run_id)
+        if payload is None:
+            return None
+        autoresearch = payload.get("autoresearch")
+        if not isinstance(autoresearch, Mapping):
+            return None
+        hermes = autoresearch.get("hermes")
+        if not isinstance(hermes, Mapping):
+            return None
+        latest_llm = None
+        llm_calls = self.list_recent_llm_calls(limit=1, loop_run_id=loop_run_id)
+        if llm_calls:
+            latest_llm = llm_calls[0]
+        return {
+            "provider": hermes.get("provider"),
+            "model": hermes.get("model"),
+            "toolsets": list(hermes.get("toolsets") or []),
+            "skills": list(hermes.get("skills") or []),
+            "pass_session_id": bool(hermes.get("pass_session_id")),
+            "home_dir": hermes.get("home_dir"),
+            "max_turns": hermes.get("max_turns"),
+            "latest_session_id": None if latest_llm is None else latest_llm.get("session_id"),
+            "latest_status": None if latest_llm is None else latest_llm.get("status"),
+            "latest_latency_ms": None if latest_llm is None else latest_llm.get("latency_ms"),
+            "latest_reason": None if latest_llm is None else latest_llm.get("reason"),
         }
 
     def list_artifacts(self, *, run_id: str | None = None) -> list[dict[str, Any]]:

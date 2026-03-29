@@ -5,12 +5,18 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 from random import Random
+from types import SimpleNamespace
 from typing import Any
 
 from _pytest.monkeypatch import MonkeyPatch
 
-from autoresearch_loop.hermes import HermesQueryTrace
-from autoresearch_loop.hermes import _build_prompt as build_hermes_prompt
+from autoresearch_loop.hermes import (
+    HermesQueryTrace,
+    _run_hermes_query,
+)
+from autoresearch_loop.hermes import (
+    _build_prompt as build_hermes_prompt,
+)
 from autoresearch_loop.loop import _resolve_iteration_config, build_parser, run_autoresearch
 from autoresearch_loop.mutations import (
     MutationPolicyCandidate,
@@ -21,9 +27,10 @@ from autoresearch_loop.mutations import (
     filter_mutation_proposals,
 )
 from imu_denoise.cli.common import resolve_config
-from imu_denoise.config import DataConfig, ExperimentConfig, ObservabilityConfig
+from imu_denoise.config import DataConfig, ExperimentConfig, HermesConfig, ObservabilityConfig
 from imu_denoise.config.schema import AutoResearchSearchSpaceConfig, AutoResearchStrategyConfig
 from imu_denoise.observability import LoopController, MissionControlQueries
+from imu_denoise.observability.lineage import build_change_items
 from imu_denoise.observability.writer import ObservabilityWriter
 
 
@@ -178,6 +185,43 @@ def test_search_space_can_freeze_architecture_for_hermes_candidates() -> None:
     assert "lower learning rate" in allowed_descriptions
 
 
+def test_search_space_exploit_mode_keeps_incumbent_model_family() -> None:
+    """Exploit mode should block proposals that switch away from the incumbent family."""
+    allowed, blocked = filter_mutation_proposals(
+        default_mutation_pool()[1:],
+        AutoResearchSearchSpaceConfig(baseline_mode="exploit"),
+        incumbent_model_name="conv1d",
+    )
+
+    allowed_descriptions = {proposal.description for proposal in allowed}
+    assert "lower learning rate" in allowed_descriptions
+    assert "small transformer" not in allowed_descriptions
+    assert "deeper lstm" not in allowed_descriptions
+    assert blocked["small transformer"] == ["exploit_incumbent_model=conv1d"]
+
+
+def test_change_items_with_reference_only_tracks_explicit_override_paths() -> None:
+    """Mutation memory should not absorb unrelated loop-level config differences."""
+    reference = {
+        "model": {"name": "conv1d", "hidden_dim": 64},
+        "training": {"lr": 0.001, "time_budget_sec": 0},
+        "autoresearch": {"hermes": {"pass_session_id": False}},
+    }
+    current = {
+        "model": {"name": "conv1d", "hidden_dim": 64},
+        "training": {"lr": 0.0003, "time_budget_sec": 600},
+        "autoresearch": {"hermes": {"pass_session_id": True}},
+    }
+
+    change_items = build_change_items(
+        current_config=current,
+        reference_config=reference,
+        overrides=["training.lr=0.0003"],
+    )
+
+    assert [item["path"] for item in change_items] == ["training.lr"]
+
+
 def test_hermes_prompt_includes_incumbent_constraints_and_lessons() -> None:
     """Hermes should receive the local policy context instead of choosing semi-blindly."""
     prompt = build_hermes_prompt(
@@ -216,6 +260,46 @@ def test_hermes_prompt_includes_incumbent_constraints_and_lessons() -> None:
     assert '"architecture_mode":"fixed"' in prompt
     assert "Recent mutation lessons" in prompt
     assert "groups=[\"training_core\",\"optimizer\"]" in prompt
+
+
+def test_hermes_query_syncs_project_skill_and_passes_skill_flags(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hermes proposal mode should preload the repo skill and pass native CLI flags."""
+    python_bin = tmp_path / "python"
+    cli_path = tmp_path / "cli.py"
+    python_bin.write_text("", encoding="utf-8")
+    cli_path.write_text("", encoding="utf-8")
+    hermes_home = tmp_path / ".hermes"
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run(*args: Any, **kwargs: Any) -> Any:
+        captured["command"] = list(args[0])
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = dict(kwargs.get("env", {}))
+        return SimpleNamespace(returncode=0, stdout='{"candidate_index":0}', stderr="")
+
+    monkeypatch.setattr("autoresearch_loop.hermes.subprocess.run", _fake_run)
+
+    _run_hermes_query(
+        prompt="pick one",
+        config=HermesConfig(
+            python_bin=str(python_bin.relative_to(tmp_path)),
+            cli_path=str(cli_path.relative_to(tmp_path)),
+            home_dir=str(hermes_home.relative_to(tmp_path)),
+            skills=["imu-autoresearch-policy"],
+            pass_session_id=True,
+        ),
+        root=tmp_path,
+    )
+
+    command = captured["command"]
+    assert "--skills" in command
+    assert "imu-autoresearch-policy" in command
+    assert "--pass_session_id" in command
+    synced_skill = hermes_home / "skills" / "imu-autoresearch-policy" / "SKILL.md"
+    assert synced_skill.exists()
 
 
 def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
