@@ -1,0 +1,9 @@
+# Override device settings. Merged on top of base.yaml.
+# preferred: auto | cuda | mps | cpu
+# dtype: float32 | float16 | bfloat16 (bfloat16 not supported on MPS)
+# compile: true | false (not supported on MPS)
+
+device:
+  preferred: auto
+  dtype: float32
+  compile: false

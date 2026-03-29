@@ -1,0 +1,6 @@
+model:
+  name: transformer
+  hidden_dim: 128
+  num_layers: 4
+  dropout: 0.1
+  num_heads: 4

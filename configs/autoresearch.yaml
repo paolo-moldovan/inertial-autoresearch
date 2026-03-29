@@ -1,0 +1,7 @@
+autoresearch:
+  max_iterations: 50
+  time_budget_sec: 600
+  metric_key: val_rmse
+  metric_direction: minimize
+  results_file: autoresearch_loop/results.tsv
+  orchestrator: none    # none | hermes | researchclaw
