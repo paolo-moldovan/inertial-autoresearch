@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -93,6 +94,40 @@ HTML = """<!doctype html>
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .tag { font-size: 12px; color: var(--muted); }
     .status-line { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .detail-grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 16px; align-items: start; }
+    .stack { display: grid; gap: 16px; }
+    .figure-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+    .figure-card {
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .figure-card img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #020617;
+    }
+    .figure-meta {
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      font-size: 13px;
+    }
+    .artifact-list { display: grid; gap: 8px; }
+    .artifact-link {
+      display: block;
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      color: var(--fg);
+      text-decoration: none;
+    }
+    .artifact-link:hover { border-color: var(--accent); }
   </style>
 </head>
 <body>
@@ -305,6 +340,9 @@ HTML = """<!doctype html>
       const curves = detail.curves || [];
       const llmCalls = detail.llm_calls || [];
       const latestDecision = decisions[0];
+      const figureArtifacts = artifacts.filter((item) => item.artifact_type === "figure");
+      const otherArtifacts = artifacts.filter((item) => item.artifact_type !== "figure");
+      const curvePreview = curves.slice(-10);
       container.innerHTML = `
         <div class="row">
           <div class="metric"><div class="label">Run</div><div class="value">${detail.run.name}</div><div class="tag">${shortId(detail.run.id)}</div></div>
@@ -315,18 +353,56 @@ HTML = """<!doctype html>
         <div class="controls">
           <button id="rerun-btn">Queue Rerun</button>
         </div>
-        <div class="split">
+        <div class="stack">
           <div>
-            <h3>Decision</h3>
-            <pre>${latestDecision ? JSON.stringify(latestDecision, null, 2) : "No decision record."}</pre>
-            <h3>Curves</h3>
-            <pre>${curves.length ? JSON.stringify(curves.slice(-10), null, 2) : "No curves."}</pre>
+            <h3>Figures</h3>
+            ${
+              figureArtifacts.length
+                ? `<div class="figure-grid">${figureArtifacts.map((artifact) => `
+                    <div class="figure-card">
+                      <a href="/artifact?path=${encodeURIComponent(artifact.path)}" target="_blank" rel="noreferrer">
+                        <img src="/artifact?path=${encodeURIComponent(artifact.path)}" alt="${artifact.label || artifact.artifact_type}">
+                      </a>
+                      <div class="figure-meta">
+                        <strong>${artifact.label || artifact.artifact_type}</strong>
+                        <span class="tag">${shortId(artifact.id)}</span>
+                      </div>
+                    </div>
+                  `).join("")}</div>`
+                : "<div class='muted'>No figure artifacts for this run yet.</div>"
+            }
           </div>
-          <div>
-            <h3>Artifacts</h3>
-            <pre>${artifacts.length ? JSON.stringify(artifacts, null, 2) : "No artifacts."}</pre>
-            <h3>LLM Calls</h3>
-            <pre>${llmCalls.length ? JSON.stringify(llmCalls.slice(0, 3), null, 2) : "No LLM calls."}</pre>
+          <div class="detail-grid">
+            <div class="stack">
+              <div>
+                <h3>Training Curves</h3>
+                <pre>${curvePreview.length ? JSON.stringify(curvePreview, null, 2) : "No curves."}</pre>
+              </div>
+              <div>
+                <h3>Decision</h3>
+                <pre>${latestDecision ? JSON.stringify(latestDecision, null, 2) : "No decision record."}</pre>
+              </div>
+            </div>
+            <div class="stack">
+              <div>
+                <h3>Artifacts</h3>
+                ${
+                  otherArtifacts.length
+                    ? `<div class="artifact-list">${otherArtifacts.map((artifact) => `
+                        <a class="artifact-link" href="/artifact?path=${encodeURIComponent(artifact.path)}" target="_blank" rel="noreferrer">
+                          <strong>${artifact.label || artifact.artifact_type}</strong>
+                          <div class="tag">${artifact.artifact_type}</div>
+                        </a>
+                      `).join("")}</div>`
+                    : "<div class='muted'>No non-figure artifacts.</div>"
+                }
+              </div>
+              <div>
+                <h3>LLM Calls</h3>
+                <pre>${llmCalls.length ? JSON.stringify(llmCalls.slice(0, 3), null, 2) : "No LLM calls."}</pre>
+              </div>
+            </div>
+          </div>
           </div>
         </div>
       `;
@@ -401,6 +477,7 @@ def run_web_dashboard(*, db_path: Path, blob_dir: Path, host: str, port: int) ->
     )
     controller = LoopController(store=store, writer=writer)
     queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
+    artifacts_root = db_path.resolve().parent.parent
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -424,6 +501,17 @@ def run_web_dashboard(*, db_path: Path, blob_dir: Path, host: str, port: int) ->
             if parsed.path == "/api/run":
                 run_id = parse_qs(parsed.query).get("run_id", [""])[0]
                 self._send_json(queries.get_run_detail(run_id) or {})
+                return
+            if parsed.path == "/artifact":
+                path_value = parse_qs(parsed.query).get("path", [""])[0]
+                artifact_path = Path(path_value).expanduser().resolve()
+                if not self._is_allowed_artifact_path(artifact_path):
+                    self.send_error(HTTPStatus.FORBIDDEN, "artifact path is outside the allowed roots")
+                    return
+                if not artifact_path.exists() or not artifact_path.is_file():
+                    self.send_error(HTTPStatus.NOT_FOUND, "artifact not found")
+                    return
+                self._send_file(artifact_path)
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -486,6 +574,20 @@ def run_web_dashboard(*, db_path: Path, blob_dir: Path, host: str, port: int) ->
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_file(self, path: Path) -> None:
+            body = path.read_bytes()
+            mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _is_allowed_artifact_path(self, path: Path) -> bool:
+            allowed_roots = [artifacts_root, blob_dir.resolve()]
+            return any(path.is_relative_to(root) for root in allowed_roots)
 
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Mission Control dashboard listening on http://{host}:{port}")

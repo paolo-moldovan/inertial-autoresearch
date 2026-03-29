@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
@@ -288,6 +290,11 @@ class Trainer:
                 label="history",
                 source="runtime",
             )
+            self._generate_summary_figures(
+                run_id=run_id,
+                val_loader=val_loader,
+                test_loader=test_loader,
+            )
 
             artifacts = TrainingArtifacts(
                 run_dir=self.run_paths.root,
@@ -426,6 +433,133 @@ class Trainer:
         if self.config.data.dataset == "blackbird":
             return 100.0
         return 200.0
+
+    def _generate_summary_figures(
+        self,
+        *,
+        run_id: str,
+        val_loader: DataLoader[Any],
+        test_loader: DataLoader[Any] | None,
+    ) -> None:
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+
+        from matplotlib import pyplot as plt
+
+        from imu_denoise.evaluation.visualization import (
+            plot_denoising_comparison,
+            plot_error_distribution,
+            plot_psd,
+            plot_training_curves,
+        )
+
+        self.run_paths.figures_dir.mkdir(parents=True, exist_ok=True)
+
+        curves_path = self.run_paths.figures_dir / "training_curves.png"
+        curves_fig = plot_training_curves(self.history_path, save_path=curves_path)
+        plt.close(curves_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=curves_path,
+            artifact_type="figure",
+            label="training_curves",
+            source="runtime",
+        )
+
+        sample_batch = self._first_batch(test_loader) or self._first_batch(val_loader)
+        if sample_batch is None:
+            return
+
+        noisy_tensor, clean_tensor = self._unpack_batch(sample_batch)
+        timestamps_tensor = (
+            sample_batch.get("timestamps") if isinstance(sample_batch, dict) else None
+        )
+        noisy = noisy_tensor.to(self.device_ctx.device)
+        self.model.eval()
+        with torch.no_grad():
+            denoised = self.model(noisy).detach().cpu().float().numpy()
+
+        noisy_np = noisy.detach().cpu().float().numpy()
+        clean_np = clean_tensor.detach().cpu().float().numpy()
+        timestamps = self._timestamps_for_batch(
+            timestamps_tensor=timestamps_tensor,
+            sample_count=noisy_np.shape[1],
+        )
+        sample_index = 0
+
+        comparison_path = self.run_paths.figures_dir / "denoising_comparison.png"
+        comparison_fig = plot_denoising_comparison(
+            noisy=noisy_np[sample_index],
+            denoised=denoised[sample_index],
+            clean=clean_np[sample_index],
+            timestamps=timestamps[sample_index],
+            title=f"{self.config.name} denoising comparison",
+            save_path=comparison_path,
+        )
+        plt.close(comparison_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=comparison_path,
+            artifact_type="figure",
+            label="denoising_comparison",
+            source="runtime",
+        )
+
+        psd_path = self.run_paths.figures_dir / "psd.png"
+        psd_fig = plot_psd(
+            signals={
+                "noisy": noisy_np[sample_index],
+                "denoised": denoised[sample_index],
+                "clean": clean_np[sample_index],
+            },
+            fs=self._sampling_rate_hz(),
+            title=f"{self.config.name} PSD",
+            save_path=psd_path,
+        )
+        plt.close(psd_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=psd_path,
+            artifact_type="figure",
+            label="psd",
+            source="runtime",
+        )
+
+        errors_path = self.run_paths.figures_dir / "error_distribution.png"
+        errors_fig = plot_error_distribution(
+            errors=(denoised[sample_index] - clean_np[sample_index]),
+            title=f"{self.config.name} error distribution",
+            save_path=errors_path,
+        )
+        plt.close(errors_fig)
+        self.observability.register_artifact(
+            run_id=run_id,
+            path=errors_path,
+            artifact_type="figure",
+            label="error_distribution",
+            source="runtime",
+        )
+
+    @staticmethod
+    def _first_batch(dataloader: DataLoader[Any] | None) -> dict[str, Any] | tuple[Any, ...] | None:
+        if dataloader is None:
+            return None
+        iterator = iter(dataloader)
+        try:
+            return cast(dict[str, Any] | tuple[Any, ...], next(iterator))
+        except StopIteration:
+            return None
+
+    def _timestamps_for_batch(
+        self,
+        *,
+        timestamps_tensor: torch.Tensor | None,
+        sample_count: int,
+    ) -> np.ndarray:
+        if timestamps_tensor is not None:
+            return timestamps_tensor.detach().cpu().float().numpy()
+        dt = 1.0 / self._sampling_rate_hz()
+        return np.tile(np.arange(sample_count, dtype=np.float32) * dt, (1, 1))
 
     def _step_scheduler(self, val_loss: float) -> None:
         if self.scheduler is None:
