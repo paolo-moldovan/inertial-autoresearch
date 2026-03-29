@@ -334,23 +334,24 @@ def _resolve_baseline_reference(base_config: ExperimentConfig) -> BaselineRefere
         )
 
     if policy == "global":
-        baseline = queries.find_latest_global_baseline(
+        baseline = queries.find_best_global_incumbent(
             metric_key=base_config.autoresearch.metric_key,
             dataset=base_config.data.dataset,
-            model=base_config.model.name,
+            direction=base_config.autoresearch.metric_direction,
+            reference_config=base_config,
         )
         if baseline is None:
             return BaselineReference(
                 include_baseline_run=True,
                 metric_value=None,
                 run_id=None,
-                description="global baseline not found; falling back to per-loop baseline",
+                description="global incumbent not found; falling back to per-loop baseline",
             )
         return BaselineReference(
             include_baseline_run=False,
             metric_value=float(baseline["metric_value"]),
             run_id=str(baseline["run_id"]),
-            description=f"global baseline {str(baseline['run_id'])[:8]}",
+            description=f"global incumbent {str(baseline['run_id'])[:8]}",
         )
 
     if policy == "manual":

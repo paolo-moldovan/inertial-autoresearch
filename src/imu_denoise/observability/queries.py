@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,36 @@ def _loads(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
     return value
+
+
+def _data_regime_payload(config_payload: Mapping[str, Any]) -> dict[str, Any]:
+    data = config_payload.get("data")
+    if not isinstance(data, Mapping):
+        return {}
+    return {
+        "dataset": data.get("dataset"),
+        "sequences": data.get("sequences"),
+        "train_sequences": data.get("train_sequences"),
+        "val_sequences": data.get("val_sequences"),
+        "test_sequences": data.get("test_sequences"),
+        "window_size": data.get("window_size"),
+        "stride": data.get("stride"),
+        "normalize": data.get("normalize"),
+        "dataset_kwargs": data.get("dataset_kwargs"),
+        "subset": data.get("subset"),
+    }
+
+
+def _data_regime_fingerprint_from_payload(config_payload: Mapping[str, Any]) -> str:
+    return sha256(
+        json.dumps(
+            _data_regime_payload(config_payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 class MissionControlQueries:
@@ -283,41 +316,77 @@ class MissionControlQueries:
             return None
         return float(row["metric_value"])
 
-    def find_latest_global_baseline(
+    def find_best_global_incumbent(
         self,
         *,
         metric_key: str,
         dataset: str,
-        model: str,
+        direction: str = "minimize",
+        reference_config: Mapping[str, Any] | Any | None = None,
     ) -> dict[str, Any] | None:
         metric_keys = [metric_key]
         if metric_key == "val_rmse":
             metric_keys.append("rmse")
-        row = self.store.fetch_one(
-            """
+        order_direction = "DESC" if direction == "maximize" else "ASC"
+        rows = self.store.fetch_all(
+            f"""
+            WITH ranked_decisions AS (
+                SELECT
+                    d.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.run_id
+                        ORDER BY d.created_at DESC, d.id DESC
+                    ) AS row_num
+                FROM decisions d
+                WHERE d.metric_key IN (?, ?)
+            )
             SELECT
                 r.id AS run_id,
                 r.name AS run_name,
                 r.dataset,
                 r.model,
-                d.metric_key,
-                d.metric_value,
-                d.created_at
-            FROM decisions d
-            JOIN runs r ON r.id = d.run_id
-            WHERE r.phase = 'training'
+                e.config_json,
+                rd.proposal_source,
+                rd.status AS decision_status,
+                rd.metric_key,
+                COALESCE(rd.metric_value, s.best_metric) AS metric_value,
+                r.started_at
+            FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
+            LEFT JOIN ranked_decisions rd ON rd.run_id = r.id AND rd.row_num = 1
+            LEFT JOIN status_snapshots s ON s.run_id = r.id
+            WHERE r.phase IN ('training', 'baseline')
               AND r.status = 'completed'
               AND r.dataset = ?
-              AND r.model = ?
-              AND d.status = 'baseline'
-              AND d.metric_key IN (?, ?)
-              AND d.metric_value IS NOT NULL
-            ORDER BY d.created_at DESC
-            LIMIT 1
+              AND COALESCE(rd.metric_value, s.best_metric) IS NOT NULL
+              AND (rd.status IS NULL OR rd.status IN ('baseline', 'keep', 'completed'))
+            ORDER BY COALESCE(rd.metric_value, s.best_metric) {order_direction}, r.started_at DESC
             """,
-            (dataset, model, metric_keys[0], metric_keys[-1]),
+            (metric_keys[0], metric_keys[-1], dataset),
         )
-        return row
+        reference_payload: Mapping[str, Any] | None = None
+        if reference_config is not None:
+            candidate_payload: Any
+            if is_dataclass(reference_config) and not isinstance(reference_config, type):
+                candidate_payload = asdict(reference_config)
+            else:
+                candidate_payload = reference_config
+            if isinstance(candidate_payload, Mapping):
+                reference_payload = candidate_payload
+        reference_fingerprint = (
+            _data_regime_fingerprint_from_payload(reference_payload)
+            if reference_payload is not None
+            else None
+        )
+        for row in rows:
+            config_payload = _loads(row.pop("config_json", None))
+            if reference_fingerprint is None:
+                return row
+            if not isinstance(config_payload, Mapping):
+                continue
+            if _data_regime_fingerprint_from_payload(config_payload) == reference_fingerprint:
+                return row
+        return None
 
     def resolve_id_fragment(self, fragment: str) -> dict[str, Any] | None:
         normalized = fragment.strip()

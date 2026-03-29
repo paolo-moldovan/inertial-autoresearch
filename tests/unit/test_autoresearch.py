@@ -11,7 +11,10 @@ from _pytest.monkeypatch import MonkeyPatch
 from autoresearch_loop.hermes import HermesQueryTrace
 from autoresearch_loop.loop import build_parser, run_autoresearch
 from autoresearch_loop.mutations import MutationProposal, build_mutation_schedule
+from imu_denoise.cli.common import resolve_config
+from imu_denoise.config import DataConfig, ExperimentConfig, ObservabilityConfig
 from imu_denoise.observability import MissionControlQueries
+from imu_denoise.observability.writer import ObservabilityWriter
 
 
 def test_mutation_schedule_is_baseline_first() -> None:
@@ -153,8 +156,198 @@ def test_loop_parser_does_not_inject_quick_config_when_explicit_config_is_passed
     assert args.config == ["configs/mission_control/hermes_euroc_subset.yaml"]
 
 
-def test_autoresearch_global_baseline_reuses_previous_baseline(tmp_path: Path) -> None:
-    """Global baseline mode should reuse the latest compatible baseline run."""
+def test_global_incumbent_prefers_best_accepted_run_over_latest_baseline(tmp_path: Path) -> None:
+    """Global mode should use the best accepted prior run, not merely the last baseline."""
+    config = ExperimentConfig(
+        observability=ObservabilityConfig(
+            enabled=True,
+            db_path=str(tmp_path / "observability" / "mission_control.db"),
+            blob_dir=str(tmp_path / "observability" / "blobs"),
+        ),
+    )
+    writer = ObservabilityWriter.from_experiment_config(config)
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+
+    baseline_run = writer.start_run(
+        name="baseline-run",
+        phase="training",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=config,
+    )
+    writer.finish_run(
+        run_id=baseline_run,
+        status="completed",
+        summary={"best_val_rmse": 0.40},
+    )
+    writer.record_decision(
+        run_id=baseline_run,
+        iteration=0,
+        proposal_source="static",
+        description="baseline",
+        status="baseline",
+        metric_key="val_rmse",
+        metric_value=0.40,
+        overrides=[],
+    )
+
+    keep_run = writer.start_run(
+        name="better-run",
+        phase="training",
+        dataset="synthetic",
+        model="conv1d",
+        device="cpu",
+        config=config,
+    )
+    writer.finish_run(
+        run_id=keep_run,
+        status="completed",
+        summary={"best_val_rmse": 0.20},
+    )
+    writer.record_decision(
+        run_id=keep_run,
+        iteration=1,
+        proposal_source="hermes",
+        description="better model",
+        status="keep",
+        metric_key="val_rmse",
+        metric_value=0.20,
+        overrides=["model.name=conv1d"],
+    )
+
+    newer_baseline_run = writer.start_run(
+        name="newer-baseline",
+        phase="training",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=config,
+    )
+    writer.finish_run(
+        run_id=newer_baseline_run,
+        status="completed",
+        summary={"best_val_rmse": 0.35},
+    )
+    writer.record_decision(
+        run_id=newer_baseline_run,
+        iteration=0,
+        proposal_source="static",
+        description="baseline",
+        status="baseline",
+        metric_key="val_rmse",
+        metric_value=0.35,
+        overrides=[],
+    )
+
+    incumbent = queries.find_best_global_incumbent(
+        metric_key="val_rmse",
+        dataset="synthetic",
+        direction="minimize",
+        reference_config=config,
+    )
+
+    assert incumbent is not None
+    assert incumbent["run_id"] == keep_run
+    assert incumbent["decision_status"] == "keep"
+    assert float(incumbent["metric_value"]) == 0.20
+
+
+def test_global_incumbent_requires_matching_data_regime(tmp_path: Path) -> None:
+    """Global mode should ignore runs from a different split/subset regime."""
+    reference_config = ExperimentConfig(
+        observability=ObservabilityConfig(
+            enabled=True,
+            db_path=str(tmp_path / "observability" / "mission_control.db"),
+            blob_dir=str(tmp_path / "observability" / "blobs"),
+        ),
+    )
+    writer = ObservabilityWriter.from_experiment_config(reference_config)
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+
+    matching_config = ExperimentConfig(
+        data=reference_config.data,
+        observability=reference_config.observability,
+    )
+    mismatched_config = ExperimentConfig(
+        data=DataConfig(
+            dataset="synthetic",
+            window_size=32,
+            stride=16,
+            normalize=True,
+            augment=False,
+        ),
+        observability=reference_config.observability,
+    )
+
+    matching_run = writer.start_run(
+        name="matching-run",
+        phase="training",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=matching_config,
+    )
+    writer.finish_run(
+        run_id=matching_run,
+        status="completed",
+        summary={"best_val_rmse": 0.30},
+    )
+    writer.record_decision(
+        run_id=matching_run,
+        iteration=0,
+        proposal_source="static",
+        description="baseline",
+        status="baseline",
+        metric_key="val_rmse",
+        metric_value=0.30,
+        overrides=[],
+    )
+
+    better_but_mismatched = writer.start_run(
+        name="mismatched-better",
+        phase="training",
+        dataset="synthetic",
+        model="conv1d",
+        device="cpu",
+        config=mismatched_config,
+    )
+    writer.finish_run(
+        run_id=better_but_mismatched,
+        status="completed",
+        summary={"best_val_rmse": 0.10},
+    )
+    writer.record_decision(
+        run_id=better_but_mismatched,
+        iteration=1,
+        proposal_source="hermes",
+        description="better but mismatched",
+        status="keep",
+        metric_key="val_rmse",
+        metric_value=0.10,
+        overrides=["data.window_size=32"],
+    )
+
+    incumbent = queries.find_best_global_incumbent(
+        metric_key="val_rmse",
+        dataset="synthetic",
+        direction="minimize",
+        reference_config=reference_config,
+    )
+
+    assert incumbent is not None
+    assert incumbent["run_id"] == matching_run
+    assert float(incumbent["metric_value"]) == 0.30
+
+
+def test_autoresearch_global_baseline_reuses_previous_best_incumbent(tmp_path: Path) -> None:
+    """Global baseline mode should reuse the best compatible prior incumbent."""
     results_path = tmp_path / "results.tsv"
     common_overrides = [
         f"autoresearch.results_file={results_path}",
@@ -196,6 +389,18 @@ def test_autoresearch_global_baseline_reuses_previous_baseline(tmp_path: Path) -
     )
     assert len(second_results) == 1
     assert second_results[0].status in {"keep", "discard"}
+    queries = MissionControlQueries(
+        db_path=tmp_path / "observability" / "mission_control.db",
+        blob_dir=tmp_path / "observability" / "blobs",
+    )
+    incumbent = queries.find_best_global_incumbent(
+        metric_key="val_rmse",
+        dataset="synthetic",
+        direction="minimize",
+        reference_config=resolve_config(config_paths, common_overrides),
+    )
+    assert incumbent is not None
+    assert incumbent["decision_status"] in {"baseline", "keep", "completed"}
 
 
 def test_autoresearch_manual_baseline_uses_selected_run(tmp_path: Path) -> None:

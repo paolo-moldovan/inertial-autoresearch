@@ -6,7 +6,7 @@ autoresearch:
   results_file: artifacts/autoresearch/results.tsv
   orchestrator: hermes    # none | hermes | researchclaw
   baseline:
-    mode: per_loop        # per_loop | global | manual
+    mode: global        # per_loop | global | manual
     run_id: ""
   hermes:
     python_bin: vendor/hermes-agent/.venv/bin/python
