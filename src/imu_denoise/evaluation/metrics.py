@@ -6,13 +6,10 @@ All metric functions accept arrays of shape ``(N, C)`` where ``C`` is typically
 
 from __future__ import annotations
 
-from typing import cast
-
 import numpy as np
-from numpy.typing import NDArray
 
 
-def rmse(pred: NDArray[np.floating], target: NDArray[np.floating]) -> float:
+def rmse(pred: np.ndarray, target: np.ndarray) -> float:
     """Root mean squared error across all elements.
 
     Args:
@@ -25,7 +22,7 @@ def rmse(pred: NDArray[np.floating], target: NDArray[np.floating]) -> float:
     return float(np.sqrt(np.mean((pred - target) ** 2)))
 
 
-def mae(pred: NDArray[np.floating], target: NDArray[np.floating]) -> float:
+def mae(pred: np.ndarray, target: np.ndarray) -> float:
     """Mean absolute error across all elements.
 
     Args:
@@ -38,10 +35,7 @@ def mae(pred: NDArray[np.floating], target: NDArray[np.floating]) -> float:
     return float(np.mean(np.abs(pred - target)))
 
 
-def rmse_per_axis(
-    pred: NDArray[np.floating],
-    target: NDArray[np.floating],
-) -> NDArray[np.floating]:
+def rmse_per_axis(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Root mean squared error computed independently per channel.
 
     Args:
@@ -51,14 +45,10 @@ def rmse_per_axis(
     Returns:
         Array of shape ``(C,)`` with per-axis RMSE.
     """
-    return cast(NDArray[np.floating], np.sqrt(np.mean((pred - target) ** 2, axis=0)))
+    return np.asarray(np.sqrt(np.mean((pred - target) ** 2, axis=0)))
 
 
-def spectral_divergence(
-    pred: NDArray[np.floating],
-    target: NDArray[np.floating],
-    fs: float,
-) -> float:
+def spectral_divergence(pred: np.ndarray, target: np.ndarray, fs: float) -> float:
     """Log spectral distance between predicted and target signals.
 
     Computes the average log-ratio of power spectral densities across all channels
@@ -88,9 +78,7 @@ def spectral_divergence(
 
 
 def compute_all_metrics(
-    pred: NDArray[np.floating],
-    target: NDArray[np.floating],
-    fs: float = 200.0,
+    pred: np.ndarray, target: np.ndarray, fs: float = 200.0
 ) -> dict[str, float]:
     """Compute the full suite of evaluation metrics.
 

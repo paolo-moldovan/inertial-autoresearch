@@ -13,7 +13,7 @@ def render_dashboard(*, db_path: Path, blob_dir: Path) -> None:
     """Render the read-only Streamlit dashboard."""
     try:
         import pandas as pd  # type: ignore[import-untyped]
-        import streamlit as st  # type: ignore[import-not-found]
+        import streamlit as st
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "Streamlit is not installed. Install `imu-denoise[monitor]` to use imu-dashboard."
@@ -81,6 +81,12 @@ def _render_run_detail(st: Any, pd: Any, queries: MissionControlQueries) -> None
         st.json(detail["experiment"]["config"])
     st.subheader("Timeline")
     st.dataframe(pd.DataFrame(detail["timeline"]), use_container_width=True)
+    st.subheader("Decisions")
+    st.dataframe(pd.DataFrame(detail["decisions"]), use_container_width=True)
+    st.subheader("LLM Calls")
+    st.dataframe(pd.DataFrame(detail["llm_calls"]), use_container_width=True)
+    st.subheader("Tool Calls")
+    st.dataframe(pd.DataFrame(detail["tool_calls"]), use_container_width=True)
     st.subheader("Artifacts")
     _artifact_gallery(st, pd, detail["artifacts"])
     st.subheader("Logs")
@@ -119,6 +125,14 @@ def _render_llm_traces(st: Any, queries: MissionControlQueries) -> None:
     if detail.get("stderr"):
         st.subheader("Stderr")
         st.code(detail["stderr"])
+    tool_calls = queries.list_tool_calls(
+        llm_call_id=labels[selected],
+        limit=50,
+        include_payload=True,
+    )
+    if tool_calls:
+        st.subheader("Tool Calls")
+        st.dataframe(tool_calls, use_container_width=True)
 
 
 def _render_memories_and_skills(st: Any, pd: Any, queries: MissionControlQueries) -> None:

@@ -1,119 +1,155 @@
-# IMU Denoise
+# IMU Denoising Auto-Research
 
-Autonomous research infrastructure for IMU denoising experiments across CUDA,
-Apple MPS, and CPU backends.
+Autonomous research pipeline for IMU denoising with deep models, classical baselines, Hermes + Ollama orchestration, and Mission Control observability.
 
-The repository is organized around a typed Python package in
-`src/imu_denoise/`, YAML-based experiment configuration in `configs/`, thin
-CLI entrypoints in `scripts/`, and vendorized research tooling in `vendor/`.
+## Setup
 
-## Current Status
-
-The repo now includes:
-
-- typed config loading with hierarchical YAML merge
-- multi-device data, training, evaluation, and auto-research loops
-- Hermes-driven autoresearch orchestration via local Ollama (`qwen3.5`)
-- model zoo with LSTM, Conv1D, and Transformer baselines
-- classical baselines with Kalman and complementary smoothing
-- mission-control observability with SQLite-backed traces, backfill, TUI, and dashboard
-- package-backed CLI entrypoints, CI, and Docker assets
-- synthetic quick-run path for fast verification
-
-## Quick Start
+Base dev environment:
 
 ```bash
-uv sync
-uv run -m pytest tests/unit
-uv run scripts/train.py --config configs/training/quick.yaml
-uv run scripts/evaluate.py --config configs/training/quick.yaml --checkpoint artifacts/checkpoints/default/best.pt
-uv run scripts/run_baseline.py --config configs/training/quick.yaml --baseline kalman
-uv run autoresearch_loop/loop.py --max-iterations 1
+uv sync --extra dev
 ```
 
-## Repository Layout
-
-- `src/imu_denoise/`: installable Python package
-- `configs/`: experiment configuration fragments
-- `scripts/`: thin wrappers around package CLI modules
-- `tests/`: unit, integration, and smoke tests
-- `autoresearch_loop/`: local config-first and Hermes-assisted experiment loop
-- `vendor/`: external tools and datasets kept isolated from package imports
-- `docker/`: container image and compose stack
-- `.github/workflows/`: CI automation
-
-## Useful Commands
+With Mission Control UIs:
 
 ```bash
-# Train a quick synthetic experiment
-uv run scripts/train.py --config configs/training/quick.yaml
+uv sync --extra dev --extra monitor
+```
 
-# Evaluate the resulting checkpoint
+With Phase 2 observability adapters (MLflow + Phoenix):
+
+```bash
+uv sync --extra dev --extra monitor --extra monitor-adapters
+```
+
+## Core Commands
+
+Train a model:
+
+```bash
+uv run scripts/train.py --config configs/models/lstm.yaml
+```
+
+Quick synthetic smoke run:
+
+```bash
+uv run scripts/train.py --config configs/models/lstm.yaml --config configs/training/quick.yaml
+```
+
+Evaluate a checkpoint:
+
+```bash
 uv run scripts/evaluate.py \
+  --config configs/models/lstm.yaml \
   --config configs/training/quick.yaml \
   --checkpoint artifacts/checkpoints/default/best.pt
-
-# Run a classical baseline
-uv run scripts/run_baseline.py \
-  --config configs/training/quick.yaml \
-  --baseline kalman
-
-# Run one baseline + one mutation in the local autoresearch loop
-uv run autoresearch_loop/loop.py --max-iterations 1
-
-# Backfill historical logs and import Hermes sessions into mission control
-uv run scripts/observability_backfill.py
-
-# Launch the live TUI monitor
-uv run scripts/monitor.py
-
-# Launch the Streamlit dashboard
-uv run scripts/dashboard.py
-
-# Start the whole stack with tmuxinator
-uv run scripts/start_mission_control.py
 ```
 
-## Hermes + Ollama
+Run a classical baseline:
 
-`configs/autoresearch.yaml` is set up to use the vendored Hermes CLI with a
-local Ollama endpoint at `http://127.0.0.1:11434/v1` and the `qwen3.5:latest`
-model. The current integration is config-first: Hermes chooses the next safe
-mutation from the bounded candidate pool, while training and evaluation still
-run through the local Python stack. If Hermes or Ollama is unavailable, the
-loop falls back to the deterministic built-in mutation schedule.
+```bash
+uv run scripts/run_baseline.py --config configs/training/quick.yaml --baseline kalman
+```
+
+Preprocess data:
+
+```bash
+uv run scripts/preprocess_data.py
+```
+
+## AutoResearch
+
+Local Hermes + Ollama smoke run:
+
+```bash
+uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml
+```
+
+The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is `autoresearch_loop/loop.py`.
 
 ## Mission Control
 
-Mission control stores a repo-local observability database under
-`artifacts/observability/` and indexes:
+One command to run the dashboard:
 
-- live run status and training epochs
-- autoresearch decisions and mutation history
-- raw Hermes/Ollama prompt and response traces
-- Hermes session imports from `.hermes/`
-- registered artifacts such as checkpoints, metrics, and figures
+```bash
+uv run --extra monitor imu-dashboard
+```
 
-The read-only surfaces are:
+That starts the Streamlit dashboard on `http://localhost:8501` by default.
 
-- `imu-monitor` / `scripts/monitor.py`: Textual TUI for live status
-- `imu-dashboard` / `scripts/dashboard.py`: Streamlit browser dashboard
-- `imu-observability-backfill` / `scripts/observability_backfill.py`: historical import
-- `imu-mission-control` / `scripts/start_mission_control.py`: tmuxinator stack launcher
+One command to run the live Textual monitor:
 
-The default stack config for the local Hermes + Ollama smoke path lives at
-`configs/mission_control/hermes_smoke.yaml`, and the tmuxinator project file
-is at `.tmuxinator/mission-control.yml`.
+```bash
+uv run --extra monitor imu-monitor
+```
 
-## CI And Docker
+Backfill existing artifacts and Hermes state into Mission Control:
 
-- CI workflow: [ci.yml](./.github/workflows/ci.yml)
-- Docker image: [Dockerfile](./docker/Dockerfile)
-- Compose stack: [docker-compose.yml](./docker/docker-compose.yml)
+```bash
+uv run --extra monitor imu-observability-backfill
+```
 
-## Design Principles
+Start the full tmuxinator Mission Control session:
 
-- One clean package boundary: application code lives under `src/imu_denoise/`
-- Device portability first: CUDA > MPS > CPU with explicit overrides
-- Reproducibility over magic: typed config, fixed outputs, deterministic tests
-- Vendor isolation: local adapters and CLI wrappers instead of direct imports
+```bash
+uv run scripts/start_mission_control.py
+```
+
+That session starts:
+- backfill
+- monitor
+- dashboard
+- autoresearch
+
+## Mission Control Phase 2
+
+Enable the external adapter config:
+
+```bash
+uv run --extra monitor-adapters imu-observability-sync \
+  --config configs/mission_control/adapters.yaml \
+  --target all
+```
+
+Sync only MLflow:
+
+```bash
+uv run --extra monitor-adapters imu-observability-sync \
+  --config configs/mission_control/adapters.yaml \
+  --target mlflow
+```
+
+Sync only Phoenix:
+
+```bash
+uv run --extra monitor-adapters imu-observability-sync \
+  --config configs/mission_control/adapters.yaml \
+  --target phoenix
+```
+
+## Testing
+
+Focused unit tests:
+
+```bash
+uv run --extra dev python -m pytest tests/unit
+```
+
+Lint:
+
+```bash
+uv run --extra dev ruff check src tests scripts
+```
+
+Type checking:
+
+```bash
+uv run --extra dev mypy src
+```
+
+## Notes
+
+- Device auto-detection is `CUDA > MPS > CPU`.
+- Override device manually with `--set device.preferred=cpu`.
+- Default Mission Control database: `artifacts/observability/mission_control.db`
+- Default Mission Control blob store: `artifacts/observability/blobs`

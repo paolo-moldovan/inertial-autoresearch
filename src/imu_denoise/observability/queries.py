@@ -247,6 +247,7 @@ class MissionControlQueries:
             "artifacts": self.list_artifacts(run_id=run_id),
             "decisions": self.list_decisions_for_run(run_id),
             "llm_calls": self.list_llm_calls_for_run(run_id),
+            "tool_calls": self.list_tool_calls(run_id=run_id, limit=200),
             "logs": self.list_logs(run_id, limit=100),
         }
 
@@ -316,6 +317,46 @@ class MissionControlQueries:
             row["parsed_payload"] = _loads(row.pop("parsed_payload_json"))
         return rows
 
+    def list_tool_calls(
+        self,
+        *,
+        run_id: str | None = None,
+        session_id: str | None = None,
+        llm_call_id: str | None = None,
+        limit: int = 200,
+        include_payload: bool = False,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if llm_call_id is not None:
+            conditions.append("llm_call_id = ?")
+            params.append(llm_call_id)
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT *
+            FROM tool_calls
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        )
+        if include_payload:
+            for row in rows:
+                ref = row.get("payload_blob_ref")
+                if isinstance(ref, str):
+                    row["payload"] = self.store.blobs.read_json(ref)
+        return rows
+
     def list_memory_events(
         self,
         *,
@@ -378,4 +419,3 @@ class MissionControlQueries:
             row["resolved"] = _loads(row.pop("resolved_json"))
             row["missing"] = _loads(row.pop("missing_json"))
         return rows
-

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ class Evaluator:
         self.device_ctx = device_ctx
         self.model = device_ctx.to_device(self.model)
 
-    def evaluate(self, dataloader: DataLoader, fs: float = 200.0) -> dict[str, float]:
+    def evaluate(self, dataloader: DataLoader[Any], fs: float = 200.0) -> dict[str, float]:
         """Evaluate the model on an entire dataloader and compute aggregate metrics.
 
         Expects each batch to yield a dictionary (or tuple) with keys/positions:
@@ -68,7 +68,7 @@ class Evaluator:
     def evaluate_from_checkpoint(
         self,
         checkpoint_path: Path,
-        dataloader: DataLoader,
+        dataloader: DataLoader[Any],
         model_config: ModelConfig,
         fs: float = 200.0,
     ) -> dict[str, float]:
@@ -92,7 +92,9 @@ class Evaluator:
         return self.evaluate(dataloader, fs=fs)
 
     @staticmethod
-    def _unpack_batch(batch: dict | tuple) -> tuple[torch.Tensor, torch.Tensor]:
+    def _unpack_batch(
+        batch: dict[str, torch.Tensor] | tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract noisy and clean tensors from a batch.
 
         Supports both dict-style (``{"noisy": ..., "clean": ...}``) and

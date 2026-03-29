@@ -12,9 +12,9 @@ from imu_denoise.observability.queries import MissionControlQueries
 def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
     """Start the Textual read-only monitor."""
     try:
-        from textual.app import App, ComposeResult  # type: ignore[import-not-found]
-        from textual.containers import Horizontal, Vertical  # type: ignore[import-not-found]
-        from textual.widgets import (  # type: ignore[import-not-found]
+        from textual.app import App, ComposeResult
+        from textual.containers import Horizontal, Vertical
+        from textual.widgets import (
             DataTable,
             Footer,
             Header,
@@ -27,7 +27,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
 
     queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
 
-    class MissionControlApp(App):  # type: ignore[misc]
+    class MissionControlApp(App[None]):
         """Minimal live console for run, decision, and trace status."""
 
         BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh")]
