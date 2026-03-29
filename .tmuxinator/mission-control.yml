@@ -1,0 +1,20 @@
+name: imu-mission-control
+root: <%= ENV.fetch("IMU_AUTORESEARCH_ROOT", "/Users/paolo/development/inertial-autoresearch") %>
+
+pre: uv sync --extra monitor
+pre_window: export PYTHONUNBUFFERED=1
+
+windows:
+  - backfill:
+      panes:
+        - uv run scripts/observability_backfill.py --config configs/mission_control/hermes_smoke.yaml; exec $SHELL -l
+  - monitor:
+      panes:
+        - uv run scripts/monitor.py --config configs/mission_control/hermes_smoke.yaml
+  - dashboard:
+      panes:
+        - uv run scripts/dashboard.py --config configs/mission_control/hermes_smoke.yaml
+  - autoresearch:
+      panes:
+        - uv run autoresearch_loop/loop.py --config configs/mission_control/hermes_smoke.yaml
+

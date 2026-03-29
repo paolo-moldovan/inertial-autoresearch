@@ -1,0 +1,30 @@
+name: mission-control-smoke
+
+training:
+  epochs: 1
+  batch_size: 4
+
+data:
+  dataset: synthetic
+  window_size: 20
+  stride: 10
+  normalize: false
+  augment: false
+  dataset_kwargs:
+    duration_sec: 2.0
+    rate_hz: 20.0
+    num_sequences: 3
+
+autoresearch:
+  max_iterations: 1
+  orchestrator: hermes
+  results_file: artifacts/autoresearch/mission_control_smoke.tsv
+  hermes:
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3.5:latest
+
+observability:
+  db_path: artifacts/observability/mission_control.db
+  blob_dir: artifacts/observability/blobs
+  streamlit_port: 8501
+
