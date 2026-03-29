@@ -162,6 +162,15 @@ The `control` pane is the session supervisor. In that pane you can:
 - type `list` to show pane mappings
 - type `exit` or press `Ctrl-C` to kill the entire Mission Control session immediately
 
+From any pane in the grid, you can also use tmux shortcuts:
+- `Ctrl-b 0` to jump back to the supervisor
+- `Ctrl-b 1` for backfill
+- `Ctrl-b 2` for the monitor
+- `Ctrl-b 3` for the dashboard
+- `Ctrl-b 4` for the autoresearch loop
+- `Ctrl-b X` to kill the full Mission Control session
+- `Ctrl-b q` to show tmux's pane-number overlay
+
 So you can watch everything at once instead of switching between tmux windows.
 
 Start the EuRoC Mission Control profile:
