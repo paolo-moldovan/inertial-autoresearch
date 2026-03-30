@@ -17,6 +17,15 @@ training:
   seed: 42
   num_workers: 4
 
+evaluation:
+  frequency_epochs: 1
+  metrics:
+    - rmse
+    - mae
+    - spectral_divergence
+  reconstruction: none
+  realtime_mode: false
+
 observability:
   enabled: true
   db_path: artifacts/observability/mission_control.db

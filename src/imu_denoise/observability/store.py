@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -281,6 +282,7 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id, created_at DES
 
 CREATE TABLE IF NOT EXISTS loop_state (
     loop_run_id TEXT PRIMARY KEY,
+    pid INTEGER,
     status TEXT NOT NULL,
     current_iteration INTEGER NOT NULL,
     max_iterations INTEGER NOT NULL,
@@ -356,6 +358,19 @@ CREATE TABLE IF NOT EXISTS import_state (
 """
 
 ACTIVE_LOOP_HEARTBEAT_TIMEOUT_SEC = 120.0
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    """Return whether a PID appears to refer to a live process."""
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _json_dumps(value: Any) -> str:
@@ -501,6 +516,13 @@ class ObservabilityStore:
                 """
                 ALTER TABLE loop_state
                 ADD COLUMN terminate_requested INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        if "pid" not in loop_state_columns:
+            conn.execute(
+                """
+                ALTER TABLE loop_state
+                ADD COLUMN pid INTEGER
                 """
             )
 
@@ -1066,6 +1088,7 @@ class ObservabilityStore:
         self,
         *,
         loop_run_id: str,
+        pid: int | None,
         status: str,
         current_iteration: int,
         max_iterations: int,
@@ -1084,12 +1107,13 @@ class ObservabilityStore:
             conn.execute(
                 """
                 INSERT INTO loop_state (
-                    loop_run_id, status, current_iteration, max_iterations, batch_size,
+                    loop_run_id, pid, status, current_iteration, max_iterations, batch_size,
                     pause_after_iteration, pause_requested, stop_requested, terminate_requested,
                     best_metric, best_run_id, active_child_run_id, heartbeat_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(loop_run_id) DO UPDATE SET
+                    pid=COALESCE(excluded.pid, loop_state.pid),
                     status=excluded.status,
                     current_iteration=excluded.current_iteration,
                     max_iterations=excluded.max_iterations,
@@ -1106,6 +1130,7 @@ class ObservabilityStore:
                 """,
                 (
                     loop_run_id,
+                    pid,
                     status,
                     current_iteration,
                     max_iterations,
@@ -1126,6 +1151,7 @@ class ObservabilityStore:
         self,
         *,
         loop_run_id: str,
+        pid: int | None,
         status: str,
         current_iteration: int,
         max_iterations: int,
@@ -1144,7 +1170,7 @@ class ObservabilityStore:
             conn.execute("BEGIN IMMEDIATE")
             active = conn.execute(
                 """
-                SELECT l.loop_run_id
+                SELECT l.loop_run_id, l.pid
                 FROM loop_state l
                 JOIN runs r ON r.id = l.loop_run_id
                 WHERE l.loop_run_id != ?
@@ -1157,17 +1183,39 @@ class ObservabilityStore:
                 (loop_run_id, _now_ts() - ACTIVE_LOOP_HEARTBEAT_TIMEOUT_SEC),
             ).fetchone()
             if active is not None:
-                conn.rollback()
-                return str(active["loop_run_id"])
+                active_row = dict(active)
+                active_pid = active_row.get("pid")
+                if _pid_is_alive(int(active_pid)) if isinstance(active_pid, int) else False:
+                    conn.rollback()
+                    return str(active["loop_run_id"])
+                stale_loop_run_id = str(active["loop_run_id"])
+                now = _now_ts()
+                conn.execute(
+                    """
+                    UPDATE loop_state
+                    SET status = ?, stop_requested = 1, terminate_requested = 1, updated_at = ?
+                    WHERE loop_run_id = ?
+                    """,
+                    ("terminated", now, stale_loop_run_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, ended_at = COALESCE(ended_at, ?)
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    ("terminated", now, stale_loop_run_id),
+                )
             conn.execute(
                 """
                 INSERT INTO loop_state (
-                    loop_run_id, status, current_iteration, max_iterations, batch_size,
+                    loop_run_id, pid, status, current_iteration, max_iterations, batch_size,
                     pause_after_iteration, pause_requested, stop_requested, terminate_requested,
                     best_metric, best_run_id, active_child_run_id, heartbeat_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(loop_run_id) DO UPDATE SET
+                    pid=COALESCE(excluded.pid, loop_state.pid),
                     status=excluded.status,
                     current_iteration=excluded.current_iteration,
                     max_iterations=excluded.max_iterations,
@@ -1184,6 +1232,7 @@ class ObservabilityStore:
                 """,
                 (
                     loop_run_id,
+                    pid,
                     status,
                     current_iteration,
                     max_iterations,

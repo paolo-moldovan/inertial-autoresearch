@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from autoresearch_loop.mutations import MutationProposal
 from imu_denoise.config import HermesConfig
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_PROJECT_SKILLS_DIR = Path(__file__).resolve().parent / "hermes_skills"
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,12 @@ def choose_mutation_proposal_with_trace(
     trace = _run_hermes_query(prompt=prompt, config=config, root=root)
     if trace.stdout is None:
         raise HermesProposalError("Hermes did not produce stdout.", trace=trace)
-    payload = _extract_json_payload(trace.stdout)
+    try:
+        payload = _extract_json_payload(trace.stdout)
+    except HermesProposalError as exc:
+        if exc.trace is not None:
+            raise
+        raise HermesProposalError(str(exc), trace=trace) from exc
     index = payload.get("candidate_index")
     if not isinstance(index, int):
         raise HermesProposalError(
@@ -170,12 +177,20 @@ def _run_hermes_query(*, prompt: str, config: HermesConfig, root: Path) -> Herme
     ]
     if config.toolsets:
         command.extend(["--toolsets", ",".join(config.toolsets)])
-    if config.api_key:
-        command.extend(["--api_key", config.api_key])
+    api_key = config.api_key or _default_custom_api_key(config)
+    if api_key:
+        command.extend(["--api_key", api_key])
 
     env = os.environ.copy()
     hermes_home = (root / config.home_dir).resolve()
     env["HERMES_HOME"] = str(hermes_home)
+    _sync_project_skills(hermes_home)
+
+    if config.skills:
+        command.extend(["--skills", ",".join(config.skills)])
+    if config.pass_session_id:
+        command.append("--pass_session_id")
+
     command_payload = {
         "argv": command,
         "cwd": str(root),
@@ -211,16 +226,17 @@ def _run_hermes_query(*, prompt: str, config: HermesConfig, root: Path) -> Herme
             trace=trace,
         ) from exc
 
+    failure_reason = _detect_hermes_failure(stdout=completed.stdout, stderr=completed.stderr)
     trace = HermesQueryTrace(
         prompt=prompt,
         command=command_payload,
-        status="ok" if completed.returncode == 0 else "error",
+        status="ok" if completed.returncode == 0 and failure_reason is None else "error",
         latency_ms=(time.perf_counter() - start) * 1000.0,
         stdout=completed.stdout,
         stderr=completed.stderr,
         parsed_payload=None,
         session_id=_latest_session_id(hermes_home, started_at=wall_clock_start),
-        reason=None,
+        reason=failure_reason,
     )
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or completed.stdout.strip()
@@ -228,8 +244,63 @@ def _run_hermes_query(*, prompt: str, config: HermesConfig, root: Path) -> Herme
             f"Hermes exited with code {completed.returncode}: {stderr}",
             trace=trace,
         )
+    if failure_reason is not None:
+        raise HermesProposalError(
+            f"Hermes did not produce a usable proposal: {failure_reason}",
+            trace=trace,
+        )
 
     return trace
+
+
+def _default_custom_api_key(config: HermesConfig) -> str | None:
+    """Provide a harmless dummy key for OpenAI-compatible local servers when needed."""
+    if config.provider != "custom":
+        return None
+    normalized = (config.base_url or "").lower()
+    if not normalized:
+        return None
+    if "11434" in normalized:
+        return "ollama"
+    return "EMPTY"
+
+
+def _detect_hermes_failure(*, stdout: str, stderr: str) -> str | None:
+    """Detect Hermes CLI failures that still exit with code 0."""
+    combined = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part).strip()
+    if not combined:
+        return None
+
+    patterns = [
+        r"API call failed after \d+ retries:\s*(.+)",
+        r"Final error:\s*(.+)",
+        r"Error:\s*(HTTP \d+:.+)",
+        r"error\"\s*:\s*\"([^\"]+)\"",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, combined, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    lowered = combined.lower()
+    if "max retries" in lowered and "giving up" in lowered:
+        lines = [line.strip() for line in combined.splitlines() if line.strip()]
+        return lines[-1] if lines else "Hermes exhausted retries"
+    return None
+
+
+def _sync_project_skills(hermes_home: Path) -> None:
+    if not _PROJECT_SKILLS_DIR.exists():
+        return
+    skills_root = hermes_home / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    for skill_dir in _PROJECT_SKILLS_DIR.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        destination = skills_root / skill_dir.name
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(skill_dir, destination)
 
 
 def _build_prompt(

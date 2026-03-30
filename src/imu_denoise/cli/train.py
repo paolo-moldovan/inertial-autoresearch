@@ -68,7 +68,7 @@ def run_command(args: Any) -> int:
     if args.dry_run:
         return 0
 
-    train_loader, val_loader, test_loader = create_dataloaders(
+    data_bundle = create_dataloaders(
         config.data,
         config.training,
         device_ctx,
@@ -80,11 +80,11 @@ def run_command(args: Any) -> int:
         device_ctx=device_ctx,
         optimizer=optimizer,
         scheduler=scheduler,
-        loss_fn=build_loss(config.training.loss),
+        loss_fn=build_loss(config.training),
         observability=observability,
         run_id=run_id,
     )
-    summary = trainer.fit(train_loader, val_loader, test_loader)
+    summary = trainer.fit(data_bundle)
     selection_event = observability.record_selection_event(
         run_id=summary.run_id,
         loop_run_id=None,
@@ -116,8 +116,8 @@ def run_command(args: Any) -> int:
         proposal_source="manual",
         description="manual run",
         status="completed",
-        metric_key="val_rmse",
-        metric_value=summary.best_val_rmse,
+        metric_key=summary.best_metric_key,
+        metric_value=summary.best_metric_value,
         overrides=list(args.overrides),
         source="runtime",
     )
@@ -134,6 +134,8 @@ def run_command(args: Any) -> int:
     print("Training complete:")
     print(f"  best_epoch: {summary.best_epoch}")
     print(f"  best_val_rmse: {summary.best_val_rmse:.6f}")
+    print(f"  best_metric_key: {summary.best_metric_key}")
+    print(f"  best_metric_value: {summary.best_metric_value:.6f}")
     print(f"  final_train_loss: {summary.final_train_loss:.6f}")
     print(f"  final_val_loss: {summary.final_val_loss:.6f}")
     print(f"  training_seconds: {summary.training_seconds:.2f}")

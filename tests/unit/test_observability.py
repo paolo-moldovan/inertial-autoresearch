@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from imu_denoise.config import AutoResearchConfig, ExperimentConfig, ObservabilityConfig
 from imu_denoise.observability import (
     BlobStore,
+    LoopController,
     MissionControlQueries,
     ObservabilityWriter,
     backfill_observability,
@@ -15,6 +20,8 @@ from imu_denoise.observability import (
     redact_payload,
 )
 from imu_denoise.observability.lineage import data_regime_fingerprint
+from imu_denoise.observability.monitor_app import _kill_mission_control_tmux_session
+from imu_denoise.observability.store import ObservabilityStore
 
 
 def _config(tmp_path: Path) -> ExperimentConfig:
@@ -179,6 +186,232 @@ def test_writer_records_run_llm_decision_and_artifacts(tmp_path: Path) -> None:
         artifact["artifact_type"] == "training_metrics"
         for artifact in run_detail["artifacts"]
     )
+
+
+def test_critical_mutation_writes_raise_but_noncritical_events_do_not(tmp_path: Path) -> None:
+    """Critical writes should surface failures while UI-only events stay best-effort."""
+    config = _config(tmp_path)
+    writer = ObservabilityWriter.from_experiment_config(config)
+    run_id = writer.start_run(
+        name="obs-critical",
+        phase="autoresearch_loop",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=config,
+        source="runtime",
+    )
+    assert writer.store is not None
+    store_any: Any = writer.store
+
+    original_insert_attempt = store_any.insert_mutation_attempt
+    original_insert_event = store_any.insert_event
+
+    def fail_attempt(**_: object) -> None:
+        raise RuntimeError("mutation attempt write failed")
+
+    def fail_event(**_: object) -> None:
+        raise RuntimeError("event write failed")
+
+    store_any.insert_mutation_attempt = fail_attempt
+    with pytest.raises(RuntimeError, match="Critical observability write failed"):
+        writer.record_mutation_outcome(
+            run_id=run_id,
+            loop_run_id=run_id,
+            regime_fingerprint=data_regime_fingerprint(config),
+            proposal_source="hermes",
+            description="switch to huber loss",
+            change_items=[
+                {
+                    "path": "training.loss",
+                    "category": "training",
+                    "before": "mse",
+                    "after": "huber",
+                }
+            ],
+            status="keep",
+            metric_key="val_rmse",
+            metric_value=0.1,
+            incumbent_metric=0.2,
+            direction="minimize",
+            source="runtime",
+        )
+
+    store_any.insert_mutation_attempt = original_insert_attempt
+    store_any.insert_event = fail_event
+    writer.append_event(
+        run_id=run_id,
+        event_type="ui_ping",
+        level="INFO",
+        title="ping",
+        payload={"ok": True},
+        source="runtime",
+    )
+    store_any.insert_event = original_insert_event
+
+
+def test_cross_regime_mutation_prior_is_advisory_only_when_local_evidence_is_sparse(
+    tmp_path: Path,
+) -> None:
+    """Cross-regime priors should warm-start new regimes without overriding strong local stats."""
+    config = _config(tmp_path)
+    writer = ObservabilityWriter.from_experiment_config(config)
+    run_id = writer.start_run(
+        name="obs-prior",
+        phase="autoresearch_loop",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=config,
+        source="runtime",
+    )
+    other_regime = "other-regime"
+    target_regime = data_regime_fingerprint(config)
+    for metric_value, incumbent_metric, status in [(0.18, 0.20, "keep"), (0.25, 0.20, "discard")]:
+        writer.record_mutation_outcome(
+            run_id=run_id,
+            loop_run_id=run_id,
+            regime_fingerprint=other_regime,
+            proposal_source="hermes",
+            description="lower learning rate",
+            change_items=[
+                {
+                    "path": "training.lr",
+                    "category": "training",
+                    "before": 0.001,
+                    "after": 0.0003,
+                }
+            ],
+            status=status,
+            metric_key="val_rmse",
+            metric_value=metric_value,
+            incumbent_metric=incumbent_metric,
+            direction="minimize",
+            source="runtime",
+        )
+
+    queries = MissionControlQueries(
+        db_path=Path(config.observability.db_path),
+        blob_dir=Path(config.observability.blob_dir),
+    )
+    prior_only = queries.get_mutation_stats_for_signatures(
+        signatures=["training.lr:0.001->0.0003"],
+        regime_fingerprint=target_regime,
+    )["training.lr:0.001->0.0003"]
+    assert prior_only["prior_strength"] > 0.0
+    assert prior_only["evidence_scope"] == "cross_regime_prior"
+
+    for metric_value in (0.19, 0.18, 0.17):
+        writer.record_mutation_outcome(
+            run_id=run_id,
+            loop_run_id=run_id,
+            regime_fingerprint=target_regime,
+            proposal_source="hermes",
+            description="lower learning rate",
+            change_items=[
+                {
+                    "path": "training.lr",
+                    "category": "training",
+                    "before": 0.001,
+                    "after": 0.0003,
+                }
+            ],
+            status="keep",
+            metric_key="val_rmse",
+            metric_value=metric_value,
+            incumbent_metric=0.20,
+            direction="minimize",
+            source="runtime",
+        )
+    strong_local = queries.get_mutation_stats_for_signatures(
+        signatures=["training.lr:0.001->0.0003"],
+        regime_fingerprint=target_regime,
+    )["training.lr:0.001->0.0003"]
+    assert strong_local.get("prior_strength", 0.0) == 0.0
+
+
+def test_dead_loop_pid_does_not_block_new_loop_slot(tmp_path: Path) -> None:
+    """A stale loop lease with a dead PID should be reclaimed immediately."""
+    config = _config(tmp_path)
+    writer = ObservabilityWriter.from_experiment_config(config)
+    store = ObservabilityStore(
+        db_path=Path(config.observability.db_path),
+        blob_dir=Path(config.observability.blob_dir),
+    )
+    controller = LoopController(store=store, writer=writer)
+
+    stale_run_id = writer.start_run(
+        name="stale-loop",
+        phase="autoresearch_loop",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=config,
+        source="runtime",
+    )
+    next_run_id = writer.start_run(
+        name="fresh-loop",
+        phase="autoresearch_loop",
+        dataset="synthetic",
+        model="lstm",
+        device="cpu",
+        config=config,
+        source="runtime",
+    )
+
+    assert store.acquire_loop_slot(
+        loop_run_id=stale_run_id,
+        pid=999_999,
+        status="running",
+        current_iteration=0,
+        max_iterations=3,
+        batch_size=None,
+        pause_after_iteration=None,
+        pause_requested=False,
+        stop_requested=False,
+        terminate_requested=False,
+        best_metric=None,
+        best_run_id=None,
+        active_child_run_id=None,
+        heartbeat_at=time.time(),
+        updated_at=time.time(),
+    ) is None
+
+    controller.initialize_loop(
+        loop_run_id=next_run_id,
+        max_iterations=3,
+        batch_size=None,
+        pause_enabled=False,
+    )
+
+    stale_state = controller.get_loop_state(stale_run_id)
+    next_state = controller.get_loop_state(next_run_id)
+    assert stale_state is not None
+    assert stale_state["status"] == "terminated"
+    assert next_state is not None
+    assert next_state["status"] == "running"
+
+
+def test_monitor_quit_kills_mission_control_tmux_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Monitor quit should kill the full Mission Control tmux session."""
+    monkeypatch.setenv("TMUX", "1")
+    calls: list[list[str]] = []
+
+    class _Result:
+        def __init__(self, returncode: int, stdout: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def _run(command: list[str], **kwargs: Any) -> _Result:
+        calls.append(command)
+        if command[:3] == ["tmux", "display-message", "-p"]:
+            return _Result(0, "imu-mission-control-euroc\n")
+        return _Result(0, "")
+
+    monkeypatch.setattr("subprocess.run", _run)
+
+    assert _kill_mission_control_tmux_session() is True
+    assert ["tmux", "kill-session", "-t", "imu-mission-control-euroc"] in calls
 
 
 def test_import_hermes_json_session_populates_llm_and_skill_views(tmp_path: Path) -> None:

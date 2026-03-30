@@ -166,6 +166,10 @@ HTML = """<!doctype html>
         </div>
       </header>
       <section>
+        <h2>Current Run</h2>
+        <div id="current-run" class="muted">No current experiment run.</div>
+      </section>
+      <section>
         <h2>Leaderboard</h2>
         <table>
           <thead><tr><th>#</th><th>Run</th><th>Model</th><th>Metric</th><th>Status</th><th>Source</th></tr></thead>
@@ -196,6 +200,14 @@ HTML = """<!doctype html>
       </section>
     </div>
     <div class="right">
+      <aside>
+        <h2>Hermes Runtime</h2>
+        <div id="hermes-runtime" class="muted">No Hermes runtime data.</div>
+      </aside>
+      <aside>
+        <h2>Current Candidate Pool</h2>
+        <div id="candidate-pool" class="muted">No current candidate pool.</div>
+      </aside>
       <aside>
         <h2>Recent Decisions</h2>
         <table>
@@ -293,6 +305,7 @@ HTML = """<!doctype html>
       const summaryHash = stableHash({
         loop_state: data.loop_state,
         best_result: data.best_result,
+        current_run: data.current_run,
         leaderboard: data.leaderboard,
         queued_proposals: data.queued_proposals,
         recent_loop_events: data.recent_loop_events,
@@ -301,6 +314,8 @@ HTML = """<!doctype html>
         regime_fingerprint: data.regime_fingerprint,
         mutation_leaderboard: data.mutation_leaderboard,
         recent_mutation_lessons: data.recent_mutation_lessons,
+        hermes_runtime: data.hermes_runtime,
+        current_candidate_pool: data.current_candidate_pool,
       });
       if (summaryHash === renderState.summaryHash) {
         return data;
@@ -310,6 +325,7 @@ HTML = """<!doctype html>
       const loop = data.loop_state;
       const best = data.best_result;
       const statusLine = document.getElementById("status-line");
+      const currentRun = data.current_run;
       document.getElementById("pause-btn").disabled = !loop || loop.status !== "running";
       document.getElementById("resume-btn").disabled = !loop || loop.status !== "paused";
       document.getElementById("stop-btn").disabled = !loop || !["running", "paused"].includes(loop.status);
@@ -327,6 +343,51 @@ HTML = """<!doctype html>
           <span>Flags pause=${loop.pause_requested} stop=${loop.stop_requested} terminate=${loop.terminate_requested}</span>
         `;
       }
+
+      document.getElementById("current-run").innerHTML = !currentRun ? "<span class='muted'>No current experiment run.</span>" : `
+        <div class="row">
+          <div class="metric">
+            <div class="label">Run</div>
+            <div class="value">${currentRun.run_name}</div>
+            <div class="tag">${shortId(currentRun.run_id)} ${currentRun.is_active ? "active" : "latest"}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Model</div>
+            <div class="value">${currentRun.model || "n/a"}</div>
+            <div class="tag">${currentRun.phase || "n/a"} · ${currentRun.causal === true ? "causal" : currentRun.causal === false ? "non-causal" : "causality n/a"}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Epoch</div>
+            <div class="value">${valueText(currentRun.epoch)}</div>
+            <div class="tag">${currentRun.status || "n/a"}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Metric</div>
+            <div class="value">${metric(currentRun.last_metric ?? currentRun.metric_value)}</div>
+            <div class="tag">${currentRun.metric_key || "last_metric"}</div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:12px;">
+          <div class="kv">
+            <div class="muted">Decision</div>
+            <div>${currentRun.decision_description || "n/a"}</div>
+            <div class="muted">Decision Status</div>
+            <div>${currentRun.decision_status || "n/a"}</div>
+            <div class="muted">Heartbeat</div>
+            <div>${currentRun.heartbeat_at || "n/a"}</div>
+            <div class="muted">Artifacts</div>
+            <div>${valueText(currentRun.artifact_count)}</div>
+            <div class="muted">LLM Calls</div>
+            <div>${valueText(currentRun.llm_call_count)}</div>
+            <div class="muted">Realtime Mode</div>
+            <div>${valueText(currentRun.realtime_mode)}</div>
+            <div class="muted">Reconstruction</div>
+            <div>${currentRun.reconstruction || "n/a"}</div>
+            <div class="muted">Eval Metrics</div>
+            <div>${(currentRun.evaluation_metrics || []).join(", ") || "n/a"}</div>
+          </div>
+        </div>
+      `;
 
       document.getElementById("leaderboard-body").innerHTML = data.leaderboard.map((row) => `
         <tr class="clickable" data-run-id="${row.run_id}">
@@ -381,6 +442,77 @@ HTML = """<!doctype html>
           typeof row.latency_ms === "number" ? `${row.latency_ms.toFixed(1)} ms` : "",
         ])
       ).join("");
+
+      const hermes = data.hermes_runtime;
+      document.getElementById("hermes-runtime").innerHTML = !hermes ? "<span class='muted'>No Hermes runtime data.</span>" : `
+        <div class="kv">
+          <div class="muted">Provider</div>
+          <div>${hermes.provider || "n/a"}</div>
+          <div class="muted">Model</div>
+          <div>${hermes.model || "n/a"}</div>
+          <div class="muted">Toolsets</div>
+          <div>${(hermes.toolsets || []).map((item) => `<span class="pill">${item}</span>`).join(" ") || "n/a"}</div>
+          <div class="muted">Skills</div>
+          <div>${(hermes.skills || []).map((item) => `<span class="pill">${item}</span>`).join(" ") || "n/a"}</div>
+          <div class="muted">Pass Session</div>
+          <div>${valueText(hermes.pass_session_id)}</div>
+          <div class="muted">Session</div>
+          <div><span class="mono">${shortId(hermes.latest_session_id)}</span></div>
+          <div class="muted">Last Call</div>
+          <div>${hermes.latest_status || "n/a"} ${typeof hermes.latest_latency_ms === "number" ? `(${hermes.latest_latency_ms.toFixed(1)} ms)` : ""}</div>
+          <div class="muted">Reason</div>
+          <div>${hermes.latest_reason || "n/a"}</div>
+        </div>
+      `;
+
+      const candidatePool = data.current_candidate_pool;
+      document.getElementById("candidate-pool").innerHTML = !candidatePool || !(candidatePool.candidates || []).length
+        ? "<span class='muted'>No current candidate pool.</span>"
+        : `
+        <div class="kv" style="margin-bottom:12px;">
+          <div class="muted">Run</div>
+          <div>${candidatePool.run_name || "n/a"} <span class="tag">${shortId(candidatePool.run_id)}</span></div>
+          <div class="muted">Source</div>
+          <div>${candidatePool.proposal_source || "n/a"}</div>
+          <div class="muted">Policy Mode</div>
+          <div>${candidatePool.policy_mode || "n/a"}</div>
+          <div class="muted">Selected</div>
+          <div>${valueText(candidatePool.selected_candidate_index)}</div>
+          <div class="muted">Preferred</div>
+          <div>${valueText(candidatePool.preferred_candidate_index)}${candidatePool.preferred_candidate_description ? ` · ${candidatePool.preferred_candidate_description}` : ""}</div>
+          <div class="muted">Hermes</div>
+          <div>${candidatePool.hermes_status || "n/a"}${candidatePool.hermes_reason ? ` · ${candidatePool.hermes_reason}` : ""}</div>
+          <div class="muted">Blocked</div>
+          <div>${Object.keys(candidatePool.blocked_candidates || {}).length}</div>
+          <div class="muted">Why</div>
+          <div>${candidatePool.selection_rationale || "n/a"}</div>
+        </div>
+        <table>
+          <thead><tr><th>#</th><th>Candidate</th><th>Score</th><th>Signals</th></tr></thead>
+          <tbody>${(candidatePool.candidates || []).map((item, index) => `
+            <tr>
+              <td>${index === candidatePool.selected_candidate_index ? "<strong>*</strong>" : item.hermes_preferred ? "h" : ""}${index}</td>
+              <td>${item.description || "n/a"}<div class="tag">${item.hermes_preferred ? "Hermes preferred" : "local"}${item.regime_compatible === false ? " · regime blocked" : ""}</div></td>
+              <td>${typeof item.total_score === "number" ? item.total_score.toFixed(3) : ""}</td>
+              <td>${(item.reasons || []).slice(0, 3).join(", ") || "n/a"}</td>
+            </tr>
+          `).join("")}</tbody>
+        </table>
+        ${Object.keys(candidatePool.blocked_candidates || {}).length ? `
+          <div class="panel" style="margin-top:12px;">
+            <h3>Blocked Candidates</h3>
+            <table>
+              <thead><tr><th>Candidate</th><th>Reasons</th></tr></thead>
+              <tbody>${Object.entries(candidatePool.blocked_candidates || {}).map(([description, reasons]) => `
+                <tr>
+                  <td>${description}</td>
+                  <td>${(Array.isArray(reasons) ? reasons : []).join(", ") || "n/a"}</td>
+                </tr>
+              `).join("")}</tbody>
+            </table>
+          </div>
+        ` : ""}
+      `;
       return data;
     }
 
@@ -417,7 +549,7 @@ HTML = """<!doctype html>
           <div class="metric"><div class="label">Run</div><div class="value">${detail.run.name}</div><div class="tag">${shortId(detail.run.id)}</div></div>
           <div class="metric"><div class="label">Phase</div><div class="value">${detail.run.phase}</div></div>
           <div class="metric"><div class="label">Status</div><div class="value">${detail.run.status}</div></div>
-          <div class="metric"><div class="label">Experiment</div><div class="value">${detail.identity?.experiment_id_short || "n/a"}</div><div class="tag">regime ${detail.identity?.regime_fingerprint_short || "n/a"}</div></div>
+          <div class="metric"><div class="label">Experiment</div><div class="value">${detail.identity?.experiment_id_short || "n/a"}</div><div class="tag">regime ${detail.identity?.regime_fingerprint_short || "n/a"} · ${detail.identity?.causal === true ? "causal" : detail.identity?.causal === false ? "non-causal" : "causality n/a"}</div></div>
         </div>
         <div class="controls">
           <button id="rerun-btn">Queue Rerun</button>
@@ -454,8 +586,36 @@ HTML = """<!doctype html>
                 <div>${policyContext.preferred_candidate_description || "n/a"}</div>
               </div>
             </div>
+            <div class="panel">
+              <h3>Evaluation Context</h3>
+              <div class="kv">
+                <div class="muted">Realtime Mode</div>
+                <div>${valueText(detail.experiment?.config?.evaluation?.realtime_mode)}</div>
+                <div class="muted">Reconstruction</div>
+                <div>${detail.experiment?.config?.evaluation?.reconstruction || "n/a"}</div>
+                <div class="muted">Metrics</div>
+                <div>${(detail.experiment?.config?.evaluation?.metrics || []).join(", ") || "n/a"}</div>
+                <div class="muted">Causality</div>
+                <div>${detail.identity?.causal === true ? "causal" : detail.identity?.causal === false ? "non-causal" : "n/a"}</div>
+              </div>
+            </div>
           </div>
           <div class="mini-grid">
+            <div class="panel">
+              <h3>Hermes Context</h3>
+              <div class="kv">
+                <div class="muted">Source</div>
+                <div>${detail.selection_event?.proposal_source || "n/a"}</div>
+                <div class="muted">LLM Calls</div>
+                <div>${llmCalls.length}</div>
+                <div class="muted">Last Session</div>
+                <div>${llmCalls.length ? `<span class="mono">${shortId(llmCalls[0].session_id)}</span>` : "n/a"}</div>
+                <div class="muted">Skills</div>
+                <div>${((window.__latestSummary?.hermes_runtime?.skills) || []).map((item) => `<span class="pill">${item}</span>`).join(" ") || "n/a"}</div>
+                <div class="muted">Toolsets</div>
+                <div>${((window.__latestSummary?.hermes_runtime?.toolsets) || []).map((item) => `<span class="pill">${item}</span>`).join(" ") || "n/a"}</div>
+              </div>
+            </div>
             <div class="panel">
               <h3>Change Diff</h3>
               ${
@@ -590,7 +750,7 @@ HTML = """<!doctype html>
       }
       refreshInFlight = true;
       try {
-        await refreshSummary();
+        window.__latestSummary = await refreshSummary();
         await refreshRunDetail();
         document.querySelectorAll("[data-run-id]").forEach((row) => {
           row.onclick = async () => {

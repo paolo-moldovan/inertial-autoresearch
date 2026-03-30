@@ -147,6 +147,11 @@ def _metric_from_summary(
     summary: Any,
     metric_key: str,
 ) -> float:
+    if getattr(summary, "best_metric_key", None) == metric_key:
+        return float(summary.best_metric_value)
+    best_eval_metrics = getattr(summary, "best_eval_metrics", None)
+    if isinstance(best_eval_metrics, dict) and metric_key in best_eval_metrics:
+        return float(best_eval_metrics[metric_key])
     if metric_key == "val_rmse":
         return float(summary.best_val_rmse)
     if metric_key == "final_val_loss":
@@ -200,23 +205,53 @@ def _select_mutation_proposal(
     *,
     iteration: int,
     base_config: ExperimentConfig,
+    base_overrides: list[str],
     rng: Random,
     results: list[LoopResult],
     fallback_proposal: MutationProposal,
     hermes_used_descriptions: set[str],
     incumbent_summary: dict[str, object] | None,
+    incumbent_config: dict[str, Any] | None,
     mutation_lessons: list[dict[str, object]] | None,
-) -> tuple[list[MutationProposal], int | None, str, HermesQueryTrace | None]:
+) -> tuple[
+    list[MutationProposal],
+    dict[str, list[str]],
+    int | None,
+    str,
+    HermesQueryTrace | None,
+]:
     from autoresearch_loop.mutations import default_mutation_pool, filter_mutation_proposals
+    from imu_denoise.observability.lineage import model_is_causal
 
     if iteration == 0:
-        return [fallback_proposal], 0, "static", None
+        return [fallback_proposal], {}, 0, "static", None
 
     candidate_pool = default_mutation_pool()[1:]
     candidate_pool, blocked_candidates = filter_mutation_proposals(
         candidate_pool,
         base_config.autoresearch.search_space,
+        incumbent_model_name=(
+            str(incumbent_summary["model"])
+            if incumbent_summary is not None and incumbent_summary.get("model") is not None
+            else None
+        ),
     )
+    realtime_blocked: dict[str, list[str]] = {}
+    if base_config.evaluation.realtime_mode:
+        realtime_allowed: list[MutationProposal] = []
+        for proposal in candidate_pool:
+            candidate_config = _resolve_iteration_config(
+                base_config=base_config,
+                base_overrides=base_overrides,
+                proposal_overrides=list(proposal.overrides),
+                incumbent_config=incumbent_config,
+            )
+            if model_is_causal(candidate_config) is False:
+                realtime_blocked[proposal.description] = ["realtime_requires_causal_model"]
+                continue
+            realtime_allowed.append(proposal)
+        candidate_pool = realtime_allowed
+        blocked_candidates.update(realtime_blocked)
     if not candidate_pool:
         raise RuntimeError(
             "No mutation candidates remain after applying the autoresearch search-space "
@@ -238,7 +273,7 @@ def _select_mutation_proposal(
             if candidate.description == fallback_proposal.description:
                 fallback_index = index
                 break
-        return available_candidates, fallback_index, "static", None
+        return available_candidates, blocked_candidates, fallback_index, "static", None
 
     from autoresearch_loop.hermes import (
         HermesProposalError,
@@ -252,7 +287,7 @@ def _select_mutation_proposal(
             if candidate.description == fallback_proposal.description:
                 fallback_index = index
                 break
-        return available_candidates, fallback_index, "static-fallback", None
+        return available_candidates, blocked_candidates, fallback_index, "static-fallback", None
 
     try:
         proposal, trace = choose_mutation_proposal_with_trace(
@@ -276,7 +311,13 @@ def _select_mutation_proposal(
             if candidate.description == fallback_proposal.description:
                 fallback_index = index
                 break
-        return available_candidates, fallback_index, "static-fallback", exc.trace
+        return (
+            available_candidates,
+            blocked_candidates,
+            fallback_index,
+            "static-fallback",
+            exc.trace,
+        )
 
     selected_index = 0
     for index, candidate in enumerate(available_candidates):
@@ -286,7 +327,7 @@ def _select_mutation_proposal(
         ):
             selected_index = index
             break
-    return available_candidates, selected_index, "hermes", trace
+    return available_candidates, blocked_candidates, selected_index, "hermes", trace
 
 
 def _run_single_experiment(
@@ -330,7 +371,7 @@ def _run_single_experiment(
     device_ctx = DeviceContext.from_config(config.device)
     model = build_model(config)
     try:
-        train_loader, val_loader, test_loader = create_dataloaders(
+        data_bundle = create_dataloaders(
             config.data,
             config.training,
             device_ctx,
@@ -342,12 +383,12 @@ def _run_single_experiment(
             device_ctx=device_ctx,
             optimizer=optimizer,
             scheduler=scheduler,
-            loss_fn=build_loss(config.training.loss),
+            loss_fn=build_loss(config.training),
             observability=observability,
             run_id=run_id,
             parent_run_id=parent_run_id,
         )
-        summary = trainer.fit(train_loader, val_loader, test_loader)
+        summary = trainer.fit(data_bundle)
         _metric_from_summary(summary, metric_key)
         return config, summary, run_id
     except TrainingInterrupted:
@@ -766,6 +807,7 @@ def run_autoresearch(
 
         queue_row = None
         candidate_pool: list[MutationProposal] | None = None
+        blocked_candidates: dict[str, list[str]] = {}
         policy_decision: Any | None = None
         policy_candidate_payloads: list[dict[str, Any]] | None = None
         if iteration > 0:
@@ -780,6 +822,9 @@ def run_autoresearch(
             preferred_candidate_index = None
         else:
             incumbent_summary: dict[str, object] | None = None
+            incumbent_config_for_policy = (
+                queries.get_run_config_payload(best_run_id) if best_run_id is not None else None
+            )
             if best_run_id is not None:
                 incumbent_reference = queries.get_run_reference(best_run_id)
                 if incumbent_reference is not None:
@@ -796,21 +841,21 @@ def run_autoresearch(
             )
             (
                 candidate_pool,
+                blocked_candidates,
                 preferred_candidate_index,
                 proposal_source,
                 hermes_trace,
             ) = _select_mutation_proposal(
                 iteration=iteration,
                 base_config=base_config,
+                base_overrides=base_overrides,
                 rng=rng,
                 results=results,
                 fallback_proposal=fallback_proposal,
                 hermes_used_descriptions=hermes_used_descriptions,
                 incumbent_summary=incumbent_summary,
+                incumbent_config=incumbent_config_for_policy,
                 mutation_lessons=mutation_lessons,
-            )
-            incumbent_config_for_policy = (
-                queries.get_run_config_payload(best_run_id) if best_run_id is not None else None
             )
             policy_candidates: list[MutationPolicyCandidate] = []
             policy_candidate_payloads = []
@@ -928,6 +973,9 @@ def run_autoresearch(
                 "overrides": run_overrides,
                 "candidate_count": len(candidate_pool) if candidate_pool is not None else 0,
                 "policy_mode": None if policy_decision is None else policy_decision.mode,
+                "hermes_reason": None if hermes_trace is None else hermes_trace.reason,
+                "hermes_status": None if hermes_trace is None else hermes_trace.status,
+                "blocked_candidates": blocked_candidates,
             },
             source="runtime",
         )
@@ -1016,6 +1064,10 @@ def run_autoresearch(
                     if preferred_candidate_index is None or candidate_pool is None
                     else candidate_pool[preferred_candidate_index].description
                 ),
+                "blocked_candidates": blocked_candidates,
+                "hermes_status": None if hermes_trace is None else hermes_trace.status,
+                "hermes_reason": None if hermes_trace is None else hermes_trace.reason,
+                "hermes_session_id": None if hermes_trace is None else hermes_trace.session_id,
                 "policy_candidates": (
                     None
                     if policy_decision is None or policy_candidate_payloads is None
@@ -1053,7 +1105,7 @@ def run_autoresearch(
             reference_kind=reference_kind,
             proposal_source=proposal_source,
             description=proposal.description,
-            overrides=run_overrides,
+            overrides=list(proposal.overrides),
             current_config=resolved_config,
             reference_config=incumbent_config if incumbent_config is not None else base_config,
             source="runtime",

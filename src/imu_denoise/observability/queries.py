@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from math import log1p
 from pathlib import Path
 from typing import Any
 
+from imu_denoise.data.diagnostics import temporal_decay_weight
 from imu_denoise.observability.control import (
     LOOP_PAUSED,
     LOOP_RESUMED,
@@ -19,7 +22,11 @@ from imu_denoise.observability.control import (
     QUEUE_ENQUEUED,
 )
 from imu_denoise.observability.events import TRAINING_EPOCH
-from imu_denoise.observability.lineage import data_regime_fingerprint, normalize_config_payload
+from imu_denoise.observability.lineage import (
+    data_regime_fingerprint,
+    model_is_causal,
+    normalize_config_payload,
+)
 from imu_denoise.observability.store import ObservabilityStore
 
 
@@ -279,6 +286,20 @@ class MissionControlQueries:
         for index, row in enumerate(rows, start=1):
             row["rank"] = index
         return rows
+
+    def get_run_objective_metric(self, run_id: str) -> str | None:
+        row = self.store.fetch_one(
+            """
+            SELECT e.objective_metric
+            FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        )
+        if row is None or row.get("objective_metric") in {None, ""}:
+            return None
+        return str(row["objective_metric"])
 
     def get_run_metric(self, run_id: str, *, metric_key: str = "val_rmse") -> float | None:
         metric_keys = [metric_key]
@@ -636,6 +657,8 @@ class MissionControlQueries:
         )
         if row is None:
             return None
+        payload = self.get_run_config_payload(run_id)
+        row["causal"] = None if payload is None else model_is_causal(payload)
         row["run_id_short"] = str(row["run_id"])[:8]
         experiment_id = row.get("experiment_id")
         row["experiment_id_short"] = str(experiment_id)[:8] if experiment_id else None
@@ -705,6 +728,8 @@ class MissionControlQueries:
         )
         if row is None:
             return None
+        payload = self.get_run_config_payload(str(run_id))
+        row["causal"] = None if payload is None else model_is_causal(payload)
         row["run_id_short"] = str(row["run_id"])[:8]
         regime_fingerprint = row.get("regime_fingerprint")
         row["regime_fingerprint_short"] = (
@@ -771,6 +796,13 @@ class MissionControlQueries:
             "selected_candidate_index": policy_state.get("selected_candidate_index"),
             "preferred_candidate_index": policy_state.get("preferred_candidate_index"),
             "preferred_candidate_description": policy_state.get("preferred_candidate_description"),
+            "blocked_candidates": (
+                policy_state.get("blocked_candidates")
+                if isinstance(policy_state.get("blocked_candidates"), dict)
+                else {}
+            ),
+            "hermes_status": policy_state.get("hermes_status"),
+            "hermes_reason": policy_state.get("hermes_reason"),
             "policy_candidates": candidates if isinstance(candidates, list) else [],
         }
 
@@ -882,15 +914,15 @@ class MissionControlQueries:
     def get_mission_control_summary(self, *, limit: int = 10) -> dict[str, Any]:
         loop_state = self.get_current_loop_state()
         comparison_regime_fingerprint: str | None = None
-        if (
-            loop_state is not None
-            and str(loop_state.get("status")) in {"running", "paused", "terminating"}
-        ):
-            comparison_regime_fingerprint = self.get_run_regime_fingerprint(
-                str(loop_state["loop_run_id"])
-            )
+        comparison_metric_key = "val_rmse"
+        if loop_state is not None:
+            loop_run_id = str(loop_state["loop_run_id"])
+            comparison_metric_key = self.get_run_objective_metric(loop_run_id) or "val_rmse"
+            if str(loop_state.get("status")) in {"running", "paused", "terminating", "completed"}:
+                comparison_regime_fingerprint = self.get_run_regime_fingerprint(loop_run_id)
         leaderboard = self.list_leaderboard(
             limit=limit,
+            metric_key=comparison_metric_key,
             regime_fingerprint=comparison_regime_fingerprint,
         )
         best_result = leaderboard[0] if leaderboard else None
@@ -923,8 +955,35 @@ class MissionControlQueries:
             limit=10,
             regime_fingerprint=mutation_regime_fingerprint,
         )
+        current_run = self.get_current_run_summary(
+            None if loop_state is None else str(loop_state["loop_run_id"])
+        )
+        current_candidate_pool = None
+        if current_run is not None:
+            current_candidate_pool = {
+                "run_id": current_run.get("run_id"),
+                "run_name": current_run.get("run_name"),
+                "proposal_source": current_run.get("proposal_source"),
+                "policy_mode": current_run.get("policy_mode"),
+                "selection_rationale": current_run.get("selection_rationale"),
+                "selected_candidate_index": current_run.get("selected_candidate_index"),
+                "preferred_candidate_index": current_run.get("preferred_candidate_index"),
+                "preferred_candidate_description": current_run.get(
+                    "preferred_candidate_description"
+                ),
+                "hermes_status": current_run.get("hermes_status"),
+                "hermes_reason": current_run.get("hermes_reason"),
+                "candidate_count": len(current_run.get("candidate_pool") or []),
+                "candidates": list(current_run.get("candidate_pool") or []),
+                "blocked_candidates": dict(current_run.get("blocked_candidates") or {}),
+            }
+        hermes_runtime = self.get_hermes_runtime_summary(
+            loop_run_id=None if loop_state is None else str(loop_state["loop_run_id"])
+        )
         return {
             "loop_state": loop_state,
+            "current_run": current_run,
+            "current_candidate_pool": current_candidate_pool,
             "best_result": best_result,
             "leaderboard": leaderboard,
             "progress": progress,
@@ -933,8 +992,155 @@ class MissionControlQueries:
             "recent_decisions": recent_decisions,
             "recent_llm_calls": recent_llm_calls,
             "regime_fingerprint": comparison_regime_fingerprint,
+            "comparison_metric_key": comparison_metric_key,
             "mutation_leaderboard": mutation_leaderboard,
             "recent_mutation_lessons": recent_mutation_lessons,
+            "hermes_runtime": hermes_runtime,
+        }
+
+    def get_current_run_summary(self, loop_run_id: str | None) -> dict[str, Any] | None:
+        if not loop_run_id:
+            return None
+        loop_state = self.store.fetch_one(
+            "SELECT * FROM loop_state WHERE loop_run_id = ?",
+            (loop_run_id,),
+        )
+        current_run_id: str | None = None
+        if loop_state is not None and loop_state.get("active_child_run_id"):
+            current_run_id = str(loop_state["active_child_run_id"])
+        if current_run_id is None:
+            latest_child = self.store.fetch_one(
+                """
+                SELECT id
+                FROM runs
+                WHERE parent_run_id = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (loop_run_id,),
+            )
+            if latest_child is not None and latest_child.get("id"):
+                current_run_id = str(latest_child["id"])
+        if current_run_id is None:
+            return None
+        detail = self.get_run_detail(current_run_id)
+        if detail is None:
+            return None
+        run = detail["run"]
+        latest_decision = detail["decisions"][0] if detail["decisions"] else None
+        evaluation_config = (
+            detail["experiment"].get("config", {}).get("evaluation")
+            if isinstance(detail.get("experiment"), dict)
+            else None
+        )
+        policy_context = detail.get("policy_context")
+        return {
+            "run_id": run["id"],
+            "run_name": run["name"],
+            "phase": run["phase"],
+            "status": run["status"],
+            "model": run["model"],
+            "causal": detail["identity"].get("causal") if detail.get("identity") else None,
+            "dataset": run["dataset"],
+            "epoch": run.get("epoch"),
+            "last_metric": run.get("last_metric"),
+            "best_metric": run.get("best_metric"),
+            "heartbeat_at": run.get("heartbeat_at"),
+            "status_message": run.get("status_message"),
+            "decision_status": None if latest_decision is None else latest_decision.get("status"),
+            "decision_description": (
+                None if latest_decision is None else latest_decision.get("description")
+            ),
+            "metric_key": (
+                None if latest_decision is None else latest_decision.get("metric_key")
+            ),
+            "metric_value": (
+                None if latest_decision is None else latest_decision.get("metric_value")
+            ),
+            "realtime_mode": (
+                bool(evaluation_config.get("realtime_mode"))
+                if isinstance(evaluation_config, Mapping)
+                else None
+            ),
+            "reconstruction": (
+                evaluation_config.get("reconstruction")
+                if isinstance(evaluation_config, Mapping)
+                else None
+            ),
+            "evaluation_metrics": (
+                list(evaluation_config.get("metrics") or [])
+                if isinstance(evaluation_config, Mapping)
+                else []
+            ),
+            "proposal_source": (
+                None if policy_context is None else policy_context.get("proposal_source")
+            ),
+            "policy_mode": None if policy_context is None else policy_context.get("policy_mode"),
+            "selection_rationale": (
+                None if policy_context is None else policy_context.get("rationale")
+            ),
+            "selected_candidate_index": (
+                None if policy_context is None else policy_context.get("selected_candidate_index")
+            ),
+            "preferred_candidate_index": (
+                None if policy_context is None else policy_context.get("preferred_candidate_index")
+            ),
+            "preferred_candidate_description": (
+                None
+                if policy_context is None
+                else policy_context.get("preferred_candidate_description")
+            ),
+            "hermes_status": (
+                None if policy_context is None else policy_context.get("hermes_status")
+            ),
+            "hermes_reason": (
+                None if policy_context is None else policy_context.get("hermes_reason")
+            ),
+            "candidate_pool": (
+                list(policy_context.get("policy_candidates") or [])
+                if isinstance(policy_context, Mapping)
+                else []
+            ),
+            "blocked_candidates": (
+                dict(policy_context.get("blocked_candidates") or {})
+                if isinstance(policy_context, Mapping)
+                else {}
+            ),
+            "llm_call_count": len(detail["llm_calls"]),
+            "artifact_count": len(detail["artifacts"]),
+            "is_active": bool(
+                loop_state is not None and loop_state.get("active_child_run_id") == current_run_id
+            ),
+        }
+
+    def get_hermes_runtime_summary(self, *, loop_run_id: str | None) -> dict[str, Any] | None:
+        if loop_run_id is None:
+            return None
+        payload = self.get_run_config_payload(loop_run_id)
+        if payload is None:
+            return None
+        autoresearch = payload.get("autoresearch")
+        if not isinstance(autoresearch, Mapping):
+            return None
+        hermes = autoresearch.get("hermes")
+        if not isinstance(hermes, Mapping):
+            return None
+        latest_llm = None
+        llm_calls = self.list_recent_llm_calls(limit=1, loop_run_id=loop_run_id)
+        if llm_calls:
+            latest_llm = llm_calls[0]
+        return {
+            "provider": hermes.get("provider"),
+            "model": hermes.get("model"),
+            "toolsets": list(hermes.get("toolsets") or []),
+            "skills": list(hermes.get("skills") or []),
+            "pass_session_id": bool(hermes.get("pass_session_id")),
+            "home_dir": hermes.get("home_dir"),
+            "max_turns": hermes.get("max_turns"),
+            "latest_session_id": None if latest_llm is None else latest_llm.get("session_id"),
+            "latest_status": None if latest_llm is None else latest_llm.get("status"),
+            "latest_latency_ms": None if latest_llm is None else latest_llm.get("latency_ms"),
+            "latest_reason": None if latest_llm is None else latest_llm.get("reason"),
         }
 
     def list_artifacts(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -1077,7 +1283,128 @@ class MissionControlQueries:
             """,
             (regime_fingerprint, *signatures),
         )
-        return {str(row["signature"]): row for row in rows}
+        stats = {str(row["signature"]): dict(row) for row in rows}
+        priors = self._cross_regime_priors_for_signatures(
+            signatures=signatures,
+            exclude_regime_fingerprint=regime_fingerprint,
+        )
+        for signature in signatures:
+            prior = priors.get(signature)
+            stat = stats.get(signature)
+            local_tries = 0 if stat is None else int(stat.get("tries", 0))
+            if prior is None or local_tries >= 3:
+                if stat is not None:
+                    stat.setdefault("prior_strength", 0.0)
+                continue
+            prior_strength = min(float(prior["prior_strength"]), 0.30 / max(1, local_tries + 1))
+            if stat is None:
+                stats[signature] = {
+                    "signature": signature,
+                    "display_name": prior.get("display_name", signature),
+                    "tries": 0,
+                    "keep_count": 0,
+                    "discard_count": 0,
+                    "crash_count": 0,
+                    "avg_metric_delta": 0.0,
+                    "confidence": 0.0,
+                }
+                stat = stats[signature]
+            stat["prior_strength"] = prior_strength
+            stat["prior_confidence"] = prior["prior_confidence"]
+            stat["prior_avg_metric_delta"] = prior["prior_avg_metric_delta"]
+            stat["prior_discard_rate"] = prior["prior_discard_rate"]
+            stat["prior_crash_rate"] = prior["prior_crash_rate"]
+            stat["prior_tries"] = prior["prior_tries"]
+            stat["evidence_scope"] = "blended" if local_tries > 0 else "cross_regime_prior"
+        return stats
+
+    def _cross_regime_priors_for_signatures(
+        self,
+        *,
+        signatures: list[str],
+        exclude_regime_fingerprint: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not signatures:
+            return {}
+        placeholders = ", ".join("?" for _ in signatures)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                a.signature,
+                a.status,
+                a.metric_delta,
+                a.created_at,
+                sig.display_name
+            FROM mutation_attempts a
+            JOIN mutation_signatures sig ON sig.signature = a.signature
+            WHERE a.signature IN ({placeholders})
+              AND a.regime_fingerprint != ?
+            ORDER BY a.created_at DESC
+            """,
+            (*signatures, exclude_regime_fingerprint),
+        )
+        now = datetime.now(tz=UTC)
+        aggregates: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            signature = str(row["signature"])
+            bucket = aggregates.setdefault(
+                signature,
+                {
+                    "display_name": row.get("display_name") or signature,
+                    "weighted_tries": 0.0,
+                    "weighted_keep": 0.0,
+                    "weighted_discard": 0.0,
+                    "weighted_crash": 0.0,
+                    "weighted_delta_sum": 0.0,
+                    "weighted_delta_count": 0.0,
+                },
+            )
+            created_at = row.get("created_at")
+            age_days = 0.0
+            if isinstance(created_at, str):
+                try:
+                    created = datetime.fromisoformat(created_at)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=UTC)
+                    age_days = max(0.0, (now - created).total_seconds() / 86_400.0)
+                except ValueError:
+                    age_days = 0.0
+            weight = temporal_decay_weight(age_days)
+            bucket["weighted_tries"] += weight
+            status = str(row.get("status") or "")
+            if status == "keep":
+                bucket["weighted_keep"] += weight
+            elif status == "discard":
+                bucket["weighted_discard"] += weight
+            elif status == "crash":
+                bucket["weighted_crash"] += weight
+            metric_delta = row.get("metric_delta")
+            if isinstance(metric_delta, (int, float)):
+                bucket["weighted_delta_sum"] += weight * float(metric_delta)
+                bucket["weighted_delta_count"] += weight
+
+        priors: dict[str, dict[str, Any]] = {}
+        for signature, bucket in aggregates.items():
+            weighted_tries = float(bucket["weighted_tries"])
+            if weighted_tries <= 0.0:
+                continue
+            weighted_delta_count = float(bucket["weighted_delta_count"])
+            prior_avg_metric_delta = (
+                float(bucket["weighted_delta_sum"]) / weighted_delta_count
+                if weighted_delta_count > 0.0
+                else 0.0
+            )
+            prior_confidence = min(0.30, 0.08 + 0.08 * log1p(weighted_tries))
+            priors[signature] = {
+                "display_name": bucket["display_name"],
+                "prior_tries": weighted_tries,
+                "prior_avg_metric_delta": prior_avg_metric_delta,
+                "prior_confidence": prior_confidence,
+                "prior_discard_rate": float(bucket["weighted_discard"]) / weighted_tries,
+                "prior_crash_rate": float(bucket["weighted_crash"]) / weighted_tries,
+                "prior_strength": min(0.30, weighted_tries / 6.0),
+            }
+        return priors
 
     def list_events(
         self,

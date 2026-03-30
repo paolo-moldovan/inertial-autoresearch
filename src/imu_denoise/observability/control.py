@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 
@@ -55,6 +56,35 @@ class LoopController:
         self.store = store
         self.writer = writer
 
+    def _critical_store_write(
+        self,
+        func: Any,
+        /,
+        *,
+        retries: int = 2,
+        **kwargs: Any,
+    ) -> Any:
+        logger = None if self.writer is None else self.writer.logger
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return func(**kwargs)
+            except Exception as exc:  # pragma: no cover - exercised via call sites
+                last_exc = exc
+                if attempt < retries:
+                    if logger is not None:
+                        logger.warning(
+                            "Critical control-plane write failed (attempt %d/%d): %s",
+                            attempt + 1,
+                            retries + 1,
+                            exc,
+                        )
+                    time.sleep(0.05)
+                    continue
+                if logger is not None:
+                    logger.error("Critical control-plane write failed: %s", exc)
+        raise RuntimeError(f"Critical control-plane write failed: {last_exc}")
+
     @classmethod
     def from_experiment_config(
         cls,
@@ -81,8 +111,10 @@ class LoopController:
         pause_after_iteration = None
         if pause_enabled and batch_size is not None:
             pause_after_iteration = current_iteration + batch_size
-        blocking_loop_run_id = self.store.acquire_loop_slot(
+        blocking_loop_run_id = self._critical_store_write(
+            self.store.acquire_loop_slot,
             loop_run_id=loop_run_id,
+            pid=os.getpid(),
             status="running",
             current_iteration=current_iteration,
             max_iterations=max_iterations,
@@ -118,8 +150,14 @@ class LoopController:
     ) -> None:
         now = _now_ts()
         existing = self.get_loop_state(loop_run_id)
-        self.store.upsert_loop_state(
+        self._critical_store_write(
+            self.store.upsert_loop_state,
             loop_run_id=loop_run_id,
+            pid=(
+                int(existing["pid"])
+                if existing is not None and isinstance(existing.get("pid"), int)
+                else os.getpid()
+            ),
             status=status,
             current_iteration=current_iteration,
             max_iterations=max_iterations,
@@ -181,7 +219,8 @@ class LoopController:
         state = self._resolve_target_loop(loop_run_id)
         if state is None:
             return None
-        self.store.update_loop_state(
+        self._critical_store_write(
+            self.store.update_loop_state,
             loop_run_id=str(state["loop_run_id"]),
             values={"pause_requested": 1},
         )
@@ -204,7 +243,8 @@ class LoopController:
         pause_after_iteration = None
         if isinstance(batch_size, int) and batch_size > 0:
             pause_after_iteration = int(state["current_iteration"]) + batch_size
-        self.store.update_loop_state(
+        self._critical_store_write(
+            self.store.update_loop_state,
             loop_run_id=str(state["loop_run_id"]),
             values={
                 "status": "running",
@@ -229,7 +269,8 @@ class LoopController:
         state = self._resolve_target_loop(loop_run_id)
         if state is None:
             return None
-        self.store.update_loop_state(
+        self._critical_store_write(
+            self.store.update_loop_state,
             loop_run_id=str(state["loop_run_id"]),
             values={"stop_requested": 1},
         )
@@ -248,7 +289,8 @@ class LoopController:
         state = self._resolve_target_loop(loop_run_id)
         if state is None:
             return None
-        self.store.update_loop_state(
+        self._critical_store_write(
+            self.store.update_loop_state,
             loop_run_id=str(state["loop_run_id"]),
             values={
                 "stop_requested": 1,
@@ -281,7 +323,8 @@ class LoopController:
         state = self._resolve_target_loop(loop_run_id)
         if state is None:
             raise RuntimeError("No active loop is available to queue a proposal.")
-        proposal_id = self.store.insert_queued_proposal(
+        proposal_id = self._critical_store_write(
+            self.store.insert_queued_proposal,
             loop_run_id=str(state["loop_run_id"]),
             status="pending",
             description=description,
@@ -306,7 +349,11 @@ class LoopController:
         return self._normalize_queue_row(selected)
 
     def claim_next_queued_proposal(self, *, loop_run_id: str) -> dict[str, Any] | None:
-        row = self.store.claim_next_queued_proposal(loop_run_id=loop_run_id, claimed_at=_now_ts())
+        row = self._critical_store_write(
+            self.store.claim_next_queued_proposal,
+            loop_run_id=loop_run_id,
+            claimed_at=_now_ts(),
+        )
         if row is None:
             return None
         normalized = self._normalize_queue_row(row)
@@ -328,7 +375,8 @@ class LoopController:
         loop_run_id: str,
         applied_run_id: str,
     ) -> None:
-        self.store.update_queued_proposal(
+        self._critical_store_write(
+            self.store.update_queued_proposal,
             proposal_id=proposal_id,
             status="applied",
             applied_run_id=applied_run_id,
@@ -349,7 +397,8 @@ class LoopController:
         proposal_id: int,
         notes: str,
     ) -> None:
-        self.store.update_queued_proposal(
+        self._critical_store_write(
+            self.store.update_queued_proposal,
             proposal_id=proposal_id,
             status="failed",
             notes=notes,

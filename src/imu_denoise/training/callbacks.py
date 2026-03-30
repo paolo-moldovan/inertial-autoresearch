@@ -67,12 +67,11 @@ class CheckpointManager:
         """Save checkpoints and return whether this epoch produced a new best."""
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        save_checkpoint(
-            self.last_path,
+        self.save_last(
+            epoch=epoch,
+            metric_value=metric_value,
             model=model,
             optimizer=optimizer,
-            epoch=epoch,
-            best_metric=metric_value,
             extra=extra,
         )
 
@@ -88,6 +87,26 @@ class CheckpointManager:
                 extra=extra,
             )
         return is_best
+
+    def save_last(
+        self,
+        *,
+        epoch: int,
+        metric_value: float,
+        model: nn.Module,
+        optimizer: Optimizer,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Save the rolling last checkpoint without touching best-tracking state."""
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        save_checkpoint(
+            self.last_path,
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            best_metric=metric_value,
+            extra=extra,
+        )
 
     def _is_improvement(self, value: float) -> bool:
         assert self.best_value is not None

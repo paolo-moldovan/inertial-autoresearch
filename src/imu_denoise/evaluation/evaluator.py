@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-from imu_denoise.evaluation.metrics import compute_all_metrics
+from imu_denoise.config.schema import EvaluationConfig
+from imu_denoise.evaluation.metrics import (
+    compute_selected_metrics,
+    drift_endpoint_error,
+    smoothness_error,
+)
+from imu_denoise.evaluation.reconstruction import reconstruct_window_predictions
 from imu_denoise.utils.io import load_checkpoint
 
 if TYPE_CHECKING:
@@ -28,9 +35,22 @@ class Evaluator:
     """
 
     def __init__(self, model: BaseDenoiser, device_ctx: DeviceContext) -> None:
+        self.evaluation = EvaluationConfig()
+        self.logger = None
         self.model = model
         self.device_ctx = device_ctx
         self.model = device_ctx.to_device(self.model)
+
+    def with_config(
+        self,
+        evaluation: EvaluationConfig,
+        *,
+        logger: Any | None = None,
+    ) -> Evaluator:
+        """Attach evaluation settings without changing existing call sites."""
+        self.evaluation = evaluation
+        self.logger = logger
+        return self
 
     def evaluate(self, dataloader: DataLoader[Any], fs: float = 200.0) -> dict[str, float]:
         """Evaluate the model on an entire dataloader and compute aggregate metrics.
@@ -48,6 +68,18 @@ class Evaluator:
         self.model.eval()
         all_preds: list[np.ndarray] = []
         all_targets: list[np.ndarray] = []
+        all_timestamps: list[np.ndarray] = []
+        sequence_ids: list[str] = []
+
+        if self.evaluation.realtime_mode and not bool(getattr(self.model, "causal", False)):
+            warnings.warn(
+                (
+                    f"Model {self.model.__class__.__name__} is non-causal but "
+                    "evaluation.realtime_mode is enabled."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         with torch.no_grad():
             for batch in dataloader:
@@ -59,11 +91,21 @@ class Evaluator:
 
                 all_preds.append(pred.cpu().float().numpy())
                 all_targets.append(clean.numpy())
+                if isinstance(batch, dict):
+                    all_timestamps.append(batch["timestamps"].cpu().float().numpy())
+                    sequence_ids.extend([str(item) for item in batch["sequence_id"]])
 
-        preds = np.concatenate(all_preds, axis=0).reshape(-1, all_preds[0].shape[-1])
-        targets = np.concatenate(all_targets, axis=0).reshape(-1, all_targets[0].shape[-1])
-
-        return compute_all_metrics(preds, targets, fs=fs)
+        pred_windows = np.concatenate(all_preds, axis=0)
+        target_windows = np.concatenate(all_targets, axis=0)
+        timestamps = np.concatenate(all_timestamps, axis=0) if all_timestamps else np.empty((0, 0))
+        return evaluate_window_predictions(
+            pred_windows=pred_windows,
+            target_windows=target_windows,
+            timestamps=timestamps,
+            sequence_ids=sequence_ids,
+            fs=fs,
+            evaluation=self.evaluation,
+        )
 
     def evaluate_from_checkpoint(
         self,
@@ -103,3 +145,80 @@ class Evaluator:
         if isinstance(batch, dict):
             return batch["noisy"], batch["clean"]
         return batch[0], batch[1]
+
+
+def evaluate_window_predictions(
+    *,
+    pred_windows: np.ndarray,
+    target_windows: np.ndarray,
+    timestamps: np.ndarray,
+    sequence_ids: list[str],
+    fs: float,
+    evaluation: EvaluationConfig,
+) -> dict[str, float]:
+    """Evaluate window predictions with optional sequence reconstruction."""
+    selected = set(evaluation.metrics)
+    window_metric_names = {
+        metric for metric in selected if metric in {"rmse", "mae", "spectral_divergence"}
+    }
+    sequence_metric_names = {
+        metric.removeprefix("sequence_")
+        for metric in selected
+        if metric.startswith("sequence_")
+        and metric.removeprefix("sequence_") in {"rmse", "mae", "spectral_divergence"}
+    }
+    results: dict[str, float] = {}
+
+    flattened_pred = pred_windows.reshape(-1, pred_windows.shape[-1])
+    flattened_target = target_windows.reshape(-1, target_windows.shape[-1])
+    if window_metric_names:
+        results.update(
+            compute_selected_metrics(
+                flattened_pred,
+                flattened_target,
+                fs=fs,
+                metric_names=sorted(window_metric_names),
+            )
+        )
+
+    needs_sequence = bool(sequence_metric_names or {"smoothness", "drift_error"} & selected)
+    if not needs_sequence:
+        return results
+    if evaluation.reconstruction == "none":
+        raise ValueError(
+            "Sequence-level metrics require evaluation.reconstruction to be set to a supported "
+            "overlap-add mode."
+        )
+
+    reconstructed = reconstruct_window_predictions(
+        pred_windows=pred_windows,
+        target_windows=target_windows,
+        timestamps=timestamps,
+        sequence_ids=sequence_ids,
+        mode=evaluation.reconstruction,
+    )
+    if sequence_metric_names:
+        ordered_pred = np.concatenate([item["pred"] for item in reconstructed.values()], axis=0)
+        ordered_target = np.concatenate([item["target"] for item in reconstructed.values()], axis=0)
+        results.update(
+            compute_selected_metrics(
+                ordered_pred,
+                ordered_target,
+                fs=fs,
+                metric_names=sorted(sequence_metric_names),
+                prefix="sequence_",
+            )
+        )
+    if "smoothness" in selected:
+        values = [
+            smoothness_error(item["pred"], item["target"])
+            for item in reconstructed.values()
+        ]
+        results["smoothness"] = float(np.mean(values)) if values else 0.0
+    if "drift_error" in selected:
+        values = [
+            drift_endpoint_error(item["pred"], item["target"], item["timestamps"])
+            for item in reconstructed.values()
+        ]
+        results["drift_error"] = float(np.mean(values)) if values else 0.0
+    return results

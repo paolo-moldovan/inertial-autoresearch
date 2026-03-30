@@ -76,6 +76,7 @@ class Conv1DDenoiser(BaseDenoiser):
         dilation_base: Base for exponential dilation growth (dilation = base^i).
         dropout: Dropout rate within conv blocks.
     """
+    causal = True
 
     def __init__(
         self,

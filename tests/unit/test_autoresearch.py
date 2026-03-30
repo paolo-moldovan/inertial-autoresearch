@@ -5,13 +5,27 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 from random import Random
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
-from autoresearch_loop.hermes import HermesQueryTrace
-from autoresearch_loop.hermes import _build_prompt as build_hermes_prompt
-from autoresearch_loop.loop import _resolve_iteration_config, build_parser, run_autoresearch
+from autoresearch_loop.hermes import (
+    HermesProposalError,
+    HermesQueryTrace,
+    _run_hermes_query,
+)
+from autoresearch_loop.hermes import (
+    _build_prompt as build_hermes_prompt,
+)
+from autoresearch_loop.loop import (
+    _metric_from_summary,
+    _resolve_iteration_config,
+    _select_mutation_proposal,
+    build_parser,
+    run_autoresearch,
+)
 from autoresearch_loop.mutations import (
     MutationPolicyCandidate,
     MutationProposal,
@@ -21,9 +35,10 @@ from autoresearch_loop.mutations import (
     filter_mutation_proposals,
 )
 from imu_denoise.cli.common import resolve_config
-from imu_denoise.config import DataConfig, ExperimentConfig, ObservabilityConfig
+from imu_denoise.config import DataConfig, ExperimentConfig, HermesConfig, ObservabilityConfig
 from imu_denoise.config.schema import AutoResearchSearchSpaceConfig, AutoResearchStrategyConfig
 from imu_denoise.observability import LoopController, MissionControlQueries
+from imu_denoise.observability.lineage import build_change_items
 from imu_denoise.observability.writer import ObservabilityWriter
 
 
@@ -178,6 +193,96 @@ def test_search_space_can_freeze_architecture_for_hermes_candidates() -> None:
     assert "lower learning rate" in allowed_descriptions
 
 
+def test_search_space_exploit_mode_keeps_incumbent_model_family() -> None:
+    """Exploit mode should block proposals that switch away from the incumbent family."""
+    allowed, blocked = filter_mutation_proposals(
+        default_mutation_pool()[1:],
+        AutoResearchSearchSpaceConfig(baseline_mode="exploit"),
+        incumbent_model_name="conv1d",
+    )
+
+    allowed_descriptions = {proposal.description for proposal in allowed}
+    assert "lower learning rate" in allowed_descriptions
+    assert "small transformer" not in allowed_descriptions
+    assert "deeper lstm" not in allowed_descriptions
+    assert blocked["small transformer"] == ["exploit_incumbent_model=conv1d"]
+
+
+def test_default_mutation_pool_is_broader_than_minimal_smoke_space() -> None:
+    """The default search pool should cover more than a handful of local tweaks."""
+    pool = default_mutation_pool()
+    descriptions = {proposal.description for proposal in pool}
+
+    assert len(pool) >= 18
+    assert "wider current model" in descriptions
+    assert "plateau scheduler" in descriptions
+    assert "causal lstm" in descriptions
+    assert "medium transformer" in descriptions
+
+
+def test_metric_from_summary_supports_sequence_objectives() -> None:
+    """Loop ranking should be able to use sequence-aware best metrics from training."""
+    summary = SimpleNamespace(
+        best_metric_key="sequence_rmse",
+        best_metric_value=0.123,
+        best_eval_metrics={"sequence_rmse": 0.123, "rmse": 0.150},
+        best_val_rmse=0.150,
+        final_val_loss=0.050,
+    )
+
+    assert _metric_from_summary(summary, "sequence_rmse") == pytest.approx(0.123)
+    assert _metric_from_summary(summary, "val_rmse") == pytest.approx(0.150)
+
+
+def test_realtime_mode_filters_noncausal_candidates_before_hermes() -> None:
+    """Realtime mode should keep Hermes on causal candidates only."""
+    config = resolve_config(
+        ["configs/base.yaml", "configs/device.yaml", "configs/models/lstm.yaml"],
+        ["evaluation.realtime_mode=true"],
+    )
+
+    candidates, blocked, _preferred_index, _source, _trace = _select_mutation_proposal(
+        iteration=1,
+        base_config=config,
+        base_overrides=[],
+        rng=Random(0),
+        results=[],
+        fallback_proposal=default_mutation_pool()[1],
+        hermes_used_descriptions=set(),
+        incumbent_summary=None,
+        incumbent_config=None,
+        mutation_lessons=[],
+    )
+
+    descriptions = {candidate.description for candidate in candidates}
+    assert "small transformer" not in descriptions
+    assert "deeper lstm" not in descriptions
+    assert "conv1d baseline" in descriptions
+    assert blocked["small transformer"] == ["realtime_requires_causal_model"]
+
+
+def test_change_items_with_reference_only_tracks_explicit_override_paths() -> None:
+    """Mutation memory should not absorb unrelated loop-level config differences."""
+    reference = {
+        "model": {"name": "conv1d", "hidden_dim": 64},
+        "training": {"lr": 0.001, "time_budget_sec": 0},
+        "autoresearch": {"hermes": {"pass_session_id": False}},
+    }
+    current = {
+        "model": {"name": "conv1d", "hidden_dim": 64},
+        "training": {"lr": 0.0003, "time_budget_sec": 600},
+        "autoresearch": {"hermes": {"pass_session_id": True}},
+    }
+
+    change_items = build_change_items(
+        current_config=current,
+        reference_config=reference,
+        overrides=["training.lr=0.0003"],
+    )
+
+    assert [item["path"] for item in change_items] == ["training.lr"]
+
+
 def test_hermes_prompt_includes_incumbent_constraints_and_lessons() -> None:
     """Hermes should receive the local policy context instead of choosing semi-blindly."""
     prompt = build_hermes_prompt(
@@ -216,6 +321,85 @@ def test_hermes_prompt_includes_incumbent_constraints_and_lessons() -> None:
     assert '"architecture_mode":"fixed"' in prompt
     assert "Recent mutation lessons" in prompt
     assert "groups=[\"training_core\",\"optimizer\"]" in prompt
+
+
+def test_hermes_query_syncs_project_skill_and_passes_skill_flags(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hermes proposal mode should preload the repo skill and pass native CLI flags."""
+    python_bin = tmp_path / "python"
+    cli_path = tmp_path / "cli.py"
+    python_bin.write_text("", encoding="utf-8")
+    cli_path.write_text("", encoding="utf-8")
+    hermes_home = tmp_path / ".hermes"
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run(*args: Any, **kwargs: Any) -> Any:
+        captured["command"] = list(args[0])
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = dict(kwargs.get("env", {}))
+        return SimpleNamespace(returncode=0, stdout='{"candidate_index":0}', stderr="")
+
+    monkeypatch.setattr("autoresearch_loop.hermes.subprocess.run", _fake_run)
+
+    _run_hermes_query(
+        prompt="pick one",
+        config=HermesConfig(
+            python_bin=str(python_bin.relative_to(tmp_path)),
+            cli_path=str(cli_path.relative_to(tmp_path)),
+            home_dir=str(hermes_home.relative_to(tmp_path)),
+            skills=["imu-autoresearch-policy"],
+            pass_session_id=True,
+        ),
+        root=tmp_path,
+    )
+
+    command = captured["command"]
+    assert "--skills" in command
+    assert "imu-autoresearch-policy" in command
+    assert "--pass_session_id" in command
+    assert "--api_key" in command
+    assert "ollama" in command
+    synced_skill = hermes_home / "skills" / "imu-autoresearch-policy" / "SKILL.md"
+    assert synced_skill.exists()
+
+
+def test_hermes_query_raises_with_trace_when_cli_prints_retry_failure(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hermes CLI retry failures should not degrade into opaque parse errors."""
+    python_bin = tmp_path / "python"
+    cli_path = tmp_path / "cli.py"
+    python_bin.write_text("", encoding="utf-8")
+    cli_path.write_text("", encoding="utf-8")
+
+    def _fake_run(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "API call failed after 3 retries: "
+                "HTTP 500: model failed to load, this may be due to resource limitations\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("autoresearch_loop.hermes.subprocess.run", _fake_run)
+
+    with pytest.raises(HermesProposalError) as exc_info:
+        _run_hermes_query(
+            prompt="pick one",
+            config=HermesConfig(
+                python_bin=str(python_bin.relative_to(tmp_path)),
+                cli_path=str(cli_path.relative_to(tmp_path)),
+                home_dir=".hermes",
+            ),
+            root=tmp_path,
+        )
+
+    assert exc_info.value.trace is not None
+    assert exc_info.value.trace.reason is not None
+    assert "model failed to load" in exc_info.value.trace.reason
 
 
 def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
@@ -280,6 +464,10 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     summary = queries.get_mission_control_summary(limit=10)
     assert summary["mutation_leaderboard"]
     assert summary["recent_mutation_lessons"]
+    assert summary["current_candidate_pool"] is not None
+    assert summary["current_candidate_pool"]["candidates"]
+    assert isinstance(summary["current_candidate_pool"]["blocked_candidates"], dict)
+    assert summary["current_candidate_pool"]["run_name"] == summary["current_run"]["run_name"]
 
 
 def test_autoresearch_loop_uses_hermes_proposals_when_enabled(

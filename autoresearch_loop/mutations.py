@@ -100,7 +100,7 @@ def choose_policy_candidate(
 
 
 def default_mutation_pool() -> list[MutationProposal]:
-    """Return a compact pool of safe config-only experiment mutations."""
+    """Return a broader pool of safe config-only experiment mutations."""
     return [
         MutationProposal(
             description="baseline",
@@ -117,9 +117,44 @@ def default_mutation_pool() -> list[MutationProposal]:
             groups=("training_core", "optimizer"),
         ),
         MutationProposal(
+            description="much lower learning rate",
+            overrides=["training.lr=0.0001"],
+            groups=("training_core", "optimizer"),
+        ),
+        MutationProposal(
+            description="moderately higher learning rate",
+            overrides=["training.lr=0.002"],
+            groups=("training_core", "optimizer"),
+        ),
+        MutationProposal(
             description="switch to huber loss",
             overrides=["training.loss=huber"],
             groups=("loss",),
+        ),
+        MutationProposal(
+            description="stronger weight decay",
+            overrides=["training.weight_decay=0.001"],
+            groups=("optimizer", "regularization"),
+        ),
+        MutationProposal(
+            description="lighter weight decay",
+            overrides=["training.weight_decay=0.00001"],
+            groups=("optimizer", "regularization"),
+        ),
+        MutationProposal(
+            description="no scheduler",
+            overrides=["training.scheduler=none"],
+            groups=("scheduler",),
+        ),
+        MutationProposal(
+            description="plateau scheduler",
+            overrides=["training.scheduler=plateau"],
+            groups=("scheduler",),
+        ),
+        MutationProposal(
+            description="step scheduler",
+            overrides=["training.scheduler=step"],
+            groups=("scheduler",),
         ),
         MutationProposal(
             description="larger batch size",
@@ -132,11 +167,52 @@ def default_mutation_pool() -> list[MutationProposal]:
             groups=("training_core",),
         ),
         MutationProposal(
+            description="reduced dropout",
+            overrides=["model.dropout=0.0"],
+            groups=("regularization", "architecture_tuning"),
+        ),
+        MutationProposal(
+            description="higher dropout",
+            overrides=["model.dropout=0.3"],
+            groups=("regularization", "architecture_tuning"),
+        ),
+        MutationProposal(
+            description="wider current model",
+            overrides=["model.hidden_dim=256"],
+            groups=("architecture_tuning",),
+        ),
+        MutationProposal(
+            description="narrower current model",
+            overrides=["model.hidden_dim=64"],
+            groups=("architecture_tuning",),
+        ),
+        MutationProposal(
+            description="deeper current model",
+            overrides=["model.num_layers=4"],
+            groups=("architecture_tuning",),
+        ),
+        MutationProposal(
+            description="shallower current model",
+            overrides=["model.num_layers=1"],
+            groups=("architecture_tuning",),
+        ),
+        MutationProposal(
             description="conv1d baseline",
             overrides=[
                 "model.name=conv1d",
                 "model.hidden_dim=64",
                 "model.num_layers=4",
+            ],
+            groups=("architecture",),
+            architecture_change=True,
+        ),
+        MutationProposal(
+            description="wider conv1d",
+            overrides=[
+                "model.name=conv1d",
+                "model.hidden_dim=128",
+                "model.num_layers=5",
+                "model.kernel_size=9",
             ],
             groups=("architecture",),
             architecture_change=True,
@@ -153,6 +229,17 @@ def default_mutation_pool() -> list[MutationProposal]:
             architecture_change=True,
         ),
         MutationProposal(
+            description="medium transformer",
+            overrides=[
+                "model.name=transformer",
+                "model.hidden_dim=128",
+                "model.num_layers=3",
+                "model.num_heads=4",
+            ],
+            groups=("architecture",),
+            architecture_change=True,
+        ),
+        MutationProposal(
             description="deeper lstm",
             overrides=[
                 "model.name=lstm",
@@ -163,9 +250,25 @@ def default_mutation_pool() -> list[MutationProposal]:
             architecture_change=True,
         ),
         MutationProposal(
+            description="causal lstm",
+            overrides=[
+                "model.name=lstm",
+                "model.hidden_dim=128",
+                "model.num_layers=2",
+                "model.bidirectional=false",
+            ],
+            groups=("architecture",),
+            architecture_change=True,
+        ),
+        MutationProposal(
             description="enable augmentation",
             overrides=["data.augment=true"],
             groups=("augmentation", "data"),
+        ),
+        MutationProposal(
+            description="disable normalization",
+            overrides=["data.normalize=false"],
+            groups=("data",),
         ),
     ]
 
@@ -203,12 +306,18 @@ def proposal_paths(proposal: MutationProposal) -> list[str]:
 def filter_mutation_proposals(
     proposals: list[MutationProposal],
     search_space: AutoResearchSearchSpaceConfig,
+    *,
+    incumbent_model_name: str | None = None,
 ) -> tuple[list[MutationProposal], dict[str, list[str]]]:
     """Filter proposals against the configured search-space constraints."""
     allowed: list[MutationProposal] = []
     blocked: dict[str, list[str]] = {}
     for proposal in proposals:
-        is_allowed, reasons = _proposal_allowed(proposal, search_space)
+        is_allowed, reasons = _proposal_allowed(
+            proposal,
+            search_space,
+            incumbent_model_name=incumbent_model_name,
+        )
         if is_allowed:
             allowed.append(proposal)
         else:
@@ -219,6 +328,8 @@ def filter_mutation_proposals(
 def _proposal_allowed(
     proposal: MutationProposal,
     search_space: AutoResearchSearchSpaceConfig,
+    *,
+    incumbent_model_name: str | None = None,
 ) -> tuple[bool, list[str]]:
     groups = set(proposal.groups)
     paths = proposal_paths(proposal)
@@ -228,6 +339,14 @@ def _proposal_allowed(
         reasons.append("architecture_fixed")
     if search_space.architecture_mode == "tune" and proposal.architecture_change:
         reasons.append("architecture_tune_only")
+    proposed_model_name = _proposed_model_name(proposal)
+    if (
+        search_space.baseline_mode == "exploit"
+        and incumbent_model_name
+        and proposed_model_name is not None
+        and proposed_model_name != incumbent_model_name
+    ):
+        reasons.append(f"exploit_incumbent_model={incumbent_model_name}")
 
     deny_groups = {item for item in search_space.deny_groups if item}
     blocked_groups = sorted(groups & deny_groups)
@@ -257,6 +376,15 @@ def _proposal_allowed(
 def _path_matches_prefix(path: str, prefix: str) -> bool:
     normalized_prefix = prefix.strip()
     return path == normalized_prefix or path.startswith(normalized_prefix + ".")
+
+
+def _proposed_model_name(proposal: MutationProposal) -> str | None:
+    for override in proposal.overrides:
+        if not override.startswith("model.name="):
+            continue
+        _key, value = override.split("=", 1)
+        return value.strip()
+    return None
 
 
 def _score_candidate(
@@ -289,6 +417,43 @@ def _score_candidate(
     confidence = (
         sum(float(item.get("confidence", 0.0)) for item in known_stats) / max(1, len(known_stats))
     )
+    prior_strength = (
+        sum(float(item.get("prior_strength", 0.0)) for item in known_stats)
+        / max(
+            1,
+            sum(1 for item in known_stats if float(item.get("prior_strength", 0.0)) > 0.0),
+        )
+    ) if known_stats else 0.0
+    prior_avg_delta = (
+        sum(
+            float(item.get("prior_avg_metric_delta", 0.0)) * float(item.get("prior_strength", 0.0))
+            for item in known_stats
+        ) / max(
+            1e-8,
+            sum(float(item.get("prior_strength", 0.0)) for item in known_stats),
+        )
+    ) if known_stats else 0.0
+    prior_confidence = (
+        sum(float(item.get("prior_confidence", 0.0)) for item in known_stats)
+        / max(
+            1,
+            sum(1 for item in known_stats if float(item.get("prior_confidence", 0.0)) > 0.0),
+        )
+    ) if known_stats else 0.0
+    prior_discard_rate = (
+        sum(float(item.get("prior_discard_rate", 0.0)) for item in known_stats)
+        / max(
+            1,
+            sum(1 for item in known_stats if float(item.get("prior_strength", 0.0)) > 0.0),
+        )
+    ) if known_stats else 0.0
+    prior_crash_rate = (
+        sum(float(item.get("prior_crash_rate", 0.0)) for item in known_stats)
+        / max(
+            1,
+            sum(1 for item in known_stats if float(item.get("prior_strength", 0.0)) > 0.0),
+        )
+    ) if known_stats else 0.0
     known_signatures = {str(item.get("signature")) for item in known_stats}
     novelty_count = sum(
         1 for signature in candidate.signatures if signature not in known_signatures
@@ -319,16 +484,28 @@ def _score_candidate(
         )
         retry_penalty = 0.05 * over_limit
     total_score = avg_metric_delta
+    if prior_strength > 0.0:
+        total_score += prior_strength * prior_avg_delta
     total_score += strategy.confidence_weight * (confidence - 0.5)
+    if prior_strength > 0.0:
+        total_score += 0.5 * strategy.confidence_weight * prior_strength * (prior_confidence - 0.5)
     total_score += novelty_score
     total_score -= strategy.discard_penalty * discard_count
     total_score -= strategy.crash_penalty * crash_count
+    if prior_strength > 0.0:
+        total_score -= strategy.discard_penalty * prior_strength * prior_discard_rate
+        total_score -= strategy.crash_penalty * prior_strength * prior_crash_rate
     total_score -= retry_penalty
     reasons: list[str] = []
     if avg_metric_delta != 0.0:
         reasons.append(f"avg_delta={avg_metric_delta:.4f}")
     if confidence > 0:
         reasons.append(f"confidence={confidence:.2f}")
+    if prior_strength > 0.0:
+        reasons.append(
+            "cross_regime_prior="
+            f"{prior_avg_delta:.4f}@{prior_strength:.2f}"
+        )
     if novelty_count > 0:
         reasons.append(f"novelty+{novelty_score:.2f}")
     if discard_count > 0:

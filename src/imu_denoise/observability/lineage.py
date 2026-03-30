@@ -42,6 +42,8 @@ def build_change_items(
 
     items: list[dict[str, Any]] = []
     _diff_mapping(current_payload, reference_payload, path="", items=items)
+    if overrides:
+        items = _filter_items_by_overrides(items, overrides)
     items.sort(key=lambda item: str(item["path"]))
     return items
 
@@ -86,6 +88,25 @@ def data_regime_fingerprint(config: Mapping[str, Any] | Any) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def model_is_causal(config: Mapping[str, Any] | Any) -> bool | None:
+    """Resolve whether the configured model is causal from its resolved config payload."""
+    payload = normalize_config_payload(config)
+    model = payload.get("model")
+    if not isinstance(model, Mapping):
+        return None
+    name = model.get("name")
+    if name == "conv1d":
+        return True
+    if name == "transformer":
+        return False
+    if name == "lstm":
+        return not bool(model.get("bidirectional", True))
+    extra = model.get("extra")
+    if isinstance(extra, Mapping) and isinstance(extra.get("causal"), bool):
+        return bool(extra.get("causal"))
+    return None
 
 
 def build_mutation_signatures(change_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -179,6 +200,29 @@ def _lookup_path(payload: Mapping[str, Any], path: str) -> Any:
     return current
 
 
+def _filter_items_by_overrides(
+    items: list[dict[str, Any]],
+    overrides: list[str],
+) -> list[dict[str, Any]]:
+    override_paths = {
+        key.strip()
+        for override in overrides
+        if "=" in override
+        for key, _value in [override.split("=", 1)]
+        if key.strip()
+    }
+    if not override_paths:
+        return items
+    return [
+        item
+        for item in items
+        if any(
+            _path_matches_prefix(str(item.get("path") or ""), prefix)
+            for prefix in override_paths
+        )
+    ]
+
+
 def _should_ignore_path(path: str) -> bool:
     if not path:
         return False
@@ -186,6 +230,10 @@ def _should_ignore_path(path: str) -> bool:
     if root in _IGNORED_ROOTS:
         return True
     return path in _IGNORED_PATHS
+
+
+def _path_matches_prefix(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + ".")
 
 
 def _signature_value(value: Any) -> str:
