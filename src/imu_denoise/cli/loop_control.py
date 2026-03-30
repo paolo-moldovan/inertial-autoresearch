@@ -9,12 +9,14 @@ from typing import Any
 
 from autoresearch_loop.loop import run_autoresearch
 from imu_denoise.cli.common import add_common_config_arguments, resolve_config
-from imu_denoise.observability import (
-    LoopAlreadyRunningError,
-    LoopController,
-    MissionControlQueries,
-    ObservabilityWriter,
-)
+from imu_denoise.observability import LoopAlreadyRunningError, build_mission_control_services
+
+
+def _build_services(config: Any) -> Any:
+    return build_mission_control_services(
+        db_path=Path(config.observability.db_path),
+        blob_dir=Path(config.observability.blob_dir),
+    )
 
 
 def add_loop_arguments(parser: argparse.ArgumentParser) -> None:
@@ -45,10 +47,10 @@ def add_loop_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_loop_command(args: Any) -> int:
     config = resolve_config(args.config, args.overrides)
-    writer = ObservabilityWriter.from_experiment_config(config)
-    controller = LoopController.from_experiment_config(config, writer=writer)
+    services = _build_services(config)
+    facade = services.facade
     if args.resume:
-        resumed = controller.resume_loop()
+        resumed = facade.resume_loop()
         if resumed is None:
             print("No paused loop is available to resume.")
             return 1
@@ -101,9 +103,8 @@ def add_queue_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_queue_command(args: Any) -> int:
     config = resolve_config(args.config, [])
-    writer = ObservabilityWriter.from_experiment_config(config)
-    controller = LoopController.from_experiment_config(config, writer=writer)
-    proposal = controller.enqueue_proposal(
+    facade = _build_services(config).facade
+    proposal = facade.enqueue_proposal(
         description=args.description,
         overrides=list(args.proposal_overrides),
         requested_by=os.environ.get("USER") or "human",
@@ -122,15 +123,12 @@ def add_status_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_status_command(args: Any) -> int:
     config = resolve_config(args.config, args.overrides)
-    queries = MissionControlQueries(
-        db_path=Path(config.observability.db_path),
-        blob_dir=Path(config.observability.blob_dir),
-    )
-    loop_state = queries.get_loop_status()
+    facade = _build_services(config).facade
+    loop_state = facade.get_loop_status()
     if loop_state is None:
         print("No active loop.")
         return 0
-    summary = queries.get_mission_control_summary(limit=1)
+    summary = facade.get_summary(limit=1)
     best = summary["best_result"]
     best_text = (
         f"{best['metric_value']:.6f} ({best['run_name']})"
@@ -158,12 +156,11 @@ def add_stop_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_stop_command(args: Any) -> int:
     config = resolve_config(args.config, args.overrides)
-    writer = ObservabilityWriter.from_experiment_config(config)
-    controller = LoopController.from_experiment_config(config, writer=writer)
+    facade = _build_services(config).facade
     state = (
-        controller.request_terminate()
+        facade.request_terminate()
         if args.terminate
-        else controller.request_stop()
+        else facade.request_stop()
     )
     if state is None:
         print("No active loop is available.")
@@ -190,15 +187,13 @@ def add_rerun_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_rerun_command(args: Any) -> int:
     config = resolve_config(args.config, args.overrides)
-    db_path = Path(config.observability.db_path)
-    blob_dir = Path(config.observability.blob_dir)
-    queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
-    match = queries.resolve_id_fragment(args.run_id)
+    facade = _build_services(config).facade
+    match = facade.search_entity(args.run_id)
     if match is None or match["entity_type"] != "run":
         print(f"Could not resolve run ID: {args.run_id}")
         return 1
     run_id = str(match["id"])
-    detail = queries.get_run_detail(run_id)
+    detail = facade.get_run_detail(run_id)
     if detail is None:
         print(f"Run not found: {run_id}")
         return 1
@@ -207,9 +202,7 @@ def run_rerun_command(args: Any) -> int:
         print(f"Run {run_id[:8]} has no decision payload to rerun.")
         return 1
     decision = decisions[0]
-    writer = ObservabilityWriter.from_experiment_config(config)
-    controller = LoopController.from_experiment_config(config, writer=writer)
-    proposal = controller.enqueue_proposal(
+    proposal = facade.enqueue_proposal(
         description=f"rerun {detail['run']['name']}",
         overrides=list(decision.get("overrides") or []),
         requested_by=os.environ.get("USER") or "human",

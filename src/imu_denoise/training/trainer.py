@@ -15,13 +15,17 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
+from autoresearch_core.training import (
+    NoOpTrainingControl,
+    NoOpTrainingHooks,
+    TrainingControl,
+    TrainingHooks,
+)
 from imu_denoise.config.schema import ExperimentConfig
 from imu_denoise.data.datamodule import DataBundle
 from imu_denoise.device.context import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
 from imu_denoise.models.base import BaseDenoiser
-from imu_denoise.observability import ObservabilityWriter
-from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training.callbacks import CheckpointManager, EarlyStopping
 from imu_denoise.training.losses import LossFn
 from imu_denoise.utils.io import save_metrics
@@ -78,7 +82,8 @@ class Trainer:
         optimizer: Optimizer,
         scheduler: LRScheduler | ReduceLROnPlateau | None,
         loss_fn: LossFn,
-        observability: ObservabilityWriter | None = None,
+        training_hooks: TrainingHooks | None = None,
+        training_control: TrainingControl | None = None,
         run_id: str | None = None,
         parent_run_id: str | None = None,
     ) -> None:
@@ -89,11 +94,9 @@ class Trainer:
         self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.scaler = device_ctx.create_scaler()
-        self.observability = observability or ObservabilityWriter.from_experiment_config(
-            config,
-            logger=None,
-        )
-        self.run_id = run_id or self.observability.make_run_id(name=config.name, phase="training")
+        self.training_hooks = training_hooks or NoOpTrainingHooks()
+        self.run_id = run_id or self.training_hooks.make_run_id(name=config.name, phase="training")
+        self.training_control = training_control or NoOpTrainingControl()
         self.run_paths = build_run_paths(
             config.output_dir,
             run_name=config.name,
@@ -104,7 +107,6 @@ class Trainer:
             log_dir=str(self.run_paths.logs_dir),
             log_filename="runtime",
         )
-        self.observability.logger = self.logger
         self.checkpoints = CheckpointManager(self.run_paths.checkpoints_dir)
         self.early_stopping = EarlyStopping(
             patience=config.training.early_stop_patience,
@@ -132,7 +134,7 @@ class Trainer:
         last_train_loss = float("nan")
         last_val_loss = float("nan")
         objective_metric_key = self.config.autoresearch.metric_key
-        run_id = self.observability.start_run(
+        run_id = self.training_hooks.start_run(
             name=self.config.name,
             phase="training",
             dataset=self.config.data.dataset,
@@ -145,7 +147,7 @@ class Trainer:
             source="runtime",
             run_id=self.run_id,
         )
-        log_handler = self.observability.create_log_handler(run_id)
+        log_handler = self.training_hooks.create_log_handler(run_id)
         self.logger.addHandler(log_handler)
         write_run_manifest(
             self.run_paths,
@@ -154,10 +156,9 @@ class Trainer:
                 "name": self.config.name,
                 "phase": "training",
                 "parent_run_id": self.parent_run_id,
-                "regime_fingerprint": data_regime_fingerprint(self.config),
             },
         )
-        self.observability.update_status(
+        self.training_hooks.update_status(
             run_id=run_id,
             phase="training",
             message=f"device={self.device_ctx.device.type} dtype={self.device_ctx.dtype}",
@@ -262,7 +263,7 @@ class Trainer:
                     best_eval_metrics = dict(metrics or {})
                     if val_rmse is not None:
                         best_val_rmse = val_rmse
-                    self.observability.register_artifact(
+                    self.training_hooks.register_artifact(
                         run_id=run_id,
                         path=self.checkpoints.best_path,
                         artifact_type="checkpoint",
@@ -277,7 +278,7 @@ class Trainer:
                         source="runtime",
                     )
 
-                self.observability.register_artifact(
+                self.training_hooks.register_artifact(
                     run_id=run_id,
                     path=self.checkpoints.last_path,
                     artifact_type="checkpoint",
@@ -288,7 +289,7 @@ class Trainer:
 
                 last_train_loss = train_loss
                 last_val_loss = val_loss
-                self.observability.record_epoch(
+                self.training_hooks.record_epoch(
                     run_id=run_id,
                     epoch=epoch,
                     train_loss=train_loss,
@@ -303,13 +304,16 @@ class Trainer:
                     if best_metric_value != float("inf")
                     else best_val_rmse
                 )
-                self._heartbeat_parent_loop(best_metric=heartbeat_metric)
+                self.training_control.heartbeat(
+                    best_metric=heartbeat_metric,
+                    active_child_run_id=self.run_id,
+                )
 
                 if self.config.training.time_budget_sec > 0:
                     elapsed = time.perf_counter() - start_time
                     if elapsed >= self.config.training.time_budget_sec:
                         self.logger.warning("Stopping early because the time budget was reached.")
-                        self.observability.append_event(
+                        self.training_hooks.append_event(
                             run_id=run_id,
                             event_type="time_budget_reached",
                             level="WARNING",
@@ -319,13 +323,13 @@ class Trainer:
                         )
                         break
 
-                self._check_loop_termination()
+                self.training_control.check_abort()
 
                 if objective_metric_value is not None and self.early_stopping.update(
                     objective_metric_value
                 ):
                     self.logger.info("Stopping early after %d epochs without improvement.", epoch)
-                    self.observability.append_event(
+                    self.training_hooks.append_event(
                         run_id=run_id,
                         event_type="early_stop",
                         level="INFO",
@@ -364,7 +368,7 @@ class Trainer:
             }
             metrics_path = self.run_paths.metrics_path
             save_metrics(metrics_path, summary_metrics)
-            self.observability.register_artifact(
+            self.training_hooks.register_artifact(
                 run_id=run_id,
                 path=metrics_path,
                 artifact_type="training_metrics",
@@ -372,7 +376,7 @@ class Trainer:
                 metadata=summary_metrics,
                 source="runtime",
             )
-            self.observability.register_artifact(
+            self.training_hooks.register_artifact(
                 run_id=run_id,
                 path=self.history_path,
                 artifact_type="history",
@@ -407,7 +411,7 @@ class Trainer:
                 training_seconds=elapsed,
                 artifacts=artifacts,
             )
-            self.observability.finish_run(
+            self.training_hooks.finish_run(
                 run_id=run_id,
                 status="completed",
                 summary=summary_metrics,
@@ -415,7 +419,7 @@ class Trainer:
             )
             return summary
         except Exception as exc:
-            self.observability.finish_run(
+            self.training_hooks.finish_run(
                 run_id=run_id,
                 status="failed",
                 summary={"message": str(exc)},
@@ -437,7 +441,7 @@ class Trainer:
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
             for batch in dataloader:
-                self._check_loop_termination()
+                self.training_control.check_abort()
                 noisy, clean = self._unpack_batch(batch)
                 noisy = noisy.to(self.device_ctx.device)
                 clean = clean.to(self.device_ctx.device)
@@ -492,54 +496,6 @@ class Trainer:
             )
         return float(metric_value)
 
-    def _check_loop_termination(self) -> None:
-        if self.parent_run_id is None or self.observability.store is None:
-            return
-        from imu_denoise.observability.control import LoopController
-
-        controller = LoopController(store=self.observability.store, writer=self.observability)
-        loop_state = controller.get_loop_state(self.parent_run_id)
-        if loop_state is None:
-            return
-        if bool(loop_state.get("terminate_requested")):
-            raise TrainingInterrupted("terminated", "Training terminated by control-plane request.")
-
-    def _heartbeat_parent_loop(self, *, best_metric: float) -> None:
-        if self.parent_run_id is None or self.observability.store is None:
-            return
-        from imu_denoise.observability.control import LoopController
-
-        controller = LoopController(store=self.observability.store, writer=self.observability)
-        loop_state = controller.get_loop_state(self.parent_run_id)
-        if loop_state is None:
-            return
-        controller.heartbeat(
-            loop_run_id=self.parent_run_id,
-            current_iteration=int(loop_state["current_iteration"]),
-            max_iterations=int(loop_state["max_iterations"]),
-            batch_size=(
-                int(loop_state["batch_size"])
-                if isinstance(loop_state.get("batch_size"), int)
-                else None
-            ),
-            pause_after_iteration=(
-                int(loop_state["pause_after_iteration"])
-                if isinstance(loop_state.get("pause_after_iteration"), int)
-                else None
-            ),
-            pause_requested=bool(loop_state.get("pause_requested")),
-            stop_requested=bool(loop_state.get("stop_requested")),
-            terminate_requested=bool(loop_state.get("terminate_requested")),
-            best_metric=best_metric if best_metric != float("inf") else None,
-            best_run_id=(
-                str(loop_state["best_run_id"])
-                if loop_state.get("best_run_id") is not None
-                else None
-            ),
-            active_child_run_id=self.run_id,
-            status=str(loop_state.get("status") or "running"),
-        )
-
     def _generate_summary_figures(
         self,
         *,
@@ -568,7 +524,7 @@ class Trainer:
         curves_path = self.run_paths.figures_dir / "training_curves.png"
         curves_fig = plot_training_curves(self.history_path, save_path=curves_path)
         plt.close(curves_fig)
-        self.observability.register_artifact(
+        self.training_hooks.register_artifact(
             run_id=run_id,
             path=curves_path,
             artifact_type="figure",
@@ -608,7 +564,7 @@ class Trainer:
             save_path=comparison_path,
         )
         plt.close(comparison_fig)
-        self.observability.register_artifact(
+        self.training_hooks.register_artifact(
             run_id=run_id,
             path=comparison_path,
             artifact_type="figure",
@@ -628,7 +584,7 @@ class Trainer:
             save_path=psd_path,
         )
         plt.close(psd_fig)
-        self.observability.register_artifact(
+        self.training_hooks.register_artifact(
             run_id=run_id,
             path=psd_path,
             artifact_type="figure",
@@ -643,7 +599,7 @@ class Trainer:
             save_path=errors_path,
         )
         plt.close(errors_fig)
-        self.observability.register_artifact(
+        self.training_hooks.register_artifact(
             run_id=run_id,
             path=errors_path,
             artifact_type="figure",

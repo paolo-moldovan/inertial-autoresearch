@@ -12,6 +12,7 @@ from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.observability import ObservabilityWriter
 from imu_denoise.observability.lineage import data_regime_fingerprint
+from imu_denoise.observability.training_hooks import build_training_hooks
 from imu_denoise.training import (
     Trainer,
     build_loss,
@@ -74,6 +75,7 @@ def run_command(args: Any) -> int:
         device_ctx,
     )
     optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+    training_hooks = build_training_hooks(config=config, observability=observability)
     trainer = Trainer(
         model=model,
         config=config,
@@ -81,7 +83,7 @@ def run_command(args: Any) -> int:
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=build_loss(config.training),
-        observability=observability,
+        training_hooks=training_hooks,
         run_id=run_id,
     )
     summary = trainer.fit(data_bundle)

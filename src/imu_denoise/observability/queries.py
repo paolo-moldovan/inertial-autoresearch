@@ -9,6 +9,10 @@ from math import log1p
 from pathlib import Path
 from typing import Any
 
+from autoresearch_core.observability.analytics import (
+    compute_loop_analytics,
+    compute_multi_loop_analytics,
+)
 from imu_denoise.data.diagnostics import temporal_decay_weight
 from imu_denoise.observability.control import (
     LOOP_PAUSED,
@@ -195,6 +199,26 @@ class MissionControlQueries:
                 s.message
             FROM runs r
             LEFT JOIN status_snapshots s ON s.run_id = r.id
+            ORDER BY r.started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    def list_loop_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self.store.fetch_all(
+            """
+            SELECT
+                r.id,
+                r.name,
+                r.dataset,
+                r.model,
+                r.status,
+                r.started_at,
+                r.ended_at,
+                r.experiment_id
+            FROM runs r
+            WHERE r.phase = 'autoresearch_loop'
             ORDER BY r.started_at DESC
             LIMIT ?
             """,
@@ -980,6 +1004,32 @@ class MissionControlQueries:
         hermes_runtime = self.get_hermes_runtime_summary(
             loop_run_id=None if loop_state is None else str(loop_state["loop_run_id"])
         )
+        analytics = compute_loop_analytics(
+            progress=progress,
+            decisions=recent_decisions,
+            leaderboard=leaderboard,
+        )
+        loop_summaries = []
+        for loop_run in self.list_loop_runs(limit=10):
+            loop_run_id = str(loop_run["id"])
+            loop_progress = self.list_loop_iteration_metrics(loop_run_id)
+            loop_decisions = self.list_recent_decisions(limit=100, loop_run_id=loop_run_id)
+            loop_leaderboard = self.list_leaderboard(
+                limit=10,
+                metric_key=self.get_run_objective_metric(loop_run_id) or "val_rmse",
+                regime_fingerprint=self.get_run_regime_fingerprint(loop_run_id),
+            )
+            loop_summaries.append(
+                {
+                    "loop_run_id": loop_run_id,
+                    "analytics": compute_loop_analytics(
+                        progress=loop_progress,
+                        decisions=loop_decisions,
+                        leaderboard=loop_leaderboard,
+                    ).__dict__,
+                }
+            )
+        multi_loop_analytics = compute_multi_loop_analytics(loop_summaries)
         return {
             "loop_state": loop_state,
             "current_run": current_run,
@@ -996,6 +1046,8 @@ class MissionControlQueries:
             "mutation_leaderboard": mutation_leaderboard,
             "recent_mutation_lessons": recent_mutation_lessons,
             "hermes_runtime": hermes_runtime,
+            "analytics": analytics.__dict__,
+            "multi_loop_analytics": multi_loop_analytics.__dict__,
         }
 
     def get_current_run_summary(self, loop_run_id: str | None) -> dict[str, Any] | None:

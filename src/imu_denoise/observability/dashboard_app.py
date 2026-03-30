@@ -6,9 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from imu_denoise.config.schema import ObservabilityConfig
-from imu_denoise.observability import LoopController, MissionControlQueries, ObservabilityStore
-from imu_denoise.observability.writer import ObservabilityWriter
+from imu_denoise.observability.services import build_mission_control_services
 
 
 def render_dashboard(*, db_path: Path, blob_dir: Path) -> None:
@@ -22,20 +20,11 @@ def render_dashboard(*, db_path: Path, blob_dir: Path) -> None:
         ) from exc
 
     st.set_page_config(page_title="IMU Mission Control", layout="wide")
-    queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
-    store = ObservabilityStore(db_path=db_path, blob_dir=blob_dir)
-    writer = ObservabilityWriter(
-        config=ObservabilityConfig(
-            enabled=True,
-            db_path=str(db_path),
-            blob_dir=str(blob_dir),
-        ),
-        store=store,
-    )
-    controller = LoopController(store=store, writer=writer)
+    services = build_mission_control_services(db_path=db_path, blob_dir=blob_dir)
+    facade = services.facade
 
     st.title("Mission Control")
-    _render_sidebar(st, queries)
+    _render_sidebar(st, facade)
     pages = ["Mission Control", "Runs", "LLM Traces"]
     current_page = _query_param_value(st, "page")
     default_index = pages.index(current_page) if current_page in pages else 0
@@ -43,18 +32,18 @@ def render_dashboard(*, db_path: Path, blob_dir: Path) -> None:
     st.query_params["page"] = page
 
     if page == "Mission Control":
-        _render_mission_control(st, pd, queries, controller)
+        _render_mission_control(st, pd, facade)
     elif page == "Runs":
-        _render_runs_page(st, pd, queries)
+        _render_runs_page(st, pd, facade)
     else:
-        _render_llm_traces(st, pd, queries)
+        _render_llm_traces(st, pd, facade)
 
 
-def _render_sidebar(st: Any, queries: MissionControlQueries) -> None:
+def _render_sidebar(st: Any, facade: Any) -> None:
     st.sidebar.subheader("Jump")
     fragment = st.sidebar.text_input("Search by ID", value="")
     if fragment:
-        match = queries.resolve_id_fragment(fragment)
+        match = facade.search_entity(fragment)
         if match is None:
             st.sidebar.warning("No unique ID match.")
         elif match["entity_type"] == "run":
@@ -74,16 +63,15 @@ def _render_sidebar(st: Any, queries: MissionControlQueries) -> None:
 def _render_mission_control(
     st: Any,
     pd: Any,
-    queries: MissionControlQueries,
-    controller: LoopController,
+    facade: Any,
 ) -> None:
-    summary = queries.get_mission_control_summary(limit=10)
+    summary = facade.get_summary(limit=10)
     loop_state = summary["loop_state"]
     best_result = summary["best_result"]
     leaderboard = summary["leaderboard"]
     progress = summary["progress"]
 
-    _render_status_bar(st, loop_state, controller)
+    _render_status_bar(st, loop_state, facade)
 
     left, right = st.columns([1, 2])
     with left:
@@ -140,7 +128,7 @@ def _render_mission_control(
 def _render_status_bar(
     st: Any,
     loop_state: dict[str, Any] | None,
-    controller: LoopController,
+    facade: Any,
 ) -> None:
     st.subheader("Status")
     if loop_state is None:
@@ -163,15 +151,15 @@ def _render_status_bar(
 
     controls = st.columns(2)
     if controls[0].button("Pause", disabled=loop_state["status"] != "running"):
-        controller.request_pause(loop_run_id=str(loop_state["loop_run_id"]))
+        facade.request_pause()
         st.rerun()
     if controls[1].button("Resume", disabled=loop_state["status"] != "paused"):
-        controller.resume_loop(loop_run_id=str(loop_state["loop_run_id"]))
+        facade.resume_loop()
         st.rerun()
 
 
-def _render_runs_page(st: Any, pd: Any, queries: MissionControlQueries) -> None:
-    runs = queries.list_runs(limit=200)
+def _render_runs_page(st: Any, pd: Any, facade: Any) -> None:
+    runs = facade.list_runs(limit=200)
     if not runs:
         st.info("No runs available.")
         return
@@ -191,7 +179,7 @@ def _render_runs_page(st: Any, pd: Any, queries: MissionControlQueries) -> None:
     run_id = str(labels[selected_label])
     st.query_params["run_id"] = run_id
 
-    detail = queries.get_run_detail(run_id)
+    detail = facade.get_run_detail(run_id)
     if detail is None:
         st.warning("Run detail not found.")
         return
@@ -245,7 +233,7 @@ def _render_runs_page(st: Any, pd: Any, queries: MissionControlQueries) -> None:
         if not llm_calls:
             st.info("No LLM trace for this run.")
         else:
-            first_call = queries.get_llm_call(str(llm_calls[0]["id"]))
+            first_call = facade.get_llm_call(str(llm_calls[0]["id"]))
             if first_call is not None:
                 st.json(
                     {
@@ -260,8 +248,8 @@ def _render_runs_page(st: Any, pd: Any, queries: MissionControlQueries) -> None:
                     st.code(first_call["response"])
 
 
-def _render_llm_traces(st: Any, pd: Any, queries: MissionControlQueries) -> None:
-    llm_calls = queries.list_recent_llm_calls(limit=200)
+def _render_llm_traces(st: Any, pd: Any, facade: Any) -> None:
+    llm_calls = facade.list_recent_llm_calls(limit=200)
     if not llm_calls:
         st.info("No LLM traces available.")
         return
@@ -278,7 +266,7 @@ def _render_llm_traces(st: Any, pd: Any, queries: MissionControlQueries) -> None
     llm_call_id = str(labels[selected_label])
     st.query_params["llm_call_id"] = llm_call_id
 
-    detail = queries.get_llm_call(llm_call_id)
+    detail = facade.get_llm_call(llm_call_id)
     if detail is None:
         st.warning("Trace not found.")
         return
@@ -300,7 +288,11 @@ def _render_llm_traces(st: Any, pd: Any, queries: MissionControlQueries) -> None
     if detail.get("response"):
         st.subheader("Response")
         st.code(detail["response"])
-    tool_calls = queries.list_tool_calls(llm_call_id=llm_call_id, limit=50, include_payload=True)
+    tool_calls = facade.list_tool_calls(
+        llm_call_id=llm_call_id,
+        limit=50,
+        include_payload=True,
+    )
     if tool_calls:
         st.subheader("Tool Calls")
         st.dataframe(pd.DataFrame(tool_calls), use_container_width=True)
