@@ -17,6 +17,7 @@ from imu_denoise.autoresearch.adapter import IMUProjectAdapter
 from imu_denoise.training import TrainingInterrupted
 
 from . import execution as execution_helpers
+from . import selection as selection_helpers
 
 if TYPE_CHECKING:
     from autoresearch_core.providers.hermes import HermesQueryTrace
@@ -197,30 +198,11 @@ def _build_run_overrides(
 
 
 def _result_snapshot(result: LoopResult) -> dict[str, object]:
-    return {
-        "iteration": result.iteration,
-        "run_name": result.run_name,
-        "status": result.status,
-        "proposal_source": result.proposal_source,
-        "metric_key": result.metric_key,
-        "metric_value": result.metric_value,
-        "model_name": result.model_name,
-        "description": result.description,
-        "overrides": result.overrides,
-    }
+    return selection_helpers.result_snapshot(result)
 
 
 def _recent_policy_results(results: list[LoopResult]) -> list[dict[str, Any]]:
-    return [
-        {
-            "iteration": result.iteration,
-            "status": result.status,
-            "proposal_source": result.proposal_source,
-            "metric_value": result.metric_value,
-            "description": result.description,
-        }
-        for result in results
-    ]
+    return selection_helpers.recent_policy_results(results)
 
 
 def _select_mutation_proposal(
@@ -244,80 +226,21 @@ def _select_mutation_proposal(
     str,
     HermesQueryTrace | None,
 ]:
-    from autoresearch_core.engine import resolve_provider_selection
-    from imu_denoise.autoresearch.mutations import default_mutation_pool, filter_mutation_proposals
-    from imu_denoise.observability.lineage import model_is_causal
-
-    candidate_pool = list(mutation_catalog or default_mutation_pool())[1:]
     config_resolver = resolve_iteration_config_fn or _resolve_iteration_config
-    candidate_pool, blocked_candidates = filter_mutation_proposals(
-        candidate_pool,
-        base_config.autoresearch.search_space,
-        incumbent_model_name=(
-            str(incumbent_summary["model"])
-            if incumbent_summary is not None and incumbent_summary.get("model") is not None
-            else None
-        ),
-    )
-    realtime_blocked: dict[str, list[str]] = {}
-    if base_config.evaluation.realtime_mode:
-        realtime_allowed: list[MutationProposal] = []
-        for proposal in candidate_pool:
-            candidate_config = config_resolver(
-                base_config=base_config,
-                base_overrides=base_overrides,
-                proposal_overrides=list(proposal.overrides),
-                incumbent_config=incumbent_config,
-            )
-            if model_is_causal(candidate_config) is False:
-                realtime_blocked[proposal.description] = ["realtime_requires_causal_model"]
-                continue
-            realtime_allowed.append(proposal)
-        candidate_pool = realtime_allowed
-        blocked_candidates.update(realtime_blocked)
-    if not candidate_pool:
-        raise RuntimeError(
-            "No mutation candidates remain after applying the autoresearch search-space "
-            f"constraints. Blocked candidates: {blocked_candidates}"
-        )
-    from autoresearch_loop.hermes import (
-        HermesProposalError,
-        choose_mutation_proposal_with_trace,
-        hermes_backend_ready,
-    )
-
-    selection = resolve_provider_selection(
+    return selection_helpers.select_mutation_proposal(
+        root=ROOT,
         iteration=iteration,
-        orchestrator=base_config.autoresearch.orchestrator,
-        fallback_proposal=fallback_proposal,
-        candidate_pool=candidate_pool,
-        blocked_candidates=blocked_candidates,
-        used_descriptions=hermes_used_descriptions,
+        base_config=base_config,
+        base_overrides=base_overrides,
+        mutation_catalog=mutation_catalog,
+        resolve_iteration_config_fn=config_resolver,
         rng=rng,
-        provider_ready=lambda: hermes_backend_ready(base_config.autoresearch.hermes, root=ROOT),
-        provider_select=lambda available_candidates: choose_mutation_proposal_with_trace(
-            config=base_config.autoresearch.hermes,
-            iteration=iteration,
-            metric_key=base_config.autoresearch.metric_key,
-            metric_direction=base_config.autoresearch.metric_direction,
-            history=[_result_snapshot(result) for result in results],
-            candidates=available_candidates,
-            incumbent=incumbent_summary,
-            search_space={
-                **asdict(base_config.autoresearch.search_space),
-                "blocked_candidates": blocked_candidates,
-            },
-            mutation_lessons=mutation_lessons,
-            root=ROOT,
-        ),
-        provider_error=HermesProposalError,
-    )
-    return (
-        selection.candidates,
-        selection.blocked_candidates,
-        selection.preferred_candidate_index,
-        selection.proposal_source,
-        selection.provider_trace,
+        results=results,
+        fallback_proposal=fallback_proposal,
+        hermes_used_descriptions=hermes_used_descriptions,
+        incumbent_summary=incumbent_summary,
+        incumbent_config=incumbent_config,
+        mutation_lessons=mutation_lessons,
     )
 
 

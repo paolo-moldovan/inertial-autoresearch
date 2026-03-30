@@ -13,6 +13,7 @@ from autoresearch_core.observability.analytics import (
     compute_loop_analytics,
     compute_multi_loop_analytics,
 )
+from autoresearch_core.observability.read_models import build_mission_control_summary_payload
 from imu_denoise.data.diagnostics import temporal_decay_weight
 from imu_denoise.observability.control import (
     LOOP_PAUSED,
@@ -982,25 +983,6 @@ class MissionControlQueries:
         current_run = self.get_current_run_summary(
             None if loop_state is None else str(loop_state["loop_run_id"])
         )
-        current_candidate_pool = None
-        if current_run is not None:
-            current_candidate_pool = {
-                "run_id": current_run.get("run_id"),
-                "run_name": current_run.get("run_name"),
-                "proposal_source": current_run.get("proposal_source"),
-                "policy_mode": current_run.get("policy_mode"),
-                "selection_rationale": current_run.get("selection_rationale"),
-                "selected_candidate_index": current_run.get("selected_candidate_index"),
-                "preferred_candidate_index": current_run.get("preferred_candidate_index"),
-                "preferred_candidate_description": current_run.get(
-                    "preferred_candidate_description"
-                ),
-                "hermes_status": current_run.get("hermes_status"),
-                "hermes_reason": current_run.get("hermes_reason"),
-                "candidate_count": len(current_run.get("candidate_pool") or []),
-                "candidates": list(current_run.get("candidate_pool") or []),
-                "blocked_candidates": dict(current_run.get("blocked_candidates") or {}),
-            }
         hermes_runtime = self.get_hermes_runtime_summary(
             loop_run_id=None if loop_state is None else str(loop_state["loop_run_id"])
         )
@@ -1030,25 +1012,24 @@ class MissionControlQueries:
                 }
             )
         multi_loop_analytics = compute_multi_loop_analytics(loop_summaries)
-        return {
-            "loop_state": loop_state,
-            "current_run": current_run,
-            "current_candidate_pool": current_candidate_pool,
-            "best_result": best_result,
-            "leaderboard": leaderboard,
-            "progress": progress,
-            "queued_proposals": queued,
-            "recent_loop_events": recent_loop_events,
-            "recent_decisions": recent_decisions,
-            "recent_llm_calls": recent_llm_calls,
-            "regime_fingerprint": comparison_regime_fingerprint,
-            "comparison_metric_key": comparison_metric_key,
-            "mutation_leaderboard": mutation_leaderboard,
-            "recent_mutation_lessons": recent_mutation_lessons,
-            "hermes_runtime": hermes_runtime,
-            "analytics": analytics.__dict__,
-            "multi_loop_analytics": multi_loop_analytics.__dict__,
-        }
+        return build_mission_control_summary_payload(
+            loop_state=loop_state,
+            current_run=current_run,
+            best_result=best_result,
+            leaderboard=leaderboard,
+            progress=progress,
+            queued_proposals=queued,
+            recent_loop_events=recent_loop_events,
+            recent_decisions=recent_decisions,
+            recent_llm_calls=recent_llm_calls,
+            regime_fingerprint=comparison_regime_fingerprint,
+            comparison_metric_key=comparison_metric_key,
+            mutation_leaderboard=mutation_leaderboard,
+            recent_mutation_lessons=recent_mutation_lessons,
+            hermes_runtime=hermes_runtime,
+            analytics=analytics.__dict__,
+            multi_loop_analytics=multi_loop_analytics.__dict__,
+        )
 
     def get_current_run_summary(self, loop_run_id: str | None) -> dict[str, Any] | None:
         if not loop_run_id:

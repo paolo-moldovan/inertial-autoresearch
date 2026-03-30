@@ -10,6 +10,7 @@ domain implementation on top of a reusable autoresearch core.
 - policy selection
 - provider integrations
 - observability-facing analytics and façades
+- Mission Control read-model assembly helpers
 - no IMU imports
 - no Torch, dataset, model, or project-specific runtime imports
 
@@ -17,6 +18,7 @@ domain implementation on top of a reusable autoresearch core.
 - IMU adapter layer
 - IMU mutation catalog
 - IMU runtime execution and config resolution
+- IMU proposal-selection helpers
 - bridge between core orchestration and the IMU training/evaluation stack
 
 3. `src/imu_denoise/training/`
@@ -43,14 +45,17 @@ Implemented:
 - `autoresearch_core.providers.hermes`
 - `autoresearch_core.observability.analytics`
 - `autoresearch_core.observability.facade`
+- `autoresearch_core.observability.read_models`
 - IMU-domain mutation catalog under `imu_denoise.autoresearch`
 - IMU-domain execution/config helpers under `imu_denoise.autoresearch.execution`
+- IMU-domain proposal selection under `imu_denoise.autoresearch.selection`
 - IMU adapter-backed loop runtime now resolves base configs, iteration configs, mutation catalogs, and run execution through `IMUProjectAdapter`
 - compatibility wrappers for `autoresearch_loop/{loop,hermes,mutations}.py`
 - trainer hook/control boundary
 - Mission Control UI bootstrap via a service layer instead of direct store construction
 - Mission Control web/TUI/Streamlit surfaces now read/control through a reusable facade layer
 - loop-control CLI now composes through Mission Control services instead of direct controller/writer setup
+- Mission Control summary payload assembly now delegates to reusable read-model helpers
 
 Still to deepen:
 - move more of the loop coordinator into `autoresearch_core.engine`

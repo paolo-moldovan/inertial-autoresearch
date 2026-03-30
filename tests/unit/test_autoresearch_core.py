@@ -15,6 +15,10 @@ from autoresearch_core.observability.analytics import (
     compute_loop_analytics,
     compute_multi_loop_analytics,
 )
+from autoresearch_core.observability.read_models import (
+    build_current_candidate_pool,
+    build_mission_control_summary_payload,
+)
 
 
 @dataclass
@@ -140,3 +144,47 @@ def test_loop_and_multi_loop_analytics_are_computed_from_read_models() -> None:
     assert multi.source_counts["static"] == 2
     assert multi.model_family_wins["conv1d"] == 1
     assert multi.model_family_wins["transformer"] == 1
+
+
+def test_summary_read_model_helpers_keep_payload_assembly_pure() -> None:
+    current_run = {
+        "run_id": "run-1",
+        "run_name": "autoresearch_004",
+        "proposal_source": "hermes",
+        "policy_mode": "exploit",
+        "selection_rationale": "recent conv1d wins",
+        "selected_candidate_index": 1,
+        "preferred_candidate_index": 0,
+        "preferred_candidate_description": "lower learning rate",
+        "hermes_status": "ok",
+        "hermes_reason": "best tradeoff",
+        "candidate_pool": [{"description": "lower learning rate"}],
+        "blocked_candidates": {"small transformer": ["architecture_fixed"]},
+    }
+
+    pool = build_current_candidate_pool(current_run)
+    assert pool is not None
+    assert pool["candidate_count"] == 1
+    assert pool["candidates"][0]["description"] == "lower learning rate"
+    assert pool["blocked_candidates"]["small transformer"] == ["architecture_fixed"]
+
+    summary = build_mission_control_summary_payload(
+        loop_state={"status": "running"},
+        current_run=current_run,
+        best_result={"run_id": "run-1"},
+        leaderboard=[],
+        progress=[],
+        queued_proposals=[],
+        recent_loop_events=[],
+        recent_decisions=[],
+        recent_llm_calls=[],
+        regime_fingerprint="regime-1",
+        comparison_metric_key="sequence_rmse",
+        mutation_leaderboard=[],
+        recent_mutation_lessons=[],
+        hermes_runtime={"provider": "custom"},
+        analytics={"total_runs": 1},
+        multi_loop_analytics={"loop_count": 1},
+    )
+    assert summary["current_candidate_pool"] == pool
+    assert summary["comparison_metric_key"] == "sequence_rmse"
