@@ -205,6 +205,10 @@ HTML = """<!doctype html>
         <div id="hermes-runtime" class="muted">No Hermes runtime data.</div>
       </aside>
       <aside>
+        <h2>Current Candidate Pool</h2>
+        <div id="candidate-pool" class="muted">No current candidate pool.</div>
+      </aside>
+      <aside>
         <h2>Recent Decisions</h2>
         <table>
           <thead><tr><th>Iter</th><th>Source</th><th>Run</th><th>Status</th><th>Metric</th></tr></thead>
@@ -311,6 +315,7 @@ HTML = """<!doctype html>
         mutation_leaderboard: data.mutation_leaderboard,
         recent_mutation_lessons: data.recent_mutation_lessons,
         hermes_runtime: data.hermes_runtime,
+        current_candidate_pool: data.current_candidate_pool,
       });
       if (summaryHash === renderState.summaryHash) {
         return data;
@@ -349,7 +354,7 @@ HTML = """<!doctype html>
           <div class="metric">
             <div class="label">Model</div>
             <div class="value">${currentRun.model || "n/a"}</div>
-            <div class="tag">${currentRun.phase || "n/a"}</div>
+            <div class="tag">${currentRun.phase || "n/a"} · ${currentRun.causal === true ? "causal" : currentRun.causal === false ? "non-causal" : "causality n/a"}</div>
           </div>
           <div class="metric">
             <div class="label">Epoch</div>
@@ -374,6 +379,12 @@ HTML = """<!doctype html>
             <div>${valueText(currentRun.artifact_count)}</div>
             <div class="muted">LLM Calls</div>
             <div>${valueText(currentRun.llm_call_count)}</div>
+            <div class="muted">Realtime Mode</div>
+            <div>${valueText(currentRun.realtime_mode)}</div>
+            <div class="muted">Reconstruction</div>
+            <div>${currentRun.reconstruction || "n/a"}</div>
+            <div class="muted">Eval Metrics</div>
+            <div>${(currentRun.evaluation_metrics || []).join(", ") || "n/a"}</div>
           </div>
         </div>
       `;
@@ -453,6 +464,55 @@ HTML = """<!doctype html>
           <div>${hermes.latest_reason || "n/a"}</div>
         </div>
       `;
+
+      const candidatePool = data.current_candidate_pool;
+      document.getElementById("candidate-pool").innerHTML = !candidatePool || !(candidatePool.candidates || []).length
+        ? "<span class='muted'>No current candidate pool.</span>"
+        : `
+        <div class="kv" style="margin-bottom:12px;">
+          <div class="muted">Run</div>
+          <div>${candidatePool.run_name || "n/a"} <span class="tag">${shortId(candidatePool.run_id)}</span></div>
+          <div class="muted">Source</div>
+          <div>${candidatePool.proposal_source || "n/a"}</div>
+          <div class="muted">Policy Mode</div>
+          <div>${candidatePool.policy_mode || "n/a"}</div>
+          <div class="muted">Selected</div>
+          <div>${valueText(candidatePool.selected_candidate_index)}</div>
+          <div class="muted">Preferred</div>
+          <div>${valueText(candidatePool.preferred_candidate_index)}${candidatePool.preferred_candidate_description ? ` · ${candidatePool.preferred_candidate_description}` : ""}</div>
+          <div class="muted">Hermes</div>
+          <div>${candidatePool.hermes_status || "n/a"}${candidatePool.hermes_reason ? ` · ${candidatePool.hermes_reason}` : ""}</div>
+          <div class="muted">Blocked</div>
+          <div>${Object.keys(candidatePool.blocked_candidates || {}).length}</div>
+          <div class="muted">Why</div>
+          <div>${candidatePool.selection_rationale || "n/a"}</div>
+        </div>
+        <table>
+          <thead><tr><th>#</th><th>Candidate</th><th>Score</th><th>Signals</th></tr></thead>
+          <tbody>${(candidatePool.candidates || []).map((item, index) => `
+            <tr>
+              <td>${index === candidatePool.selected_candidate_index ? "<strong>*</strong>" : item.hermes_preferred ? "h" : ""}${index}</td>
+              <td>${item.description || "n/a"}<div class="tag">${item.hermes_preferred ? "Hermes preferred" : "local"}${item.regime_compatible === false ? " · regime blocked" : ""}</div></td>
+              <td>${typeof item.total_score === "number" ? item.total_score.toFixed(3) : ""}</td>
+              <td>${(item.reasons || []).slice(0, 3).join(", ") || "n/a"}</td>
+            </tr>
+          `).join("")}</tbody>
+        </table>
+        ${Object.keys(candidatePool.blocked_candidates || {}).length ? `
+          <div class="panel" style="margin-top:12px;">
+            <h3>Blocked Candidates</h3>
+            <table>
+              <thead><tr><th>Candidate</th><th>Reasons</th></tr></thead>
+              <tbody>${Object.entries(candidatePool.blocked_candidates || {}).map(([description, reasons]) => `
+                <tr>
+                  <td>${description}</td>
+                  <td>${(Array.isArray(reasons) ? reasons : []).join(", ") || "n/a"}</td>
+                </tr>
+              `).join("")}</tbody>
+            </table>
+          </div>
+        ` : ""}
+      `;
       return data;
     }
 
@@ -489,7 +549,7 @@ HTML = """<!doctype html>
           <div class="metric"><div class="label">Run</div><div class="value">${detail.run.name}</div><div class="tag">${shortId(detail.run.id)}</div></div>
           <div class="metric"><div class="label">Phase</div><div class="value">${detail.run.phase}</div></div>
           <div class="metric"><div class="label">Status</div><div class="value">${detail.run.status}</div></div>
-          <div class="metric"><div class="label">Experiment</div><div class="value">${detail.identity?.experiment_id_short || "n/a"}</div><div class="tag">regime ${detail.identity?.regime_fingerprint_short || "n/a"}</div></div>
+          <div class="metric"><div class="label">Experiment</div><div class="value">${detail.identity?.experiment_id_short || "n/a"}</div><div class="tag">regime ${detail.identity?.regime_fingerprint_short || "n/a"} · ${detail.identity?.causal === true ? "causal" : detail.identity?.causal === false ? "non-causal" : "causality n/a"}</div></div>
         </div>
         <div class="controls">
           <button id="rerun-btn">Queue Rerun</button>
@@ -524,6 +584,19 @@ HTML = """<!doctype html>
                 <div>${valueText(policyContext.explore_probability)}</div>
                 <div class="muted">Preferred</div>
                 <div>${policyContext.preferred_candidate_description || "n/a"}</div>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Evaluation Context</h3>
+              <div class="kv">
+                <div class="muted">Realtime Mode</div>
+                <div>${valueText(detail.experiment?.config?.evaluation?.realtime_mode)}</div>
+                <div class="muted">Reconstruction</div>
+                <div>${detail.experiment?.config?.evaluation?.reconstruction || "n/a"}</div>
+                <div class="muted">Metrics</div>
+                <div>${(detail.experiment?.config?.evaluation?.metrics || []).join(", ") || "n/a"}</div>
+                <div class="muted">Causality</div>
+                <div>${detail.identity?.causal === true ? "causal" : detail.identity?.causal === false ? "non-causal" : "n/a"}</div>
               </div>
             </div>
           </div>

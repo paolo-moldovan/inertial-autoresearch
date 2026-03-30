@@ -31,6 +31,12 @@ training:
 autoresearch:
   max_iterations: 100
   orchestrator: hermes
+  strategy:
+    explore_probability: 0.30
+    exploit_top_k: 5
+    novelty_bonus: 0.15
+  search_space:
+    baseline_mode: branch_from_baseline
   hermes:
     base_url: http://127.0.0.1:11434/v1
     model: qwen3.5:latest

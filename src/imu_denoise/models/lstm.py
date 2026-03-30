@@ -38,6 +38,7 @@ class LSTMDenoiser(BaseDenoiser):
         bidirectional: bool = True,
     ) -> None:
         super().__init__()
+        self.causal = not bidirectional
         self.input_proj = nn.Linear(IMU_CHANNELS, hidden_dim)
 
         self.lstm = nn.LSTM(

@@ -16,6 +16,7 @@ from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from imu_denoise.config.schema import ExperimentConfig
+from imu_denoise.data.datamodule import DataBundle
 from imu_denoise.device.context import DeviceContext
 from imu_denoise.evaluation.evaluator import Evaluator
 from imu_denoise.models.base import BaseDenoiser
@@ -111,11 +112,12 @@ class Trainer:
 
     def fit(
         self,
-        train_loader: DataLoader[Any],
-        val_loader: DataLoader[Any],
-        test_loader: DataLoader[Any] | None = None,
+        data_bundle: DataBundle,
     ) -> TrainingSummary:
         """Run the training loop and return a summary plus artifact paths."""
+        train_loader = data_bundle.train_loader
+        val_loader = data_bundle.val_loader
+        test_loader = data_bundle.test_loader
         start_time = time.perf_counter()
         best_epoch = 0
         best_val_rmse = float("inf")
@@ -161,11 +163,25 @@ class Trainer:
             for epoch in range(1, self.config.training.epochs + 1):
                 train_loss = self._run_epoch(train_loader, training=True)
                 val_loss = self._run_epoch(val_loader, training=False)
-                metrics = Evaluator(self.model, self.device_ctx).evaluate(
-                    val_loader,
-                    fs=self._sampling_rate_hz(),
-                )
-                val_rmse = metrics["rmse"]
+                should_evaluate = self._should_run_full_evaluation(epoch)
+                metrics: dict[str, float] | None = None
+                val_rmse: float | None = None
+                if should_evaluate:
+                    metrics = (
+                        Evaluator(self.model, self.device_ctx)
+                        .with_config(self.config.evaluation, logger=self.logger)
+                        .evaluate(
+                            val_loader,
+                            fs=data_bundle.sampling_rate_hz,
+                        )
+                    )
+                    rmse_metric = metrics.get("rmse")
+                    if rmse_metric is None:
+                        raise ValueError(
+                            "training requires evaluation.metrics to include 'rmse' so "
+                            "best_val_rmse can be tracked."
+                        )
+                    val_rmse = float(rmse_metric)
                 lr = self.optimizer.param_groups[0]["lr"]
 
                 self._write_history(
@@ -175,27 +191,52 @@ class Trainer:
                         "val_loss": val_loss,
                         "val_rmse": val_rmse,
                         "lr": lr,
+                        "evaluated": should_evaluate,
                     }
                 )
-                self.logger.info(
-                    "Epoch %d/%d train_loss=%.6f val_loss=%.6f val_rmse=%.6f lr=%.6g",
-                    epoch,
-                    self.config.training.epochs,
-                    train_loss,
-                    val_loss,
-                    val_rmse,
-                    lr,
-                )
+                if val_rmse is None:
+                    self.logger.info(
+                        "Epoch %d/%d train_loss=%.6f val_loss=%.6f val_rmse=skipped lr=%.6g",
+                        epoch,
+                        self.config.training.epochs,
+                        train_loss,
+                        val_loss,
+                        lr,
+                    )
+                else:
+                    self.logger.info(
+                        "Epoch %d/%d train_loss=%.6f val_loss=%.6f val_rmse=%.6f lr=%.6g",
+                        epoch,
+                        self.config.training.epochs,
+                        train_loss,
+                        val_loss,
+                        val_rmse,
+                        lr,
+                    )
 
                 self._step_scheduler(val_loss)
-                is_best = self.checkpoints.save(
-                    epoch=epoch,
-                    metric_value=val_rmse,
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    extra={"val_metrics": metrics},
+                checkpoint_metric = val_rmse if val_rmse is not None else (
+                    best_val_rmse if best_val_rmse != float("inf") else float("inf")
                 )
-                if is_best:
+                is_best = False
+                checkpoint_extra = {"val_metrics": metrics} if metrics is not None else None
+                if val_rmse is not None:
+                    is_best = self.checkpoints.save(
+                        epoch=epoch,
+                        metric_value=val_rmse,
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        extra=checkpoint_extra,
+                    )
+                else:
+                    self.checkpoints.save_last(
+                        epoch=epoch,
+                        metric_value=checkpoint_metric,
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        extra=checkpoint_extra,
+                    )
+                if is_best and val_rmse is not None:
                     best_epoch = epoch
                     best_val_rmse = val_rmse
                     self.observability.register_artifact(
@@ -203,7 +244,7 @@ class Trainer:
                         path=self.checkpoints.best_path,
                         artifact_type="checkpoint",
                         label="best",
-                        metadata={"epoch": epoch, "val_rmse": val_rmse},
+                        metadata={"epoch": epoch, "val_rmse": val_rmse, "evaluated": True},
                         source="runtime",
                     )
 
@@ -212,7 +253,7 @@ class Trainer:
                     path=self.checkpoints.last_path,
                     artifact_type="checkpoint",
                     label="last",
-                    metadata={"epoch": epoch, "val_rmse": val_rmse},
+                    metadata={"epoch": epoch, "val_rmse": val_rmse, "evaluated": should_evaluate},
                     source="runtime",
                 )
 
@@ -246,7 +287,7 @@ class Trainer:
 
                 self._check_loop_termination()
 
-                if self.early_stopping.update(val_rmse):
+                if val_rmse is not None and self.early_stopping.update(val_rmse):
                     self.logger.info("Stopping early after %d epochs without improvement.", epoch)
                     self.observability.append_event(
                         run_id=run_id,
@@ -260,9 +301,11 @@ class Trainer:
 
             elapsed = time.perf_counter() - start_time
             test_metrics = (
-                Evaluator(self.model, self.device_ctx).evaluate(
+                Evaluator(self.model, self.device_ctx)
+                .with_config(self.config.evaluation, logger=self.logger)
+                .evaluate(
                     test_loader,
-                    fs=self._sampling_rate_hz(),
+                    fs=data_bundle.sampling_rate_hz,
                 )
                 if test_loader is not None
                 else {}
@@ -296,6 +339,7 @@ class Trainer:
                 run_id=run_id,
                 val_loader=val_loader,
                 test_loader=test_loader,
+                sampling_rate_hz=data_bundle.sampling_rate_hz,
             )
 
             artifacts = TrainingArtifacts(
@@ -431,17 +475,13 @@ class Trainer:
             status=str(loop_state.get("status") or "running"),
         )
 
-    def _sampling_rate_hz(self) -> float:
-        if self.config.data.dataset == "blackbird":
-            return 100.0
-        return 200.0
-
     def _generate_summary_figures(
         self,
         *,
         run_id: str,
         val_loader: DataLoader[Any],
         test_loader: DataLoader[Any] | None,
+        sampling_rate_hz: float,
     ) -> None:
         os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
         os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
@@ -489,6 +529,7 @@ class Trainer:
         timestamps = self._timestamps_for_batch(
             timestamps_tensor=timestamps_tensor,
             sample_count=noisy_np.shape[1],
+            sampling_rate_hz=sampling_rate_hz,
         )
         sample_index = 0
 
@@ -517,7 +558,7 @@ class Trainer:
                 "denoised": denoised[sample_index],
                 "clean": clean_np[sample_index],
             },
-            fs=self._sampling_rate_hz(),
+            fs=sampling_rate_hz,
             title=f"{self.config.name} PSD",
             save_path=psd_path,
         )
@@ -560,11 +601,16 @@ class Trainer:
         *,
         timestamps_tensor: torch.Tensor | None,
         sample_count: int,
+        sampling_rate_hz: float,
     ) -> np.ndarray:
         if timestamps_tensor is not None:
             return timestamps_tensor.detach().cpu().float().numpy()
-        dt = 1.0 / self._sampling_rate_hz()
+        dt = 0.0 if sampling_rate_hz <= 0.0 else 1.0 / sampling_rate_hz
         return np.tile(np.arange(sample_count, dtype=np.float32) * dt, (1, 1))
+
+    def _should_run_full_evaluation(self, epoch: int) -> bool:
+        frequency = max(1, int(self.config.evaluation.frequency_epochs))
+        return epoch == self.config.training.epochs or epoch % frequency == 0
 
     def _step_scheduler(self, val_loss: float) -> None:
         if self.scheduler is None:

@@ -68,7 +68,7 @@ def run_command(args: Any) -> int:
     if args.dry_run:
         return 0
 
-    train_loader, val_loader, test_loader = create_dataloaders(
+    data_bundle = create_dataloaders(
         config.data,
         config.training,
         device_ctx,
@@ -80,11 +80,11 @@ def run_command(args: Any) -> int:
         device_ctx=device_ctx,
         optimizer=optimizer,
         scheduler=scheduler,
-        loss_fn=build_loss(config.training.loss),
+        loss_fn=build_loss(config.training),
         observability=observability,
         run_id=run_id,
     )
-    summary = trainer.fit(train_loader, val_loader, test_loader)
+    summary = trainer.fit(data_bundle)
     selection_event = observability.record_selection_event(
         run_id=summary.run_id,
         loop_run_id=None,

@@ -91,6 +91,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
         DataConfig,
         DataSubsetConfig,
         DeviceConfig,
+        EvaluationConfig,
         HermesConfig,
         ModelConfig,
         ObservabilityConfig,
@@ -103,6 +104,7 @@ def _resolve_type(cls: type, field_name: str) -> type | None:
             "data": DataConfig,
             "model": ModelConfig,
             "training": TrainingConfig,
+            "evaluation": EvaluationConfig,
             "autoresearch": AutoResearchConfig,
             "observability": ObservabilityConfig,
         }

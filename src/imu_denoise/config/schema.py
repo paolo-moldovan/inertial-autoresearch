@@ -83,11 +83,24 @@ class TrainingConfig:
     scheduler_kwargs: dict[str, object] = field(default_factory=dict)
     optimizer: str = "adamw"  # "adam" | "adamw" | "sgd"
     loss: str = "mse"  # "mse" | "huber" | "spectral"
+    channel_loss_weights: list[float] = field(default_factory=list)
+    accel_loss_weight: float = 1.0
+    gyro_loss_weight: float = 1.0
     gradient_clip: float = 1.0
     early_stop_patience: int = 10
     seed: int = 42
     num_workers: int = 4
     time_budget_sec: int = 0  # 0 = no budget
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    """Evaluation behavior for validation, test runs, and autoresearch ranking."""
+
+    frequency_epochs: int = 1
+    metrics: list[str] = field(default_factory=lambda: ["rmse", "mae", "spectral_divergence"])
+    reconstruction: str = "none"  # "none" | "hann"
+    realtime_mode: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,7 +159,8 @@ class AutoResearchSearchSpaceConfig:
     allow_groups: list[str] = field(default_factory=list)
     deny_groups: list[str] = field(default_factory=list)
     architecture_mode: str = "branch"  # "fixed" | "tune" | "evolve" | "branch"
-    baseline_mode: str = "exploit"  # "exploit" | "mutate_baseline" | "branch_from_baseline"
+    baseline_mode: str = "branch_from_baseline"  # "exploit" | "mutate_baseline" |
+    # "branch_from_baseline"
 
 
 @dataclass(frozen=True)
@@ -199,6 +213,7 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     autoresearch: AutoResearchConfig = field(default_factory=AutoResearchConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     output_dir: str = "artifacts"

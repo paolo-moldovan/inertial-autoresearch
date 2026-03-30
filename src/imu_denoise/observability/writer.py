@@ -113,6 +113,26 @@ class ObservabilityWriter:
         self.store = store
         self.logger = logger or logging.getLogger("imu_denoise.observability")
 
+    def _critical(self, func: Any, /, *, retries: int = 2, **kwargs: Any) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                func(**kwargs)
+                return
+            except Exception as exc:  # pragma: no cover - exercised via call sites
+                last_exc = exc
+                if attempt < retries:
+                    self.logger.warning(
+                        "Critical observability write failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        retries + 1,
+                        exc,
+                    )
+                    time.sleep(0.05)
+                    continue
+                self.logger.error("Critical observability write failed: %s", exc)
+        raise RuntimeError(f"Critical observability write failed: {last_exc}")
+
     @classmethod
     def from_experiment_config(
         cls,
@@ -334,7 +354,7 @@ class ObservabilityWriter:
         epoch: int,
         train_loss: float,
         val_loss: float,
-        val_rmse: float,
+        val_rmse: float | None,
         lr: float,
         best_metric: float | None,
         source: str = "runtime",
@@ -622,7 +642,7 @@ class ObservabilityWriter:
             signature = str(signature_payload["signature"])
             category = str(signature_payload["category"])
             path = signature_payload.get("path")
-            self._safe(
+            self._critical(
                 self.store.upsert_mutation_signature,
                 signature=signature,
                 display_name=str(signature_payload["display_name"]),
@@ -633,7 +653,7 @@ class ObservabilityWriter:
                 created_at=created_at,
                 source=source,
             )
-            self._safe(
+            self._critical(
                 self.store.insert_mutation_attempt,
                 run_id=run_id,
                 loop_run_id=loop_run_id,
@@ -659,7 +679,7 @@ class ObservabilityWriter:
                 crash_count=int(aggregate["crash_count"]),
                 avg_metric_delta=aggregate["avg_metric_delta"],
             )
-            self._safe(
+            self._critical(
                 self.store.upsert_mutation_stat,
                 signature=signature,
                 regime_fingerprint=regime_fingerprint,
@@ -684,7 +704,7 @@ class ObservabilityWriter:
                 metric_delta=metric_delta,
             )
             if lesson is not None:
-                self._safe(
+                self._critical(
                     self.store.insert_mutation_lesson,
                     run_id=run_id,
                     loop_run_id=loop_run_id,

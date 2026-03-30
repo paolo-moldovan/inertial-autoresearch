@@ -90,6 +90,25 @@ def data_regime_fingerprint(config: Mapping[str, Any] | Any) -> str:
     ).hexdigest()
 
 
+def model_is_causal(config: Mapping[str, Any] | Any) -> bool | None:
+    """Resolve whether the configured model is causal from its resolved config payload."""
+    payload = normalize_config_payload(config)
+    model = payload.get("model")
+    if not isinstance(model, Mapping):
+        return None
+    name = model.get("name")
+    if name == "conv1d":
+        return True
+    if name == "transformer":
+        return False
+    if name == "lstm":
+        return not bool(model.get("bidirectional", True))
+    extra = model.get("extra")
+    if isinstance(extra, Mapping) and isinstance(extra.get("causal"), bool):
+        return bool(extra.get("causal"))
+    return None
+
+
 def build_mutation_signatures(change_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build stable mutation-family signatures from structured change items."""
     signatures: list[dict[str, Any]] = []

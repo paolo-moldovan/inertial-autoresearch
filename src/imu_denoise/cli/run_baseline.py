@@ -12,7 +12,7 @@ from imu_denoise.classical import ComplementaryFilterBaseline, KalmanFilterBasel
 from imu_denoise.cli.common import add_common_config_arguments, resolve_config
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
-from imu_denoise.evaluation.metrics import compute_all_metrics
+from imu_denoise.evaluation.evaluator import evaluate_window_predictions
 from imu_denoise.observability import ObservabilityWriter
 from imu_denoise.observability.lineage import data_regime_fingerprint
 from imu_denoise.training.reproducibility import seed_everything
@@ -81,31 +81,38 @@ def run_command(args: Any) -> int:
         },
     )
 
-    _, _, test_loader = create_dataloaders(config.data, config.training, device_ctx)
+    data_bundle = create_dataloaders(config.data, config.training, device_ctx)
     baseline = _build_baseline(args.baseline)
 
     all_noisy: list[np.ndarray] = []
     all_clean: list[np.ndarray] = []
     all_pred: list[np.ndarray] = []
+    all_timestamps: list[np.ndarray] = []
+    sequence_ids: list[str] = []
     sample_timestamps: np.ndarray | None = None
 
-    for batch in test_loader:
+    for batch in data_bundle.test_loader:
         noisy = batch["noisy"].cpu().numpy().astype(np.float32)
         clean = batch["clean"].cpu().numpy().astype(np.float32)
         pred = baseline.denoise(noisy)
         all_noisy.append(noisy)
         all_clean.append(clean)
         all_pred.append(pred)
+        all_timestamps.append(batch["timestamps"].cpu().numpy().astype(np.float32))
+        sequence_ids.extend([str(item) for item in batch["sequence_id"]])
         if sample_timestamps is None:
             sample_timestamps = batch["timestamps"].cpu().numpy()[0]
 
     noisy_array = np.concatenate(all_noisy, axis=0)
     clean_array = np.concatenate(all_clean, axis=0)
     pred_array = np.concatenate(all_pred, axis=0)
-    metrics = compute_all_metrics(
-        pred_array.reshape(-1, pred_array.shape[-1]),
-        clean_array.reshape(-1, clean_array.shape[-1]),
-        fs=100.0 if config.data.dataset == "blackbird" else 200.0,
+    metrics = evaluate_window_predictions(
+        pred_windows=pred_array,
+        target_windows=clean_array,
+        timestamps=np.concatenate(all_timestamps, axis=0),
+        sequence_ids=sequence_ids,
+        fs=data_bundle.sampling_rate_hz,
+        evaluation=config.evaluation,
     )
 
     run_paths.root.mkdir(parents=True, exist_ok=True)
@@ -139,7 +146,7 @@ def run_command(args: Any) -> int:
     )
     plot_psd(
         signals={"noisy": noisy_array[0], "denoised": pred_array[0], "clean": clean_array[0]},
-        fs=100.0 if config.data.dataset == "blackbird" else 200.0,
+        fs=data_bundle.sampling_rate_hz,
         title=f"{args.baseline} baseline PSD",
         save_path=run_paths.figures_dir / "psd.png",
     )
@@ -153,7 +160,11 @@ def run_command(args: Any) -> int:
     observability.finish_run(
         run_id=run_id,
         status="completed",
-        summary={"rmse": metrics["rmse"], "mae": metrics["mae"]},
+        summary={
+            key: float(value)
+            for key, value in metrics.items()
+            if isinstance(value, (int, float))
+        },
         source="runtime",
     )
     selection_event = observability.record_selection_event(
@@ -188,7 +199,7 @@ def run_command(args: Any) -> int:
         description=f"{args.baseline} baseline",
         status="completed",
         metric_key="rmse",
-        metric_value=float(metrics["rmse"]),
+        metric_value=float(metrics.get("rmse", 0.0)),
         overrides=list(args.overrides),
         source="runtime",
     )
@@ -205,8 +216,8 @@ def run_command(args: Any) -> int:
     print("Baseline evaluation complete:")
     print(f"  baseline: {args.baseline}")
     print(f"  metrics_path: {metrics_path}")
-    print(f"  rmse: {metrics['rmse']:.6f}")
-    print(f"  mae: {metrics['mae']:.6f}")
+    for metric_name, value in sorted(metrics.items()):
+        print(f"  {metric_name}: {value:.6f}")
     return 0
 
 

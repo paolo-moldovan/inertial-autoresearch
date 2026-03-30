@@ -8,16 +8,23 @@ from random import Random
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 from autoresearch_loop.hermes import (
+    HermesProposalError,
     HermesQueryTrace,
     _run_hermes_query,
 )
 from autoresearch_loop.hermes import (
     _build_prompt as build_hermes_prompt,
 )
-from autoresearch_loop.loop import _resolve_iteration_config, build_parser, run_autoresearch
+from autoresearch_loop.loop import (
+    _resolve_iteration_config,
+    _select_mutation_proposal,
+    build_parser,
+    run_autoresearch,
+)
 from autoresearch_loop.mutations import (
     MutationPolicyCandidate,
     MutationProposal,
@@ -200,6 +207,45 @@ def test_search_space_exploit_mode_keeps_incumbent_model_family() -> None:
     assert blocked["small transformer"] == ["exploit_incumbent_model=conv1d"]
 
 
+def test_default_mutation_pool_is_broader_than_minimal_smoke_space() -> None:
+    """The default search pool should cover more than a handful of local tweaks."""
+    pool = default_mutation_pool()
+    descriptions = {proposal.description for proposal in pool}
+
+    assert len(pool) >= 18
+    assert "wider current model" in descriptions
+    assert "plateau scheduler" in descriptions
+    assert "causal lstm" in descriptions
+    assert "medium transformer" in descriptions
+
+
+def test_realtime_mode_filters_noncausal_candidates_before_hermes() -> None:
+    """Realtime mode should keep Hermes on causal candidates only."""
+    config = resolve_config(
+        ["configs/base.yaml", "configs/device.yaml", "configs/models/lstm.yaml"],
+        ["evaluation.realtime_mode=true"],
+    )
+
+    candidates, blocked, _preferred_index, _source, _trace = _select_mutation_proposal(
+        iteration=1,
+        base_config=config,
+        base_overrides=[],
+        rng=Random(0),
+        results=[],
+        fallback_proposal=default_mutation_pool()[1],
+        hermes_used_descriptions=set(),
+        incumbent_summary=None,
+        incumbent_config=None,
+        mutation_lessons=[],
+    )
+
+    descriptions = {candidate.description for candidate in candidates}
+    assert "small transformer" not in descriptions
+    assert "deeper lstm" not in descriptions
+    assert "conv1d baseline" in descriptions
+    assert blocked["small transformer"] == ["realtime_requires_causal_model"]
+
+
 def test_change_items_with_reference_only_tracks_explicit_override_paths() -> None:
     """Mutation memory should not absorb unrelated loop-level config differences."""
     reference = {
@@ -298,8 +344,47 @@ def test_hermes_query_syncs_project_skill_and_passes_skill_flags(
     assert "--skills" in command
     assert "imu-autoresearch-policy" in command
     assert "--pass_session_id" in command
+    assert "--api_key" in command
+    assert "ollama" in command
     synced_skill = hermes_home / "skills" / "imu-autoresearch-policy" / "SKILL.md"
     assert synced_skill.exists()
+
+
+def test_hermes_query_raises_with_trace_when_cli_prints_retry_failure(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hermes CLI retry failures should not degrade into opaque parse errors."""
+    python_bin = tmp_path / "python"
+    cli_path = tmp_path / "cli.py"
+    python_bin.write_text("", encoding="utf-8")
+    cli_path.write_text("", encoding="utf-8")
+
+    def _fake_run(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "API call failed after 3 retries: "
+                "HTTP 500: model failed to load, this may be due to resource limitations\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("autoresearch_loop.hermes.subprocess.run", _fake_run)
+
+    with pytest.raises(HermesProposalError) as exc_info:
+        _run_hermes_query(
+            prompt="pick one",
+            config=HermesConfig(
+                python_bin=str(python_bin.relative_to(tmp_path)),
+                cli_path=str(cli_path.relative_to(tmp_path)),
+                home_dir=".hermes",
+            ),
+            root=tmp_path,
+        )
+
+    assert exc_info.value.trace is not None
+    assert exc_info.value.trace.reason is not None
+    assert "model failed to load" in exc_info.value.trace.reason
 
 
 def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
@@ -364,6 +449,10 @@ def test_autoresearch_loop_writes_results(tmp_path: Path) -> None:
     summary = queries.get_mission_control_summary(limit=10)
     assert summary["mutation_leaderboard"]
     assert summary["recent_mutation_lessons"]
+    assert summary["current_candidate_pool"] is not None
+    assert summary["current_candidate_pool"]["candidates"]
+    assert isinstance(summary["current_candidate_pool"]["blocked_candidates"], dict)
+    assert summary["current_candidate_pool"]["run_name"] == summary["current_run"]["run_name"]
 
 
 def test_autoresearch_loop_uses_hermes_proposals_when_enabled(

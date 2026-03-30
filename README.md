@@ -57,6 +57,8 @@ Preprocess data:
 uv run imu-preprocess
 ```
 
+Processed datasets now carry ground-truth diagnostics in their metadata, and preprocessing registers those diagnostics in Mission Control as dataset artifacts.
+
 Legacy compatibility entrypoints still work:
 - `imu-train`
 - `imu-eval`
@@ -116,8 +118,48 @@ autoresearch:
 ```
 
 - `per_loop`: run a fresh baseline at iteration `0`
-- `global`: reuse the latest completed baseline run for the same dataset and model if one exists
+- `global`: reuse the best completed compatible incumbent for the same apples-to-apples data regime
 - `manual`: pin the baseline to a specific prior run id or id prefix
+
+## Evaluation and Validity
+
+Evaluation behavior is configured explicitly under `evaluation:`:
+
+```yaml
+evaluation:
+  frequency_epochs: 1
+  metrics:
+    - rmse
+    - mae
+    - spectral_divergence
+  reconstruction: none   # none | hann
+  realtime_mode: false
+```
+
+Notes:
+- `frequency_epochs` controls how often the full evaluator runs during training
+- `metrics` selects which metrics are computed
+- `reconstruction: hann` enables overlap-add sequence reconstruction for:
+  - `sequence_rmse`
+  - `sequence_mae`
+  - `sequence_spectral_divergence`
+  - `smoothness`
+  - `drift_error`
+- `realtime_mode: true` warns on non-causal models and constrains autoresearch toward causal candidates
+
+The default search objective remains `val_rmse`. Sequence-level and temporal metrics are opt-in until you explicitly choose them.
+
+Loss weighting is configurable:
+
+```yaml
+training:
+  loss: mse
+  channel_loss_weights: []   # optional explicit length-6 weights
+  accel_loss_weight: 1.0
+  gyro_loss_weight: 1.0
+```
+
+If `channel_loss_weights` is set, it takes precedence over the accel/gyro convenience weights.
 
 The validated local path today is the config-first loop above. The `researchclaw` config scaffold is present, but the actively exercised repo path is [autoresearch_loop/loop.py](/Users/paolo/development/inertial-autoresearch/autoresearch_loop/loop.py).
 

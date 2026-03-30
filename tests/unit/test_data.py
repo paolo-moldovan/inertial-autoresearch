@@ -5,10 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from imu_denoise.config import DataConfig, DataSubsetConfig, DeviceConfig, TrainingConfig
 from imu_denoise.data.datamodule import create_dataloaders
+from imu_denoise.data.diagnostics import (
+    compute_ground_truth_diagnostics,
+    infer_sampling_rate_hz,
+)
 from imu_denoise.data.io import load_processed_sequence, save_processed_sequence
 from imu_denoise.data.registry import get_dataset
 from imu_denoise.data.splits import resolve_splits, split_by_sequence
@@ -31,6 +36,7 @@ def test_synthetic_generator_produces_ground_truth() -> None:
 def test_processed_sequence_roundtrip(tmp_path: Path) -> None:
     """Processed-sequence save/load should preserve arrays and metadata."""
     sequence = generate_synthetic_imu(duration_sec=1.0, rate_hz=8.0, seed=3, name="roundtrip")
+    sequence.metadata = {"diagnostics": {"ok": True}}
     destination = tmp_path / "processed" / "synthetic" / "roundtrip.npz"
 
     save_processed_sequence(sequence, destination)
@@ -43,6 +49,34 @@ def test_processed_sequence_roundtrip(tmp_path: Path) -> None:
     assert loaded.ground_truth_accel is not None
     assert sequence.ground_truth_accel is not None
     assert np.allclose(loaded.ground_truth_accel, sequence.ground_truth_accel)
+    assert loaded.metadata == sequence.metadata
+
+
+def test_sampling_rate_inference_handles_round_and_nonround_rates() -> None:
+    """Sampling rate should come from timestamps rather than dataset-name heuristics."""
+    timestamps_100 = np.arange(0.0, 1.0, 0.01, dtype=np.float64)
+    timestamps_200 = np.arange(0.0, 1.0, 0.005, dtype=np.float64)
+    timestamps_nonround = np.arange(0.0, 1.0, 1.0 / 123.5, dtype=np.float64)
+
+    assert infer_sampling_rate_hz(timestamps_100) == pytest.approx(100.0, rel=1e-4)
+    assert infer_sampling_rate_hz(timestamps_200) == pytest.approx(200.0, rel=1e-4)
+    assert infer_sampling_rate_hz(timestamps_nonround) == pytest.approx(123.5, rel=1e-4)
+
+
+def test_ground_truth_diagnostics_capture_psd_and_allan_variance() -> None:
+    """Processed-sequence metadata should support GT quality diagnostics."""
+    sequence = generate_synthetic_imu(duration_sec=2.0, rate_hz=20.0, seed=9, name="diag")
+    diagnostics = compute_ground_truth_diagnostics(
+        timestamps=sequence.timestamps,
+        noisy_imu=sequence.noisy_imu,
+        clean_imu=sequence.clean_imu,
+    )
+
+    assert diagnostics["sampling_rate_hz"] == pytest.approx(20.0, rel=1e-4)
+    assert "psd_gap" in diagnostics
+    assert "allan_variance" in diagnostics
+    assert diagnostics["allan_variance"]["taus_sec"]
+    assert "flags" in diagnostics
 
 
 def test_sliding_window_returns_noisy_clean_and_timestamps() -> None:
@@ -114,11 +148,14 @@ def test_create_dataloaders_builds_metadata_rich_batches() -> None:
     training_config = TrainingConfig(batch_size=2, num_workers=0, seed=42)
     device_ctx = DeviceContext.from_config(DeviceConfig(preferred="cpu"))
 
-    train_loader, val_loader, test_loader = create_dataloaders(
+    bundle = create_dataloaders(
         data_config,
         training_config,
         device_ctx,
     )
+    train_loader = bundle.train_loader
+    val_loader = bundle.val_loader
+    test_loader = bundle.test_loader
 
     train_batch = next(iter(train_loader))
 
@@ -131,6 +168,7 @@ def test_create_dataloaders_builds_metadata_rich_batches() -> None:
     assert isinstance(train_batch["sequence_id"], list)
     assert isinstance(train_batch["sequence_id"][0], str)
     assert train_batch["dt"].dtype == torch.float32
+    assert bundle.sampling_rate_hz > 0.0
     assert isinstance(val_batch["noisy"], torch.Tensor)
     assert isinstance(test_batch["noisy"], torch.Tensor)
 
@@ -158,15 +196,25 @@ def test_subset_controls_are_reproducible_and_split_safe() -> None:
     training_config = TrainingConfig(batch_size=8, num_workers=0, seed=42)
     device_ctx = DeviceContext.from_config(DeviceConfig(preferred="cpu"))
 
-    first_train, first_val, first_test = create_dataloaders(
+    first_bundle = create_dataloaders(
         data_config,
         training_config,
         device_ctx,
     )
-    second_train, second_val, second_test = create_dataloaders(
+    second_bundle = create_dataloaders(
         data_config,
         training_config,
         device_ctx,
+    )
+    first_train, first_val, first_test = (
+        first_bundle.train_loader,
+        first_bundle.val_loader,
+        first_bundle.test_loader,
+    )
+    second_train, second_val, second_test = (
+        second_bundle.train_loader,
+        second_bundle.val_loader,
+        second_bundle.test_loader,
     )
 
     first_train_ids = set(first_train.dataset._sequence_ids)  # type: ignore[attr-defined]
@@ -209,8 +257,8 @@ def test_subset_controls_do_not_change_sampling_interval() -> None:
     training_config = TrainingConfig(batch_size=4, num_workers=0, seed=42)
     device_ctx = DeviceContext.from_config(DeviceConfig(preferred="cpu"))
 
-    base_train, _, _ = create_dataloaders(base_config, training_config, device_ctx)
-    subset_train, _, _ = create_dataloaders(subset_config, training_config, device_ctx)
+    base_train = create_dataloaders(base_config, training_config, device_ctx).train_loader
+    subset_train = create_dataloaders(subset_config, training_config, device_ctx).train_loader
 
     base_dt = float(base_train.dataset[0]["dt"])
     subset_dt = float(subset_train.dataset[0]["dt"])

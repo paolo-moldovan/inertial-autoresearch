@@ -27,7 +27,7 @@ autoresearch:
     allow_groups: []
     deny_groups: []
     architecture_mode: branch
-    baseline_mode: exploit
+    baseline_mode: branch_from_baseline
   hermes:
     python_bin: vendor/hermes-agent/.venv/bin/python
     cli_path: vendor/hermes-agent/cli.py

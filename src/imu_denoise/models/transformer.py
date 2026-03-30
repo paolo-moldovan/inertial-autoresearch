@@ -32,6 +32,7 @@ class TransformerDenoiser(BaseDenoiser):
         dropout: Dropout rate.
         max_len: Maximum sequence length for positional encoding.
     """
+    causal = False
 
     def __init__(
         self,

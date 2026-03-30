@@ -97,11 +97,10 @@ def run_command(args: Any) -> int:
     )
     checkpoint_path = _resolve_checkpoint_path(config, args.checkpoint)
 
-    _, _, test_loader = create_dataloaders(config.data, config.training, device_ctx)
-    evaluator = Evaluator(model, device_ctx)
+    data_bundle = create_dataloaders(config.data, config.training, device_ctx)
+    evaluator = Evaluator(model, device_ctx).with_config(config.evaluation)
     load_checkpoint(checkpoint_path, evaluator.model, device=device_ctx.device)
-    sampling_rate = 100.0 if config.data.dataset == "blackbird" else 200.0
-    metrics = evaluator.evaluate(test_loader, fs=sampling_rate)
+    metrics = evaluator.evaluate(data_bundle.test_loader, fs=data_bundle.sampling_rate_hz)
 
     run_paths.root.mkdir(parents=True, exist_ok=True)
     run_paths.figures_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +122,7 @@ def run_command(args: Any) -> int:
         source="runtime",
     )
 
-    sample_batch = next(iter(test_loader))
+    sample_batch = next(iter(data_bundle.test_loader))
     noisy = sample_batch["noisy"].to(device_ctx.device)
     with torch.no_grad():
         pred = evaluator.model(noisy).cpu().float().numpy()
@@ -151,7 +150,7 @@ def run_command(args: Any) -> int:
             "denoised": pred[0],
             "clean": clean[0],
         },
-        fs=sampling_rate,
+        fs=data_bundle.sampling_rate_hz,
         save_path=run_paths.figures_dir / "psd.png",
     )
     observability.register_artifact(
@@ -164,15 +163,19 @@ def run_command(args: Any) -> int:
     observability.finish_run(
         run_id=run_id,
         status="completed",
-        summary={"rmse": metrics["rmse"], "mae": metrics["mae"]},
+        summary={
+            key: float(value)
+            for key, value in metrics.items()
+            if isinstance(value, (int, float))
+        },
         source="runtime",
     )
 
     print("Evaluation complete:")
     print(f"  checkpoint: {checkpoint_path}")
     print(f"  metrics_path: {metrics_path}")
-    print(f"  rmse: {metrics['rmse']:.6f}")
-    print(f"  mae: {metrics['mae']:.6f}")
+    for metric_name, value in sorted(metrics.items()):
+        print(f"  {metric_name}: {value:.6f}")
     return 0
 
 

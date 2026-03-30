@@ -16,6 +16,7 @@ class BaseDenoiser(nn.Module, ABC):
     All denoisers take (batch, seq_len, 6) input — 3 accelerometer + 3 gyroscope
     channels — and produce (batch, seq_len, 6) denoised output.
     """
+    causal: bool = False
 
     @abstractmethod
     def forward(self, noisy_imu: Tensor, timestamps: Tensor | None = None) -> Tensor:

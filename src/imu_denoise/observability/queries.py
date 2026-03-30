@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from math import log1p
 from pathlib import Path
 from typing import Any
 
+from imu_denoise.data.diagnostics import temporal_decay_weight
 from imu_denoise.observability.control import (
     LOOP_PAUSED,
     LOOP_RESUMED,
@@ -19,7 +22,11 @@ from imu_denoise.observability.control import (
     QUEUE_ENQUEUED,
 )
 from imu_denoise.observability.events import TRAINING_EPOCH
-from imu_denoise.observability.lineage import data_regime_fingerprint, normalize_config_payload
+from imu_denoise.observability.lineage import (
+    data_regime_fingerprint,
+    model_is_causal,
+    normalize_config_payload,
+)
 from imu_denoise.observability.store import ObservabilityStore
 
 
@@ -636,6 +643,8 @@ class MissionControlQueries:
         )
         if row is None:
             return None
+        payload = self.get_run_config_payload(run_id)
+        row["causal"] = None if payload is None else model_is_causal(payload)
         row["run_id_short"] = str(row["run_id"])[:8]
         experiment_id = row.get("experiment_id")
         row["experiment_id_short"] = str(experiment_id)[:8] if experiment_id else None
@@ -705,6 +714,8 @@ class MissionControlQueries:
         )
         if row is None:
             return None
+        payload = self.get_run_config_payload(str(run_id))
+        row["causal"] = None if payload is None else model_is_causal(payload)
         row["run_id_short"] = str(row["run_id"])[:8]
         regime_fingerprint = row.get("regime_fingerprint")
         row["regime_fingerprint_short"] = (
@@ -771,6 +782,13 @@ class MissionControlQueries:
             "selected_candidate_index": policy_state.get("selected_candidate_index"),
             "preferred_candidate_index": policy_state.get("preferred_candidate_index"),
             "preferred_candidate_description": policy_state.get("preferred_candidate_description"),
+            "blocked_candidates": (
+                policy_state.get("blocked_candidates")
+                if isinstance(policy_state.get("blocked_candidates"), dict)
+                else {}
+            ),
+            "hermes_status": policy_state.get("hermes_status"),
+            "hermes_reason": policy_state.get("hermes_reason"),
             "policy_candidates": candidates if isinstance(candidates, list) else [],
         }
 
@@ -926,12 +944,32 @@ class MissionControlQueries:
         current_run = self.get_current_run_summary(
             None if loop_state is None else str(loop_state["loop_run_id"])
         )
+        current_candidate_pool = None
+        if current_run is not None:
+            current_candidate_pool = {
+                "run_id": current_run.get("run_id"),
+                "run_name": current_run.get("run_name"),
+                "proposal_source": current_run.get("proposal_source"),
+                "policy_mode": current_run.get("policy_mode"),
+                "selection_rationale": current_run.get("selection_rationale"),
+                "selected_candidate_index": current_run.get("selected_candidate_index"),
+                "preferred_candidate_index": current_run.get("preferred_candidate_index"),
+                "preferred_candidate_description": current_run.get(
+                    "preferred_candidate_description"
+                ),
+                "hermes_status": current_run.get("hermes_status"),
+                "hermes_reason": current_run.get("hermes_reason"),
+                "candidate_count": len(current_run.get("candidate_pool") or []),
+                "candidates": list(current_run.get("candidate_pool") or []),
+                "blocked_candidates": dict(current_run.get("blocked_candidates") or {}),
+            }
         hermes_runtime = self.get_hermes_runtime_summary(
             loop_run_id=None if loop_state is None else str(loop_state["loop_run_id"])
         )
         return {
             "loop_state": loop_state,
             "current_run": current_run,
+            "current_candidate_pool": current_candidate_pool,
             "best_result": best_result,
             "leaderboard": leaderboard,
             "progress": progress,
@@ -975,12 +1013,19 @@ class MissionControlQueries:
             return None
         run = detail["run"]
         latest_decision = detail["decisions"][0] if detail["decisions"] else None
+        evaluation_config = (
+            detail["experiment"].get("config", {}).get("evaluation")
+            if isinstance(detail.get("experiment"), dict)
+            else None
+        )
+        policy_context = detail.get("policy_context")
         return {
             "run_id": run["id"],
             "run_name": run["name"],
             "phase": run["phase"],
             "status": run["status"],
             "model": run["model"],
+            "causal": detail["identity"].get("causal") if detail.get("identity") else None,
             "dataset": run["dataset"],
             "epoch": run.get("epoch"),
             "last_metric": run.get("last_metric"),
@@ -996,6 +1041,55 @@ class MissionControlQueries:
             ),
             "metric_value": (
                 None if latest_decision is None else latest_decision.get("metric_value")
+            ),
+            "realtime_mode": (
+                bool(evaluation_config.get("realtime_mode"))
+                if isinstance(evaluation_config, Mapping)
+                else None
+            ),
+            "reconstruction": (
+                evaluation_config.get("reconstruction")
+                if isinstance(evaluation_config, Mapping)
+                else None
+            ),
+            "evaluation_metrics": (
+                list(evaluation_config.get("metrics") or [])
+                if isinstance(evaluation_config, Mapping)
+                else []
+            ),
+            "proposal_source": (
+                None if policy_context is None else policy_context.get("proposal_source")
+            ),
+            "policy_mode": None if policy_context is None else policy_context.get("policy_mode"),
+            "selection_rationale": (
+                None if policy_context is None else policy_context.get("rationale")
+            ),
+            "selected_candidate_index": (
+                None if policy_context is None else policy_context.get("selected_candidate_index")
+            ),
+            "preferred_candidate_index": (
+                None if policy_context is None else policy_context.get("preferred_candidate_index")
+            ),
+            "preferred_candidate_description": (
+                None
+                if policy_context is None
+                else policy_context.get("preferred_candidate_description")
+            ),
+            "hermes_status": (
+                None if policy_context is None else policy_context.get("hermes_status")
+            ),
+            "hermes_reason": (
+                None if policy_context is None else policy_context.get("hermes_reason")
+            ),
+            "candidate_pool": (
+                list(policy_context.get("policy_candidates") or [])
+                if isinstance(policy_context, Mapping)
+                else []
+            ),
+            "blocked_candidates": (
+                dict(policy_context.get("blocked_candidates") or {})
+                if isinstance(policy_context, Mapping)
+                else {}
             ),
             "llm_call_count": len(detail["llm_calls"]),
             "artifact_count": len(detail["artifacts"]),
@@ -1174,7 +1268,128 @@ class MissionControlQueries:
             """,
             (regime_fingerprint, *signatures),
         )
-        return {str(row["signature"]): row for row in rows}
+        stats = {str(row["signature"]): dict(row) for row in rows}
+        priors = self._cross_regime_priors_for_signatures(
+            signatures=signatures,
+            exclude_regime_fingerprint=regime_fingerprint,
+        )
+        for signature in signatures:
+            prior = priors.get(signature)
+            stat = stats.get(signature)
+            local_tries = 0 if stat is None else int(stat.get("tries", 0))
+            if prior is None or local_tries >= 3:
+                if stat is not None:
+                    stat.setdefault("prior_strength", 0.0)
+                continue
+            prior_strength = min(float(prior["prior_strength"]), 0.30 / max(1, local_tries + 1))
+            if stat is None:
+                stats[signature] = {
+                    "signature": signature,
+                    "display_name": prior.get("display_name", signature),
+                    "tries": 0,
+                    "keep_count": 0,
+                    "discard_count": 0,
+                    "crash_count": 0,
+                    "avg_metric_delta": 0.0,
+                    "confidence": 0.0,
+                }
+                stat = stats[signature]
+            stat["prior_strength"] = prior_strength
+            stat["prior_confidence"] = prior["prior_confidence"]
+            stat["prior_avg_metric_delta"] = prior["prior_avg_metric_delta"]
+            stat["prior_discard_rate"] = prior["prior_discard_rate"]
+            stat["prior_crash_rate"] = prior["prior_crash_rate"]
+            stat["prior_tries"] = prior["prior_tries"]
+            stat["evidence_scope"] = "blended" if local_tries > 0 else "cross_regime_prior"
+        return stats
+
+    def _cross_regime_priors_for_signatures(
+        self,
+        *,
+        signatures: list[str],
+        exclude_regime_fingerprint: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not signatures:
+            return {}
+        placeholders = ", ".join("?" for _ in signatures)
+        rows = self.store.fetch_all(
+            f"""
+            SELECT
+                a.signature,
+                a.status,
+                a.metric_delta,
+                a.created_at,
+                sig.display_name
+            FROM mutation_attempts a
+            JOIN mutation_signatures sig ON sig.signature = a.signature
+            WHERE a.signature IN ({placeholders})
+              AND a.regime_fingerprint != ?
+            ORDER BY a.created_at DESC
+            """,
+            (*signatures, exclude_regime_fingerprint),
+        )
+        now = datetime.now(tz=UTC)
+        aggregates: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            signature = str(row["signature"])
+            bucket = aggregates.setdefault(
+                signature,
+                {
+                    "display_name": row.get("display_name") or signature,
+                    "weighted_tries": 0.0,
+                    "weighted_keep": 0.0,
+                    "weighted_discard": 0.0,
+                    "weighted_crash": 0.0,
+                    "weighted_delta_sum": 0.0,
+                    "weighted_delta_count": 0.0,
+                },
+            )
+            created_at = row.get("created_at")
+            age_days = 0.0
+            if isinstance(created_at, str):
+                try:
+                    created = datetime.fromisoformat(created_at)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=UTC)
+                    age_days = max(0.0, (now - created).total_seconds() / 86_400.0)
+                except ValueError:
+                    age_days = 0.0
+            weight = temporal_decay_weight(age_days)
+            bucket["weighted_tries"] += weight
+            status = str(row.get("status") or "")
+            if status == "keep":
+                bucket["weighted_keep"] += weight
+            elif status == "discard":
+                bucket["weighted_discard"] += weight
+            elif status == "crash":
+                bucket["weighted_crash"] += weight
+            metric_delta = row.get("metric_delta")
+            if isinstance(metric_delta, (int, float)):
+                bucket["weighted_delta_sum"] += weight * float(metric_delta)
+                bucket["weighted_delta_count"] += weight
+
+        priors: dict[str, dict[str, Any]] = {}
+        for signature, bucket in aggregates.items():
+            weighted_tries = float(bucket["weighted_tries"])
+            if weighted_tries <= 0.0:
+                continue
+            weighted_delta_count = float(bucket["weighted_delta_count"])
+            prior_avg_metric_delta = (
+                float(bucket["weighted_delta_sum"]) / weighted_delta_count
+                if weighted_delta_count > 0.0
+                else 0.0
+            )
+            prior_confidence = min(0.30, 0.08 + 0.08 * log1p(weighted_tries))
+            priors[signature] = {
+                "display_name": bucket["display_name"],
+                "prior_tries": weighted_tries,
+                "prior_avg_metric_delta": prior_avg_metric_delta,
+                "prior_confidence": prior_confidence,
+                "prior_discard_rate": float(bucket["weighted_discard"]) / weighted_tries,
+                "prior_crash_rate": float(bucket["weighted_crash"]) / weighted_tries,
+                "prior_strength": min(0.30, weighted_tries / 6.0),
+            }
+        return priors
 
     def list_events(
         self,
