@@ -287,6 +287,20 @@ class MissionControlQueries:
             row["rank"] = index
         return rows
 
+    def get_run_objective_metric(self, run_id: str) -> str | None:
+        row = self.store.fetch_one(
+            """
+            SELECT e.objective_metric
+            FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        )
+        if row is None or row.get("objective_metric") in {None, ""}:
+            return None
+        return str(row["objective_metric"])
+
     def get_run_metric(self, run_id: str, *, metric_key: str = "val_rmse") -> float | None:
         metric_keys = [metric_key]
         if metric_key == "val_rmse":
@@ -900,15 +914,15 @@ class MissionControlQueries:
     def get_mission_control_summary(self, *, limit: int = 10) -> dict[str, Any]:
         loop_state = self.get_current_loop_state()
         comparison_regime_fingerprint: str | None = None
-        if (
-            loop_state is not None
-            and str(loop_state.get("status")) in {"running", "paused", "terminating"}
-        ):
-            comparison_regime_fingerprint = self.get_run_regime_fingerprint(
-                str(loop_state["loop_run_id"])
-            )
+        comparison_metric_key = "val_rmse"
+        if loop_state is not None:
+            loop_run_id = str(loop_state["loop_run_id"])
+            comparison_metric_key = self.get_run_objective_metric(loop_run_id) or "val_rmse"
+            if str(loop_state.get("status")) in {"running", "paused", "terminating", "completed"}:
+                comparison_regime_fingerprint = self.get_run_regime_fingerprint(loop_run_id)
         leaderboard = self.list_leaderboard(
             limit=limit,
+            metric_key=comparison_metric_key,
             regime_fingerprint=comparison_regime_fingerprint,
         )
         best_result = leaderboard[0] if leaderboard else None
@@ -978,6 +992,7 @@ class MissionControlQueries:
             "recent_decisions": recent_decisions,
             "recent_llm_calls": recent_llm_calls,
             "regime_fingerprint": comparison_regime_fingerprint,
+            "comparison_metric_key": comparison_metric_key,
             "mutation_leaderboard": mutation_leaderboard,
             "recent_mutation_lessons": recent_mutation_lessons,
             "hermes_runtime": hermes_runtime,

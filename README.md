@@ -221,6 +221,13 @@ Start the EuRoC Mission Control profile:
 uv run scripts/start_mission_control.py --profile euroc
 ```
 
+Run a sequence-aware EuRoC autoresearch profile that optimizes reconstructed
+`sequence_rmse` instead of plain window `val_rmse`:
+
+```bash
+uv run imu loop --config configs/mission_control/hermes_euroc_temporal.yaml
+```
+
 That uses [configs/mission_control/hermes_euroc_subset.yaml](/Users/paolo/development/inertial-autoresearch/configs/mission_control/hermes_euroc_subset.yaml) and is intended for a real-data subset run on the currently processed EuRoC Machine Hall sequences.
 
 ## Mission Control Phase 2

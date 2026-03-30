@@ -1,0 +1,59 @@
+name: mission-control-euroc-temporal
+
+data:
+  dataset: euroc
+  window_size: 200
+  stride: 100
+  normalize: true
+  augment: false
+  train_sequences:
+    - MH_01_easy
+  val_sequences:
+    - MH_04_difficult
+  test_sequences:
+    - MH_05_difficult
+  subset:
+    enabled: true
+    seed: 42
+    train_max_sequences: 1
+    val_max_sequences: 1
+    test_max_sequences: 1
+    train_max_windows: 128
+    val_max_windows: 32
+    test_max_windows: 32
+
+training:
+  epochs: 200
+  batch_size: 16
+  num_workers: 0
+  time_budget_sec: 0
+
+evaluation:
+  frequency_epochs: 2
+  metrics:
+    - rmse
+    - sequence_rmse
+    - smoothness
+    - drift_error
+  reconstruction: hann
+  realtime_mode: false
+
+autoresearch:
+  max_iterations: 50
+  metric_key: sequence_rmse
+  metric_direction: minimize
+  orchestrator: hermes
+  strategy:
+    explore_probability: 0.30
+    exploit_top_k: 5
+    novelty_bonus: 0.15
+  search_space:
+    baseline_mode: branch_from_baseline
+  hermes:
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3.5:latest
+
+observability:
+  db_path: artifacts/observability/mission_control.db
+  blob_dir: artifacts/observability/blobs
+  streamlit_port: 8501

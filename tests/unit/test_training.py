@@ -166,3 +166,64 @@ def test_weighted_loss_supports_sensor_type_and_channel_weights() -> None:
     )
 
     assert float(sensor_weighted(pred, target)) == float(channel_weighted(pred, target))
+
+
+def test_trainer_can_track_sequence_metric_as_objective(tmp_path: Path) -> None:
+    """Sequence-aware metrics should be usable as the trainer's best-run objective."""
+    config = ExperimentConfig(
+        name="sequence-objective",
+        output_dir=str(tmp_path / "artifacts"),
+        log_dir=str(tmp_path / "artifacts" / "logs"),
+        data=DataConfig(
+            dataset="synthetic",
+            window_size=16,
+            stride=8,
+            normalize=True,
+            augment=False,
+            dataset_kwargs={
+                "duration_sec": 1.0,
+                "rate_hz": 20.0,
+                "num_sequences": 4,
+                "seed": 11,
+            },
+        ),
+        training=TrainingConfig(
+            epochs=2,
+            batch_size=4,
+            num_workers=0,
+            seed=123,
+            early_stop_patience=5,
+        ),
+        evaluation=EvaluationConfig(
+            frequency_epochs=1,
+            metrics=["rmse", "sequence_rmse"],
+            reconstruction="hann",
+        ),
+        autoresearch=ExperimentConfig().autoresearch.__class__(metric_key="sequence_rmse"),
+        device=DeviceConfig(preferred="cpu"),
+        observability=ObservabilityConfig(
+            enabled=True,
+            db_path=str(tmp_path / "artifacts" / "observability" / "mission_control.db"),
+            blob_dir=str(tmp_path / "artifacts" / "observability" / "blobs"),
+        ),
+    )
+    seed_everything(config.training.seed)
+    device_ctx = DeviceContext.from_config(config.device)
+    model = build_model(config)
+    data_bundle = create_dataloaders(config.data, config.training, device_ctx)
+    optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+
+    trainer = Trainer(
+        model=model,
+        config=config,
+        device_ctx=device_ctx,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        loss_fn=build_loss(config.training),
+    )
+    summary = trainer.fit(data_bundle)
+
+    assert summary.best_metric_key == "sequence_rmse"
+    assert summary.best_metric_value >= 0.0
+    metrics = json.loads(summary.artifacts.metrics_path.read_text(encoding="utf-8"))
+    assert metrics["best_metric_key"] == "sequence_rmse"

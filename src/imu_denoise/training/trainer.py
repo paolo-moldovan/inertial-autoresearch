@@ -57,6 +57,9 @@ class TrainingSummary:
     run_id: str
     best_epoch: int
     best_val_rmse: float
+    best_metric_key: str
+    best_metric_value: float
+    best_eval_metrics: dict[str, float]
     final_train_loss: float
     final_val_loss: float
     training_seconds: float
@@ -105,7 +108,10 @@ class Trainer:
         self.checkpoints = CheckpointManager(self.run_paths.checkpoints_dir)
         self.early_stopping = EarlyStopping(
             patience=config.training.early_stop_patience,
-            mode="min",
+            mode="max" if config.autoresearch.metric_direction == "maximize" else "min",
+        )
+        self.checkpoints.mode = (
+            "max" if config.autoresearch.metric_direction == "maximize" else "min"
         )
         self.history_path = self.run_paths.history_path
         self.parent_run_id = parent_run_id
@@ -121,8 +127,11 @@ class Trainer:
         start_time = time.perf_counter()
         best_epoch = 0
         best_val_rmse = float("inf")
+        best_metric_value = float("inf")
+        best_eval_metrics: dict[str, float] = {}
         last_train_loss = float("nan")
         last_val_loss = float("nan")
+        objective_metric_key = self.config.autoresearch.metric_key
         run_id = self.observability.start_run(
             name=self.config.name,
             phase="training",
@@ -166,6 +175,7 @@ class Trainer:
                 should_evaluate = self._should_run_full_evaluation(epoch)
                 metrics: dict[str, float] | None = None
                 val_rmse: float | None = None
+                objective_metric_value: float | None = None
                 if should_evaluate:
                     metrics = (
                         Evaluator(self.model, self.device_ctx)
@@ -182,6 +192,10 @@ class Trainer:
                             "best_val_rmse can be tracked."
                         )
                     val_rmse = float(rmse_metric)
+                    objective_metric_value = self._objective_metric_value(
+                        metrics=metrics,
+                        val_loss=val_loss,
+                    )
                 lr = self.optimizer.param_groups[0]["lr"]
 
                 self._write_history(
@@ -215,15 +229,21 @@ class Trainer:
                     )
 
                 self._step_scheduler(val_loss)
-                checkpoint_metric = val_rmse if val_rmse is not None else (
-                    best_val_rmse if best_val_rmse != float("inf") else float("inf")
+                checkpoint_metric = (
+                    objective_metric_value
+                    if objective_metric_value is not None
+                    else (
+                        best_metric_value
+                        if best_metric_value != float("inf")
+                        else float("inf")
+                    )
                 )
                 is_best = False
                 checkpoint_extra = {"val_metrics": metrics} if metrics is not None else None
-                if val_rmse is not None:
+                if objective_metric_value is not None:
                     is_best = self.checkpoints.save(
                         epoch=epoch,
-                        metric_value=val_rmse,
+                        metric_value=objective_metric_value,
                         model=self.model,
                         optimizer=self.optimizer,
                         extra=checkpoint_extra,
@@ -236,15 +256,24 @@ class Trainer:
                         optimizer=self.optimizer,
                         extra=checkpoint_extra,
                     )
-                if is_best and val_rmse is not None:
+                if is_best and objective_metric_value is not None:
                     best_epoch = epoch
-                    best_val_rmse = val_rmse
+                    best_metric_value = objective_metric_value
+                    best_eval_metrics = dict(metrics or {})
+                    if val_rmse is not None:
+                        best_val_rmse = val_rmse
                     self.observability.register_artifact(
                         run_id=run_id,
                         path=self.checkpoints.best_path,
                         artifact_type="checkpoint",
                         label="best",
-                        metadata={"epoch": epoch, "val_rmse": val_rmse, "evaluated": True},
+                        metadata={
+                            "epoch": epoch,
+                            "val_rmse": val_rmse,
+                            "objective_metric_key": objective_metric_key,
+                            "objective_metric_value": objective_metric_value,
+                            "evaluated": True,
+                        },
                         source="runtime",
                     )
 
@@ -269,7 +298,12 @@ class Trainer:
                     best_metric=best_val_rmse if best_val_rmse != float("inf") else None,
                     source="runtime",
                 )
-                self._heartbeat_parent_loop(best_metric=best_val_rmse)
+                heartbeat_metric = (
+                    best_metric_value
+                    if best_metric_value != float("inf")
+                    else best_val_rmse
+                )
+                self._heartbeat_parent_loop(best_metric=heartbeat_metric)
 
                 if self.config.training.time_budget_sec > 0:
                     elapsed = time.perf_counter() - start_time
@@ -287,14 +321,21 @@ class Trainer:
 
                 self._check_loop_termination()
 
-                if val_rmse is not None and self.early_stopping.update(val_rmse):
+                if objective_metric_value is not None and self.early_stopping.update(
+                    objective_metric_value
+                ):
                     self.logger.info("Stopping early after %d epochs without improvement.", epoch)
                     self.observability.append_event(
                         run_id=run_id,
                         event_type="early_stop",
                         level="INFO",
                         title="early stopping triggered",
-                        payload={"epoch": epoch, "val_rmse": val_rmse},
+                        payload={
+                            "epoch": epoch,
+                            "val_rmse": val_rmse,
+                            "objective_metric_key": objective_metric_key,
+                            "objective_metric_value": objective_metric_value,
+                        },
                         source="runtime",
                     )
                     break
@@ -313,6 +354,9 @@ class Trainer:
             summary_metrics = {
                 "best_epoch": best_epoch,
                 "best_val_rmse": best_val_rmse,
+                "best_metric_key": objective_metric_key,
+                "best_metric_value": best_metric_value,
+                "best_eval_metrics": best_eval_metrics,
                 "final_train_loss": last_train_loss,
                 "final_val_loss": last_val_loss,
                 "training_seconds": elapsed,
@@ -355,6 +399,9 @@ class Trainer:
                 run_id=run_id,
                 best_epoch=best_epoch,
                 best_val_rmse=best_val_rmse,
+                best_metric_key=objective_metric_key,
+                best_metric_value=best_metric_value,
+                best_eval_metrics=best_eval_metrics,
                 final_train_loss=last_train_loss,
                 final_val_loss=last_val_loss,
                 training_seconds=elapsed,
@@ -426,6 +473,24 @@ class Trainer:
                 total_batches += 1
 
         return total_loss / max(total_batches, 1)
+
+    def _objective_metric_value(
+        self,
+        *,
+        metrics: dict[str, float],
+        val_loss: float,
+    ) -> float:
+        metric_key = self.config.autoresearch.metric_key
+        if metric_key == "final_val_loss":
+            return float(val_loss)
+        evaluation_metric_key = "rmse" if metric_key == "val_rmse" else metric_key
+        metric_value = metrics.get(evaluation_metric_key)
+        if metric_value is None:
+            raise ValueError(
+                "training requires evaluation.metrics to include "
+                f"{evaluation_metric_key!r} when autoresearch.metric_key={metric_key!r}."
+            )
+        return float(metric_value)
 
     def _check_loop_termination(self) -> None:
         if self.parent_run_id is None or self.observability.store is None:

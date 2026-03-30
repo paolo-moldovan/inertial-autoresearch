@@ -116,8 +116,8 @@ def run_command(args: Any) -> int:
         proposal_source="manual",
         description="manual run",
         status="completed",
-        metric_key="val_rmse",
-        metric_value=summary.best_val_rmse,
+        metric_key=summary.best_metric_key,
+        metric_value=summary.best_metric_value,
         overrides=list(args.overrides),
         source="runtime",
     )
@@ -134,6 +134,8 @@ def run_command(args: Any) -> int:
     print("Training complete:")
     print(f"  best_epoch: {summary.best_epoch}")
     print(f"  best_val_rmse: {summary.best_val_rmse:.6f}")
+    print(f"  best_metric_key: {summary.best_metric_key}")
+    print(f"  best_metric_value: {summary.best_metric_value:.6f}")
     print(f"  final_train_loss: {summary.final_train_loss:.6f}")
     print(f"  final_val_loss: {summary.final_val_loss:.6f}")
     print(f"  training_seconds: {summary.training_seconds:.2f}")

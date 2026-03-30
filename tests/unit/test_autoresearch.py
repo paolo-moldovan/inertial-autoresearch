@@ -20,6 +20,7 @@ from autoresearch_loop.hermes import (
     _build_prompt as build_hermes_prompt,
 )
 from autoresearch_loop.loop import (
+    _metric_from_summary,
     _resolve_iteration_config,
     _select_mutation_proposal,
     build_parser,
@@ -217,6 +218,20 @@ def test_default_mutation_pool_is_broader_than_minimal_smoke_space() -> None:
     assert "plateau scheduler" in descriptions
     assert "causal lstm" in descriptions
     assert "medium transformer" in descriptions
+
+
+def test_metric_from_summary_supports_sequence_objectives() -> None:
+    """Loop ranking should be able to use sequence-aware best metrics from training."""
+    summary = SimpleNamespace(
+        best_metric_key="sequence_rmse",
+        best_metric_value=0.123,
+        best_eval_metrics={"sequence_rmse": 0.123, "rmse": 0.150},
+        best_val_rmse=0.150,
+        final_val_loss=0.050,
+    )
+
+    assert _metric_from_summary(summary, "sequence_rmse") == pytest.approx(0.123)
+    assert _metric_from_summary(summary, "val_rmse") == pytest.approx(0.150)
 
 
 def test_realtime_mode_filters_noncausal_candidates_before_hermes() -> None:

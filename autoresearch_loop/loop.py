@@ -147,6 +147,11 @@ def _metric_from_summary(
     summary: Any,
     metric_key: str,
 ) -> float:
+    if getattr(summary, "best_metric_key", None) == metric_key:
+        return float(summary.best_metric_value)
+    best_eval_metrics = getattr(summary, "best_eval_metrics", None)
+    if isinstance(best_eval_metrics, dict) and metric_key in best_eval_metrics:
+        return float(best_eval_metrics[metric_key])
     if metric_key == "val_rmse":
         return float(summary.best_val_rmse)
     if metric_key == "final_val_loss":
