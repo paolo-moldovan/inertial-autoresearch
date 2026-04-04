@@ -58,6 +58,37 @@ class RunResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class SupportsRunResult(Protocol):
+    """Structural protocol for provider/policy-facing run history."""
+
+    @property
+    def iteration(self) -> int: ...
+
+    @property
+    def run_name(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
+
+    @property
+    def proposal_source(self) -> str: ...
+
+    @property
+    def metric_key(self) -> str: ...
+
+    @property
+    def metric_value(self) -> float | None: ...
+
+    @property
+    def model_name(self) -> str: ...
+
+    @property
+    def description(self) -> str: ...
+
+    @property
+    def overrides(self) -> list[str]: ...
+
+
 @dataclass(frozen=True)
 class SelectionContext:
     """Context handed to providers and policy logic for one iteration."""

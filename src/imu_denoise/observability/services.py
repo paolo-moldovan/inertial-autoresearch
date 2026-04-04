@@ -2,25 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
-from autoresearch_core.observability import MissionControlFacade
+from autoresearch_core.observability import (
+    MissionControlServices,
+    compose_mission_control_services,
+)
 from imu_denoise.config.schema import ObservabilityConfig
 from imu_denoise.observability.control import LoopController
 from imu_denoise.observability.queries import MissionControlQueries
 from imu_denoise.observability.store import ObservabilityStore
 from imu_denoise.observability.writer import ObservabilityWriter
-
-
-@dataclass(frozen=True)
-class MissionControlServices:
-    """Resolved query/control stack used by the UI and CLI composition layers."""
-
-    facade: MissionControlFacade
-    queries: MissionControlQueries
-    controller: LoopController
-    writer: ObservabilityWriter
 
 
 def build_mission_control_services(
@@ -39,10 +31,11 @@ def build_mission_control_services(
         store=store,
     )
     controller = LoopController(store=store, writer=writer)
-    facade = MissionControlFacade(queries=queries, controller=controller, writer=writer)
-    return MissionControlServices(
-        facade=facade,
+    return compose_mission_control_services(
         queries=queries,
         controller=controller,
         writer=writer,
     )
+
+
+__all__ = ["MissionControlServices", "build_mission_control_services"]

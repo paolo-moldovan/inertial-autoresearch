@@ -6,72 +6,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from random import Random
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from autoresearch_core import SupportsRunResult
     from autoresearch_core.providers.hermes import HermesQueryTrace
     from imu_denoise.autoresearch.mutations import MutationProposal
     from imu_denoise.config import ExperimentConfig
-
-
-class SupportsLoopResult(Protocol):
-    """Structural protocol for loop result snapshots used by the policy layer."""
-
-    @property
-    def iteration(self) -> int: ...
-
-    @property
-    def run_name(self) -> str: ...
-
-    @property
-    def status(self) -> str: ...
-
-    @property
-    def proposal_source(self) -> str: ...
-
-    @property
-    def metric_key(self) -> str: ...
-
-    @property
-    def metric_value(self) -> float | None: ...
-
-    @property
-    def model_name(self) -> str: ...
-
-    @property
-    def description(self) -> str: ...
-
-    @property
-    def overrides(self) -> list[str]: ...
-
-
-def result_snapshot(result: SupportsLoopResult) -> dict[str, object]:
-    """Convert a loop result into the compact provider-facing history payload."""
-    return {
-        "iteration": result.iteration,
-        "run_name": result.run_name,
-        "status": result.status,
-        "proposal_source": result.proposal_source,
-        "metric_key": result.metric_key,
-        "metric_value": result.metric_value,
-        "model_name": result.model_name,
-        "description": result.description,
-        "overrides": result.overrides,
-    }
-
-
-def recent_policy_results(results: Sequence[SupportsLoopResult]) -> list[dict[str, Any]]:
-    """Reduce loop history to the fields used by the local policy layer."""
-    return [
-        {
-            "iteration": result.iteration,
-            "status": result.status,
-            "proposal_source": result.proposal_source,
-            "metric_value": result.metric_value,
-            "description": result.description,
-        }
-        for result in results
-    ]
 
 
 def select_mutation_proposal(
@@ -83,7 +24,7 @@ def select_mutation_proposal(
     mutation_catalog: list[MutationProposal] | None = None,
     resolve_iteration_config_fn: Callable[..., ExperimentConfig],
     rng: Random,
-    results: Sequence[SupportsLoopResult],
+    results: Sequence[SupportsRunResult],
     fallback_proposal: MutationProposal,
     hermes_used_descriptions: set[str],
     incumbent_summary: dict[str, object] | None,
@@ -97,7 +38,7 @@ def select_mutation_proposal(
     HermesQueryTrace | None,
 ]:
     """Resolve the effective candidate pool and provider preference for one iteration."""
-    from autoresearch_core.engine import resolve_provider_selection
+    from autoresearch_core.engine import resolve_provider_selection, result_snapshot
     from autoresearch_loop.hermes import (
         HermesProposalError,
         choose_mutation_proposal_with_trace,
