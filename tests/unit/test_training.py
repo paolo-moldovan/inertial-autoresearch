@@ -17,6 +17,7 @@ from imu_denoise.config import (
 from imu_denoise.data.datamodule import create_dataloaders
 from imu_denoise.device import DeviceContext
 from imu_denoise.observability import MissionControlQueries
+from imu_denoise.observability.training_hooks import build_training_hooks
 from imu_denoise.training import (
     Trainer,
     build_loss,
@@ -61,6 +62,7 @@ def test_trainer_runs_end_to_end_on_synthetic_data(tmp_path: Path) -> None:
         device_ctx,
     )
     optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+    training_hooks = build_training_hooks(config=config)
 
     trainer = Trainer(
         model=model,
@@ -69,6 +71,7 @@ def test_trainer_runs_end_to_end_on_synthetic_data(tmp_path: Path) -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=build_loss(config.training),
+        training_hooks=training_hooks,
     )
     summary = trainer.fit(data_bundle)
 
@@ -130,6 +133,7 @@ def test_trainer_honors_evaluation_frequency_and_preserves_history(tmp_path: Pat
     model = build_model(config)
     data_bundle = create_dataloaders(config.data, config.training, device_ctx)
     optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+    training_hooks = build_training_hooks(config=config)
 
     trainer = Trainer(
         model=model,
@@ -138,6 +142,7 @@ def test_trainer_honors_evaluation_frequency_and_preserves_history(tmp_path: Pat
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=build_loss(config.training),
+        training_hooks=training_hooks,
     )
     summary = trainer.fit(data_bundle)
 
@@ -212,6 +217,7 @@ def test_trainer_can_track_sequence_metric_as_objective(tmp_path: Path) -> None:
     model = build_model(config)
     data_bundle = create_dataloaders(config.data, config.training, device_ctx)
     optimizer, scheduler = build_optimizer_and_scheduler(model.parameters(), config.training)
+    training_hooks = build_training_hooks(config=config)
 
     trainer = Trainer(
         model=model,
@@ -220,6 +226,7 @@ def test_trainer_can_track_sequence_metric_as_objective(tmp_path: Path) -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=build_loss(config.training),
+        training_hooks=training_hooks,
     )
     summary = trainer.fit(data_bundle)
 

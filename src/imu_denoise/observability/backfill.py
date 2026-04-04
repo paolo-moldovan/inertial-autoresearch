@@ -4,42 +4,18 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
+from autoresearch_core.observability.backfill import (
+    build_backfill_run_id,
+    ensure_backfill_run,
+    parse_iso_timestamp,
+    read_json_lines,
+    resolve_manifest_run_reference,
+)
 from imu_denoise.config import ExperimentConfig
 from imu_denoise.observability.events import LOG_EVENT
 from imu_denoise.observability.writer import ObservabilityWriter
-
-
-def _run_id(name: str, phase: str) -> str:
-    return f"backfill:{phase}:{name}"
-
-
-def _parse_timestamp(value: str) -> float:
-    return datetime.fromisoformat(value).timestamp()
-
-
-def _read_json_lines(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            rows.append(dict(json.loads(stripped)))
-    return rows
-
-
-def _load_manifest(path: Path) -> dict[str, Any] | None:
-    for parent in (path.parent, *path.parents):
-        manifest_path = parent / "run.json"
-        if manifest_path.exists():
-            return dict(json.loads(manifest_path.read_text(encoding="utf-8")))
-        if parent.name == "runs":
-            break
-    return None
 
 
 def _resolve_run_reference(
@@ -48,13 +24,11 @@ def _resolve_run_reference(
     default_name: str,
     default_phase: str,
 ) -> tuple[str, str, str]:
-    manifest = _load_manifest(path)
-    if manifest is None:
-        return _run_id(default_name, default_phase), default_name, default_phase
-    run_name = str(manifest.get("name") or default_name)
-    phase = str(manifest.get("phase") or default_phase)
-    run_id = str(manifest.get("run_id") or _run_id(run_name, phase))
-    return run_id, run_name, phase
+    return resolve_manifest_run_reference(
+        path,
+        default_name=default_name,
+        default_phase=default_phase,
+    )
 
 
 def _legacy_run_name_from_metrics_path(metrics_path: Path) -> str:
@@ -75,26 +49,6 @@ def _legacy_run_name_from_artifact_path(artifact_path: Path) -> str:
     if artifact_path.parent.parent.name == "baselines":
         return artifact_path.parent.parent.parent.name
     return run_name
-
-
-def _ensure_backfill_run(
-    writer: ObservabilityWriter,
-    *,
-    config: ExperimentConfig,
-    run_id: str,
-    run_name: str,
-    phase: str,
-) -> None:
-    writer.start_run(
-        name=run_name,
-        phase=phase,
-        dataset=None,
-        model=None,
-        device=None,
-        config=config,
-        source="backfill",
-        run_id=run_id,
-    )
 
 
 def _infer_artifact_type(path: Path, run_name: str) -> tuple[str, str | None]:
@@ -141,18 +95,12 @@ def backfill_observability(
             default_name=default_name,
             default_phase="training",
         )
-        _ensure_backfill_run(
-            obs_writer,
-            config=config,
-            run_id=run_id,
-            run_name=run_name,
-            phase=phase,
-        )
+        ensure_backfill_run(obs_writer, run_id=run_id, run_name=run_name, phase=phase)
         if run_id not in known_run_ids:
             counts["runs"] += 1
             known_run_ids.add(run_id)
         best_metric: float | None = None
-        for record in _read_json_lines(history_path):
+        for record in read_json_lines(history_path):
             epoch = int(record["epoch"])
             val_rmse = float(record["val_rmse"])
             best_metric = val_rmse if best_metric is None else min(best_metric, val_rmse)
@@ -192,13 +140,7 @@ def backfill_observability(
             default_name=default_name,
             default_phase="training",
         )
-        _ensure_backfill_run(
-            obs_writer,
-            config=config,
-            run_id=run_id,
-            run_name=run_name,
-            phase=phase,
-        )
+        ensure_backfill_run(obs_writer, run_id=run_id, run_name=run_name, phase=phase)
         if run_id not in known_run_ids:
             counts["runs"] += 1
             known_run_ids.add(run_id)
@@ -210,9 +152,9 @@ def backfill_observability(
             source="backfill",
         )
         counts["artifacts"] += 1
-        for record in _read_json_lines(log_path):
+        for record in read_json_lines(log_path):
             timestamp = record.get("timestamp")
-            created_at = _parse_timestamp(str(timestamp)) if timestamp is not None else None
+            created_at = parse_iso_timestamp(str(timestamp)) if timestamp is not None else None
             obs_writer.append_event(
                 run_id=run_id,
                 event_type=LOG_EVENT,
@@ -231,13 +173,7 @@ def backfill_observability(
             default_name=_legacy_run_name_from_metrics_path(metrics_path),
             default_phase="training",
         )
-        _ensure_backfill_run(
-            obs_writer,
-            config=config,
-            run_id=run_id,
-            run_name=run_name,
-            phase=phase,
-        )
+        ensure_backfill_run(obs_writer, run_id=run_id, run_name=run_name, phase=phase)
         if run_id not in known_run_ids:
             counts["runs"] += 1
             known_run_ids.add(run_id)
@@ -268,13 +204,7 @@ def backfill_observability(
             default_name=_legacy_run_name_from_artifact_path(artifact_path),
             default_phase="training",
         )
-        _ensure_backfill_run(
-            obs_writer,
-            config=config,
-            run_id=run_id,
-            run_name=run_name,
-            phase=phase,
-        )
+        ensure_backfill_run(obs_writer, run_id=run_id, run_name=run_name, phase=phase)
         if run_id not in known_run_ids:
             counts["runs"] += 1
             known_run_ids.add(run_id)
@@ -294,10 +224,9 @@ def backfill_observability(
             reader = csv.DictReader(handle, delimiter="\t")
             for row in reader:
                 run_name = row["run_name"]
-                run_id = _run_id(run_name, "training")
-                _ensure_backfill_run(
+                run_id = build_backfill_run_id(run_name, "training")
+                ensure_backfill_run(
                     obs_writer,
-                    config=config,
                     run_id=run_id,
                     run_name=run_name,
                     phase="training",

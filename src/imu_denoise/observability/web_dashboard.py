@@ -12,9 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from imu_denoise.config.schema import ObservabilityConfig
-from imu_denoise.observability import LoopController, MissionControlQueries, ObservabilityStore
-from imu_denoise.observability.writer import ObservabilityWriter
+from imu_denoise.observability.services import build_mission_control_services
 
 HTML = """<!doctype html>
 <html lang="en">
@@ -796,13 +794,8 @@ HTML = """<!doctype html>
 
 def run_web_dashboard(*, db_path: Path, blob_dir: Path, host: str, port: int) -> None:
     """Serve the Mission Control dashboard over HTTP without Streamlit reruns."""
-    store = ObservabilityStore(db_path=db_path, blob_dir=blob_dir)
-    writer = ObservabilityWriter(
-        config=ObservabilityConfig(enabled=True, db_path=str(db_path), blob_dir=str(blob_dir)),
-        store=store,
-    )
-    controller = LoopController(store=store, writer=writer)
-    queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
+    services = build_mission_control_services(db_path=db_path, blob_dir=blob_dir)
+    facade = services.facade
     artifacts_root = db_path.resolve().parent.parent
 
     class DashboardHandler(BaseHTTPRequestHandler):
@@ -812,21 +805,21 @@ def run_web_dashboard(*, db_path: Path, blob_dir: Path, host: str, port: int) ->
                 self._send_html(HTML)
                 return
             if parsed.path == "/api/summary":
-                self._send_json(queries.get_mission_control_summary(limit=15))
+                self._send_json(facade.get_summary(limit=15))
                 return
             if parsed.path == "/api/decisions":
-                self._send_json(queries.list_recent_decisions(limit=20))
+                self._send_json(facade.list_recent_decisions(limit=20))
                 return
             if parsed.path == "/api/llm":
-                self._send_json(queries.list_recent_llm_calls(limit=20))
+                self._send_json(facade.list_recent_llm_calls(limit=20))
                 return
             if parsed.path == "/api/resolve":
                 fragment = parse_qs(parsed.query).get("id", [""])[0]
-                self._send_json(queries.resolve_id_fragment(fragment) or {})
+                self._send_json(facade.search_entity(fragment) or {})
                 return
             if parsed.path == "/api/run":
                 run_id = parse_qs(parsed.query).get("run_id", [""])[0]
-                self._send_json(queries.get_run_detail(run_id) or {})
+                self._send_json(facade.get_run_detail(run_id) or {})
                 return
             if parsed.path == "/artifact":
                 path_value = parse_qs(parsed.query).get("path", [""])[0]
@@ -844,26 +837,26 @@ def run_web_dashboard(*, db_path: Path, blob_dir: Path, host: str, port: int) ->
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/api/control/pause":
-                self._send_json(controller.request_pause() or {})
+                self._send_json(facade.request_pause() or {})
                 return
             if parsed.path == "/api/control/resume":
-                self._send_json(controller.resume_loop() or {})
+                self._send_json(facade.resume_loop() or {})
                 return
             if parsed.path == "/api/control/stop":
-                self._send_json(controller.request_stop() or {})
+                self._send_json(facade.request_stop() or {})
                 return
             if parsed.path == "/api/control/terminate":
-                self._send_json(controller.request_terminate() or {})
+                self._send_json(facade.request_terminate() or {})
                 return
             if parsed.path == "/api/control/rerun":
                 payload = self._read_json_body()
                 run_id = str(payload.get("run_id") or "")
-                detail = queries.get_run_detail(run_id)
+                detail = facade.get_run_detail(run_id)
                 if detail is None or not detail.get("decisions"):
                     self.send_error(HTTPStatus.BAD_REQUEST, "Run cannot be requeued.")
                     return
                 decision = detail["decisions"][0]
-                queued = controller.enqueue_proposal(
+                queued = facade.enqueue_proposal(
                     description=f"rerun {detail['run']['name']}",
                     overrides=list(decision.get("overrides") or []),
                     requested_by="dashboard",

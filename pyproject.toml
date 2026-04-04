@@ -56,7 +56,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/imu_denoise"]
+packages = ["src/imu_denoise", "src/autoresearch_core"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

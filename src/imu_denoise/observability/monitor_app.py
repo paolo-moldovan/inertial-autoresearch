@@ -7,9 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from imu_denoise.config.schema import ObservabilityConfig
-from imu_denoise.observability import LoopController, MissionControlQueries, ObservabilityStore
-from imu_denoise.observability.writer import ObservabilityWriter
+from imu_denoise.observability.services import build_mission_control_services
 
 
 def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
@@ -23,17 +21,8 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
             "Textual is not installed. Install `imu-denoise[monitor]` to use imu-monitor."
         ) from exc
 
-    queries = MissionControlQueries(db_path=db_path, blob_dir=blob_dir)
-    store = ObservabilityStore(db_path=db_path, blob_dir=blob_dir)
-    writer = ObservabilityWriter(
-        config=ObservabilityConfig(
-            enabled=True,
-            db_path=str(db_path),
-            blob_dir=str(blob_dir),
-        ),
-        store=store,
-    )
-    controller = LoopController(store=store, writer=writer)
+    services = build_mission_control_services(db_path=db_path, blob_dir=blob_dir)
+    facade = services.facade
 
     class FocusableStatic(Static):
         can_focus = True
@@ -91,19 +80,19 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
             self.exit()
 
         def action_pause(self) -> None:
-            controller.request_pause()
+            facade.request_pause()
             self.refresh_data()
 
         def action_resume(self) -> None:
-            controller.resume_loop()
+            facade.resume_loop()
             self.refresh_data()
 
         def action_stop(self) -> None:
-            controller.request_stop()
+            facade.request_stop()
             self.refresh_data()
 
         def action_terminate(self) -> None:
-            controller.request_terminate()
+            facade.request_terminate()
             self.refresh_data()
 
         def action_cycle_sections(self) -> None:
@@ -111,7 +100,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
             self.query_one(self._focus_order[self._focus_index]).focus()
 
         def refresh_data(self) -> None:
-            summary = queries.get_mission_control_summary(limit=10)
+            summary = facade.get_summary(limit=10)
             loop_state = summary["loop_state"]
             current_run = summary.get("current_run")
             best_result = summary["best_result"]
@@ -270,7 +259,7 @@ def run_monitor(*, db_path: Path, blob_dir: Path, refresh_hz: int) -> None:
                 and self._decision_rows[cursor_row].get("run_id")
             ):
                 selected_run_id = str(self._decision_rows[cursor_row]["run_id"])
-            detail = queries.get_run_detail(selected_run_id)
+            detail = facade.get_run_detail(selected_run_id)
             if detail is None:
                 detail_widget.update("DETAIL\nBest run detail not found.")
                 return
